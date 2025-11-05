@@ -1,0 +1,17 @@
+[package]
+name = "cabi-rust-libp2p"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]   # gives .dll/.so/.dylib
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+libp2p = { version = "0.54", features = ["kad", "gossipsub", "noise", "yamux", "quic"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+cbindgen = "0.26"   # generate .h
