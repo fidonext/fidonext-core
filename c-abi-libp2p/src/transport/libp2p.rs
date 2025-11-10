@@ -71,6 +71,7 @@ impl TransportConfig {
         keypair: &identity::Keypair,
     ) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         let tcp_transport = Self::build_tcp_transport(keypair)?;
+        
         if self.use_quic {
             let quic_transport = Self::build_quic_transport(keypair);
             Ok(quic_transport.or_transport(tcp_transport).boxed())
@@ -80,20 +81,21 @@ impl TransportConfig {
     }
 
     fn build_tcp_transport(keypair: &identity::Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
-        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-            .into_authentic(keypair)
-            .map_err(|err| anyhow!("failed to sign noise static keypair: {err}"))?;
+        let noise_config = noise::Config::new(keypair)
+            .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
 
         let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default());
         Ok(tcp_transport
             .upgrade(upgrade::Version::V1Lazy)
-            .authenticate(noise::Config::new(noise_keys))
+            .authenticate(noise_config)
             .multiplex(libp2p::yamux::Config::default())
             .boxed())
     }
 
     fn build_quic_transport(keypair: &identity::Keypair) -> Boxed<(PeerId, StreamMuxerBox)> {
-        quic::tokio::Transport::new(quic::Config::new(keypair.clone()))
+        let quic_config = quic::Config::new(keypair);
+
+        quic::tokio::Transport::new(quic_config)
             .map(|(peer_id, connection), _| (peer_id, StreamMuxerBox::new(connection)))
             .boxed()
     }

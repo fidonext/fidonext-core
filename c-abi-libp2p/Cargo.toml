@@ -9,11 +9,12 @@ crate-type = ["cdylib"]   # gives .dll/.so/.dylib
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-libp2p = { version = "0.54", features = ["kad", "gossipsub", "noise", "yamux", "quic"] }
+libp2p = { version = "0.56", features = ["macros", "kad", "gossipsub", "noise", "yamux", "quic", "identify", "ping", "tcp", "tokio"] }
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+once_cell = "1.21.3"
 
 [build-dependencies]
 cbindgen = "0.26"   # generate .h
