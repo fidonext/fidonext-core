@@ -1,14 +1,18 @@
 //! Libp2p transport and behaviour configuration.
 
 use anyhow::{anyhow, Result};
+use futures::future::Either;
 use libp2p::{
-    core::{muxing::StreamMuxerBox, transport::Boxed, upgrade},
+    core::{
+        muxing::StreamMuxerBox,
+        transport::{Boxed, Transport},
+        upgrade,
+    },
     identify, identity,
-    kad::{store::MemoryStore, Kademlia, KademliaConfig},
+    kad::{self, store::MemoryStore},
     noise, ping, quic,
-    swarm::Swarm,
+    swarm::{Config as SwarmConfig, Swarm},
     tcp,
-    transport::{Transport, TransportExt},
     PeerId,
 };
 use std::time::Duration;
@@ -17,13 +21,36 @@ use std::time::Duration;
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(to_swarm = "BehaviourEvent")]
 pub struct NetworkBehaviour {
-    pub kademlia: Kademlia<MemoryStore>,
+    pub kademlia: kad::Behaviour<MemoryStore>,
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
-pub type BehaviourEvent = <NetworkBehaviour as libp2p::swarm::NetworkBehaviour>::ToSwarm;
+#[derive(Debug)]
+pub enum BehaviourEvent {
+    Kademlia(kad::Event),
+    Ping(ping::Event),
+    Identify(identify::Event),
+}
+
+impl From<kad::Event> for BehaviourEvent {
+    fn from(event: kad::Event) -> Self {
+        Self::Kademlia(event)
+    }
+}
+
+impl From<ping::Event> for BehaviourEvent {
+    fn from(event: ping::Event) -> Self {
+        Self::Ping(event)
+    }
+}
+
+impl From<identify::Event> for BehaviourEvent {
+    fn from(event: identify::Event) -> Self {
+        Self::Identify(event)
+    }
+}
 
 /// Transport configuration builder.
 #[derive(Debug, Clone)]
@@ -45,22 +72,27 @@ impl TransportConfig {
         let transport = self.build_transport(&keypair)?;
         let behaviour = Self::build_behaviour(&keypair);
         let local_peer_id = PeerId::from(keypair.public());
-        let swarm = Swarm::with_tokio_executor(transport, behaviour, local_peer_id);
+        let swarm = Swarm::new(
+            transport,
+            behaviour,
+            local_peer_id,
+            SwarmConfig::with_tokio_executor(),
+        );
         Ok((keypair, swarm))
     }
 
     fn build_behaviour(keypair: &identity::Keypair) -> NetworkBehaviour {
         let peer_id = PeerId::from(keypair.public());
-        let mut kad_config = KademliaConfig::default();
+        let mut kad_config = kad::Config::default();
         kad_config.set_query_timeout(Duration::from_secs(5));
         let store = MemoryStore::new(peer_id);
 
-        let ping_config = ping::Config::new().with_keep_alive(true);
+        let ping_config = ping::Config::new();
         let identify_config = identify::Config::new("/cabi/1.0.0".into(), keypair.public())
             .with_interval(Duration::from_secs(30));
 
         NetworkBehaviour {
-            kademlia: Kademlia::with_config(peer_id, store, kad_config),
+            kademlia: kad::Behaviour::with_config(peer_id, store, kad_config),
             ping: ping::Behaviour::new(ping_config),
             identify: identify::Behaviour::new(identify_config),
         }
@@ -71,10 +103,15 @@ impl TransportConfig {
         keypair: &identity::Keypair,
     ) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         let tcp_transport = Self::build_tcp_transport(keypair)?;
-        
+
         if self.use_quic {
             let quic_transport = Self::build_quic_transport(keypair);
-            Ok(quic_transport.or_transport(tcp_transport).boxed())
+            Ok(quic_transport
+                .or_transport(tcp_transport)
+                .map(|either, _| match either {
+                    Either::Left(output) | Either::Right(output) => output,
+                })
+                .boxed())
         } else {
             Ok(tcp_transport)
         }

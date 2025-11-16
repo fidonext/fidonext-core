@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
     core::Multiaddr,
-    identity, ping,
+    identity,
     swarm::{Swarm, SwarmEvent},
     PeerId,
 };
@@ -61,7 +61,6 @@ impl PeerManagerHandle {
 }
 
 /// Manages the libp2p swarm and exposes a command-driven control loop.
-#[derive(Debug)]
 pub struct PeerManager {
     swarm: Swarm<NetworkBehaviour>,
     command_receiver: mpsc::Receiver<PeerCommand>,
@@ -164,9 +163,9 @@ impl PeerManager {
                 tracing::warn!(target: "peer", %send_back_addr, %error, "incoming connection error");
             }
             SwarmEvent::ListenerClosed {
-                addresses, cause, ..
+                addresses, reason, ..
             } => {
-                tracing::warn!(target: "peer", ?addresses, ?cause, "listener closed");
+                tracing::warn!(target: "peer", ?addresses, ?reason, "listener closed");
             }
             SwarmEvent::ListenerError { error, .. } => {
                 tracing::error!(target: "peer", %error, "listener error");
@@ -184,11 +183,8 @@ impl PeerManager {
                 tracing::debug!(target: "peer", ?event, "kademlia event");
             }
             BehaviourEvent::Ping(event) => match event.result {
-                Ok(ping::Success::Ping { rtt }) => {
+                Ok(rtt) => {
                     tracing::debug!(target: "peer", ?rtt, "ping success");
-                }
-                Ok(ping::Success::Pong) => {
-                    tracing::debug!(target: "peer", "pong received");
                 }
                 Err(error) => {
                     tracing::warn!(target: "peer", %error, "ping failure");
