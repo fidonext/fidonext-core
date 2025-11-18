@@ -6,7 +6,7 @@
 
 
 # Use the official Rust image as base
-FROM rust:1.91 as builder
+FROM rust:1.91 AS builder
 
 # Install cross-compilation toolchains and dependencies
 RUN apt-get update && \
@@ -14,6 +14,7 @@ RUN apt-get update && \
         clang \
         gcc-aarch64-linux-gnu \
         gcc-mingw-w64 \
+        libc6-dev-arm64-cross \
         lld && \
     rm -rf /var/lib/apt/lists/*
 
@@ -21,9 +22,12 @@ RUN apt-get update && \
 RUN rustup target add \
         x86_64-unknown-linux-gnu \
         aarch64-unknown-linux-gnu \
-        x86_64-pc-windows-gnu \
-        x86_64-apple-darwin \
-        aarch64-apple-darwin
+        x86_64-pc-windows-gnu
+
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
         
 
 # Set working directory
@@ -42,26 +46,20 @@ RUN echo "Building for Linux (ARM64)..."
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 RUN echo "Building for Windows (GNU)..."
 RUN cargo build --release --target x86_64-pc-windows-gnu
-RUN echo "Building for macOS (x86_64)..."
-RUN cargo build --release --target x86_64-apple-darwin
-RUN echo "Building for macOS (ARM64)..."
-RUN cargo build --release --target aarch64-apple-darwin
 
 # Test stage - runs tests for native platform (default final stage)
-FROM builder as test
+FROM builder AS test
 RUN cargo test --release --verbose
 
 # Artifact collection stage
-FROM builder as artifacts
+FROM builder AS artifacts
 WORKDIR /app/c-abi-libp2p
 
 # Create output directory structure
 RUN mkdir -p /output/linux-x86_64-gnu \
     && mkdir -p /output/linux-x86_64-musl \
     && mkdir -p /output/linux-aarch64 \
-    && mkdir -p /output/windows-x86_64-gnu \
-    && mkdir -p /output/macos-x86_64 \
-    && mkdir -p /output/macos-aarch64
+    && mkdir -p /output/windows-x86_64-gnu
 
 # Copy Linux GNU build
 RUN cp target/x86_64-unknown-linux-gnu/release/libcabi_rust_libp2p.so /output/linux-x86_64-gnu/ 2>/dev/null || true
