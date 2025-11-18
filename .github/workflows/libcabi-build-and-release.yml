@@ -1,0 +1,113 @@
+name: Build and Release libcabi
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:    
+  RUST_TOOLCHAIN: "1.91.0"
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    defaults:
+      run:
+        working-directory: c-abi-libp2p
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64 \
+            libc6-dev-arm64-cross \
+            lld
+
+      - name: Add cross compilation targets
+        run: |
+          rustup target add \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-pc-windows-gnu \
+            x86_64-unknown-linux-musl
+
+      - name: Build Linux (GNU)
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build Linux (ARM64)
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Build Windows (GNU)
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Build Linux (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Run tests
+        run: cargo test --release --verbose
+
+      - name: Collect build artifacts
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR=../artifacts
+          mkdir -p "${OUTPUT_DIR}/linux-x86_64-gnu"
+          mkdir -p "${OUTPUT_DIR}/linux-x86_64-musl"
+          mkdir -p "${OUTPUT_DIR}/linux-aarch64"
+          mkdir -p "${OUTPUT_DIR}/windows-x86_64-gnu"
+          cp target/x86_64-unknown-linux-gnu/release/libcabi_rust_libp2p.so "${OUTPUT_DIR}/linux-x86_64-gnu/" 2>/dev/null || true
+          cp target/x86_64-unknown-linux-musl/release/libcabi_rust_libp2p.a "${OUTPUT_DIR}/linux-x86_64-musl/" 2>/dev/null || true
+          cp target/aarch64-unknown-linux-gnu/release/libcabi_rust_libp2p.so "${OUTPUT_DIR}/linux-aarch64/" 2>/dev/null || true
+          cp target/x86_64-pc-windows-gnu/release/cabi_rust_libp2p.dll "${OUTPUT_DIR}/windows-x86_64-gnu/" 2>/dev/null || true
+          cargo build
+          cp cabi-rust-libp2p.h "${OUTPUT_DIR}/" 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcabi-rust-libp2p-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libcabi-rust-libp2p-${{ github.sha }}
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+
