@@ -57,15 +57,11 @@ WORKDIR /app/c-abi-libp2p
 
 # Create output directory structure
 RUN mkdir -p /output/linux-x86_64-gnu \
-    && mkdir -p /output/linux-x86_64-musl \
     && mkdir -p /output/linux-aarch64 \
     && mkdir -p /output/windows-x86_64-gnu
 
 # Copy Linux GNU build
 RUN cp target/x86_64-unknown-linux-gnu/release/libcabi_rust_libp2p.so /output/linux-x86_64-gnu/ 2>/dev/null || true
-
-# Copy Linux musl build
-RUN cp target/x86_64-unknown-linux-musl/release/libcabi_rust_libp2p.a /output/linux-x86_64-musl/ 2>/dev/null || true
 
 # Copy Linux ARM64 build
 RUN cp target/aarch64-unknown-linux-gnu/release/libcabi_rust_libp2p.so /output/linux-aarch64/ 2>/dev/null || true
