@@ -43,7 +43,8 @@ jobs:
             gcc-aarch64-linux-gnu \
             gcc-mingw-w64 \
             libc6-dev-arm64-cross \
-            lld
+            lld \
+            musl-tools
 
       - name: Add cross compilation targets
         run: |
@@ -62,8 +63,8 @@ jobs:
       - name: Build Windows (GNU)
         run: cargo build --release --target x86_64-pc-windows-gnu
 
-      - name: Build Linux (musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Build Linux (musl staticlib)
+        run: cargo rustc --release --target x86_64-unknown-linux-musl
 
       - name: Run tests
         run: cargo test --release --verbose
