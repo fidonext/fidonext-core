@@ -64,3 +64,24 @@ Small `ctypes` script that:
   cd /home/georgeb/fidonext-core/c-abi-libp2p
   RUST_LOG="info,peer=debug,ffi=debug" python3 examples/python/ping_two_nodes.py --use-quic
   ```
+
+## Docker Example (Standalone Nodes)
+
+To run two separate nodes in Docker containers that communicate over a bridge network:
+
+1. Navigate to the python examples directory:
+   ```bash
+   cd c-abi-libp2p/examples/python
+   ```
+
+2. Run with Docker Compose:
+   ```bash
+   docker-compose up --build
+   ```
+
+   This will:
+   - Build the Rust library in a Docker container.
+   - Create two containers: `libp2p-listener` (at 172.28.0.2) and `libp2p-dialer` (at 172.28.0.3).
+   - The dialer will connect to the listener and exchange pings.
+
+   You can see the output of both containers in the terminal. Use Ctrl+C to stop.

@@ -1,0 +1,32 @@
+services:
+  listener:
+    build:
+      context: ../../../
+      dockerfile: c-abi-libp2p/examples/python/Dockerfile
+    image: libp2p-python-example
+    container_name: libp2p-listener
+    command: ["--mode", "listen", "--addr", "/ip4/0.0.0.0/tcp/41000"]
+    networks:
+      libp2p_net:
+        ipv4_address: 172.28.0.2
+
+  dialer:
+    build:
+      context: ../../../
+      dockerfile: c-abi-libp2p/examples/python/Dockerfile
+    image: libp2p-python-example
+    container_name: libp2p-dialer
+    command: ["--mode", "dial", "--addr", "/ip4/172.28.0.2/tcp/41000"]
+    depends_on:
+      - listener
+    networks:
+      libp2p_net:
+        ipv4_address: 172.28.0.3
+
+networks:
+  libp2p_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
