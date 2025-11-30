@@ -60,7 +60,7 @@ impl PeerManagerHandle {
     }
 }
 
-/// Manages the libp2p swarm and exposes a command-driven control loop.
+/// Manages the libp2p swarm (peer orchestrator) and exposes a command-driven control loop.
 pub struct PeerManager {
     swarm: Swarm<NetworkBehaviour>,
     command_receiver: mpsc::Receiver<PeerCommand>,
@@ -113,6 +113,7 @@ impl PeerManager {
         Ok(())
     }
 
+    /// Processes a command and returns whether shutdown was requested
     fn handle_command(&mut self, command: PeerCommand) -> Result<bool> {
         match command {
             PeerCommand::StartListening(address) => {
@@ -136,6 +137,7 @@ impl PeerManager {
         }
     }
 
+    /// Logging and reacting to events coming from the swarm (peer orchestrator)
     fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(event) => self.handle_behaviour_event(event),
@@ -177,6 +179,7 @@ impl PeerManager {
         }
     }
 
+    /// Handles events from additional network's features
     fn handle_behaviour_event(&mut self, event: BehaviourEvent) {
         match event {
             BehaviourEvent::Autonat(event) => {

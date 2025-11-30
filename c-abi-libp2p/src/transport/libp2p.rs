@@ -20,9 +20,13 @@ use std::time::Duration;
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(to_swarm = "BehaviourEvent")]
 pub struct NetworkBehaviour {
+    /// Kademlia DHT behaviour for peer discovery
     pub kademlia: kad::Behaviour<MemoryStore>,
+    /// Ping behaviour to keep connections alive and measure latency
     pub ping: ping::Behaviour,
+    /// Identify protocol for exchanging supported protocols and addresses
     pub identify: identify::Behaviour,
+    /// AutoNAT behaviour to probe for public reachability
     pub autonat: autonat::Behaviour,
 }
 
@@ -88,6 +92,7 @@ impl TransportConfig {
         Ok((keypair, swarm))
     }
 
+    /// Constructs the composite network behaviour using the supplied keypair
     fn build_behaviour(keypair: &identity::Keypair) -> NetworkBehaviour {
         let peer_id = PeerId::from(keypair.public());
         let mut kad_config = kad::Config::default();
@@ -107,6 +112,7 @@ impl TransportConfig {
         }
     }
 
+    /// Builds the transport stack using TCP and optionally QUIC
     fn build_transport(
         &self,
         keypair: &identity::Keypair,
@@ -126,6 +132,7 @@ impl TransportConfig {
         }
     }
 
+    /// Configures TCP with Noise authentication and Yamux multiplexing
     fn build_tcp_transport(keypair: &identity::Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         let noise_config = noise::Config::new(keypair)
             .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
@@ -138,6 +145,7 @@ impl TransportConfig {
             .boxed())
     }
 
+    /// Configures QUIC transport for encrypted, multiplexed streams
     fn build_quic_transport(keypair: &identity::Keypair) -> Boxed<(PeerId, StreamMuxerBox)> {
         let quic_config = quic::Config::new(keypair);
 

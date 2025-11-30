@@ -8,6 +8,7 @@ pub use manager::{PeerCommand, PeerManager, PeerManagerHandle};
 #[derive(Debug, Default, Clone)]
 pub struct PeerInfo {
     // TODO: implement peer identity management
+    /// String representation of the libp2p [`PeerId`].
     pub peer_id: Option<String>,
 }
 

@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use ::libp2p::Multiaddr;
 use tokio::{runtime::Runtime, task::JoinHandle};
 
+/// More suitable alias for results while using C-ABI libp2p rust lib
 type FfiResult<T> = std::result::Result<T, c_int>;
 
 /// Operation completed successfully.
@@ -38,6 +39,7 @@ pub struct CabiNodeHandle {
     _private: [u8; 0],
 }
 
+/// Wrapper struct around peer manager and tokio runtime
 struct ManagedNode {
     runtime: Runtime,
     handle: peer::PeerManagerHandle,
@@ -45,6 +47,7 @@ struct ManagedNode {
 }
 
 impl ManagedNode {
+    /// Creates new peer manager for the single peer
     fn new(config: transport::TransportConfig) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let (manager, handle) = peer::PeerManager::new(config)?;
@@ -61,18 +64,21 @@ impl ManagedNode {
         })
     }
 
+    /// Requests to start listening operation on provided address
     fn start_listening(&self, address: Multiaddr) -> Result<()> {
         self.runtime
             .block_on(self.handle.start_listening(address))
             .context("failed to start listening")
     }
 
+    /// Requests to dial peer with provided address
     fn dial(&self, address: Multiaddr) -> Result<()> {
         self.runtime
             .block_on(self.handle.dial(address))
             .context("failed to dial remote")
     }
 
+    /// Requsets to gracefully shutdown peer manager and joins the background tasks
     fn shutdown(&mut self) {
         if let Err(err) = self.runtime.block_on(self.handle.shutdown()) {
             tracing::warn!(target: "ffi", %err, "node shutdown request failed");
@@ -95,6 +101,7 @@ impl Drop for ManagedNode {
 }
 
 #[no_mangle]
+/// C-ABI. Inits tracing for the library in order to give more proper info on networking
 pub extern "C" fn cabi_init_tracing() -> c_int {
     match config::init_tracing() {
         Ok(_) => CABI_STATUS_SUCCESS,
@@ -106,6 +113,7 @@ pub extern "C" fn cabi_init_tracing() -> c_int {
 }
 
 #[no_mangle]
+/// C-ABI. Creates a new node instance and returns its handle
 pub extern "C" fn cabi_node_new(use_quic: bool) -> *mut CabiNodeHandle {
     // Safe to call multiple times; only the first invocation sets up tracing.
     let _ = config::init_tracing();
@@ -124,6 +132,7 @@ pub extern "C" fn cabi_node_new(use_quic: bool) -> *mut CabiNodeHandle {
 }
 
 #[no_mangle]
+/// C-ABI. Inits listening on the given address
 pub extern "C" fn cabi_node_listen(handle: *mut CabiNodeHandle, address: *const c_char) -> c_int {
     let node = match node_from_ptr(handle) {
         Ok(node) => node,
@@ -145,6 +154,7 @@ pub extern "C" fn cabi_node_listen(handle: *mut CabiNodeHandle, address: *const 
 }
 
 #[no_mangle]
+/// C-ABI. Inits a dial to the outbound peer with the specified address
 pub extern "C" fn cabi_node_dial(handle: *mut CabiNodeHandle, address: *const c_char) -> c_int {
     let node = match node_from_ptr(handle) {
         Ok(node) => node,
@@ -166,6 +176,7 @@ pub extern "C" fn cabi_node_dial(handle: *mut CabiNodeHandle, address: *const c_
 }
 
 #[no_mangle]
+/// C-ABI. Frees node with specified handle
 pub extern "C" fn cabi_node_free(handle: *mut CabiNodeHandle) {
     if handle.is_null() {
         return;
@@ -176,6 +187,7 @@ pub extern "C" fn cabi_node_free(handle: *mut CabiNodeHandle) {
     }
 }
 
+/// Converts pointer into node reference
 fn node_from_ptr(handle: *mut CabiNodeHandle) -> FfiResult<&'static mut ManagedNode> {
     if handle.is_null() {
         return Err(CABI_STATUS_NULL_POINTER);
@@ -184,6 +196,7 @@ fn node_from_ptr(handle: *mut CabiNodeHandle) -> FfiResult<&'static mut ManagedN
     Ok(unsafe { &mut *(handle as *mut ManagedNode) })
 }
 
+/// Parses a c string into a libp2p multiaddr. Returns additional status codes on error.
 fn parse_multiaddr(address: *const c_char) -> FfiResult<Multiaddr> {
     if address.is_null() {
         return Err(CABI_STATUS_NULL_POINTER);
