@@ -115,10 +115,23 @@ pub extern "C" fn cabi_init_tracing() -> c_int {
 #[no_mangle]
 /// C-ABI. Creates a new node instance and returns its handle
 pub extern "C" fn cabi_node_new(use_quic: bool) -> *mut CabiNodeHandle {
+    cabi_node_new_with_relay(use_quic, false)
+}
+
+#[no_mangle]
+/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode
+pub extern "C" fn cabi_node_new_with_relay(
+    use_quic: bool,
+    enable_relay_hop: bool,
+) -> *mut CabiNodeHandle {
     // Safe to call multiple times; only the first invocation sets up tracing.
     let _ = config::init_tracing();
 
-    let config = transport::TransportConfig { use_quic };
+    let config = transport::TransportConfig {
+        use_quic,
+        hop_relay: enable_relay_hop,
+    };
+
     match ManagedNode::new(config) {
         Ok(node) => {
             let boxed = Box::new(node);
