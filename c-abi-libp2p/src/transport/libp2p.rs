@@ -13,7 +13,7 @@ use libp2p::{
     noise, ping, quic,
     swarm::{Config as SwarmConfig, Swarm},
     tcp, PeerId, autonat, 
-    relay, toggle::Toggle,
+    relay, swarm::behaviour::toggle::Toggle,
 };
 use std::time::Duration;
 
@@ -30,9 +30,9 @@ pub struct NetworkBehaviour {
     /// AutoNAT behaviour to probe for public reachability
     pub autonat: autonat::Behaviour,
     /// Relay client for connecting through hop relays.
-    pub relay_client: relay::v2::client::Behaviour,
+    pub relay_client: relay::client::Behaviour,
     /// Optional relay server (hop) behaviour for acting as a public relay.
-    pub relay_server: Toggle<relay::v2::relay::Behaviour>,
+    pub relay_server: Toggle<relay::Behaviour>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -42,8 +42,8 @@ pub enum BehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
     Autonat(autonat::Event),
-    RelayClient(relay::v2::client::Event),
-    RelayServer(relay::v2::relay::Event),
+    RelayClient(relay::client::Event),
+    RelayServer(relay::Event),
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -70,14 +70,14 @@ impl From<autonat::Event> for BehaviourEvent {
     }
 }
 
-impl From<relay::v2::client::Event> for BehaviourEvent {
-    fn from(event: relay::v2::client::Event) -> Self {
+impl From<relay::client::Event> for BehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
         Self::RelayClient(event)
     }
 }
 
-impl From<relay::v2::relay::Event> for BehaviourEvent {
-    fn from(event: relay::v2::relay::Event) -> Self {
+impl From<relay::Event> for BehaviourEvent {
+    fn from(event: relay::Event) -> Self {
         Self::RelayServer(event)
     }
 }
@@ -106,7 +106,7 @@ impl TransportConfig {
         let keypair = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(keypair.public());
         let (transport, relay_client) = self.build_transport(&keypair, local_peer_id)?;
-        let behaviour = Self::build_behaviour(&keypair);
+        let behaviour = Self::build_behaviour(&keypair, relay_client, self.hop_relay);
         let swarm = Swarm::new(
             transport,
             behaviour,
@@ -119,7 +119,7 @@ impl TransportConfig {
     /// Constructs the composite network behaviour using the supplied keypair
     fn build_behaviour(
         keypair: &identity::Keypair,
-        relay_client: relay::v2::client::Behaviour,
+        relay_client: relay::client::Behaviour,
         hop_relay: bool,
     ) -> NetworkBehaviour {
         let peer_id = PeerId::from(keypair.public());
@@ -133,8 +133,9 @@ impl TransportConfig {
         let autonat_config = autonat::Config::default();
 
         let relay_server = if hop_relay {
-            Toggle::from(Some(relay::v2::relay::Behaviour::new(
-                relay::v2::relay::Config::default(),
+            Toggle::from(Some(relay::Behaviour::new(
+                peer_id,
+                relay::Config::default(),
             )))
         } else {
             Toggle::from(None)
@@ -157,9 +158,12 @@ impl TransportConfig {
         local_peer_id: PeerId,
     ) -> Result<(
         Boxed<(PeerId, StreamMuxerBox)>,
-        relay::v2::client::Behaviour,
+        relay::client::Behaviour,
      )> {
-        let tcp_transport = Self::build_tcp_transport(keypair)?;
+        let noise_config = noise::Config::new(keypair)
+            .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
+
+        let tcp_transport = Self::build_tcp_transport(noise_config.clone())?;
 
         let base_transport = if self.use_quic {
             let quic_transport = Self::build_quic_transport(keypair);
@@ -174,7 +178,7 @@ impl TransportConfig {
         };
 
         let (relay_transport, relay_client) =
-            Self::build_relay_transport(noise_config, local_peer_id);
+            Self::build_relay_transport(noise_config.clone(), local_peer_id);
 
         Ok((
             relay_transport
@@ -188,10 +192,9 @@ impl TransportConfig {
     }
 
     /// Configures TCP with Noise authentication and Yamux multiplexing
-    fn build_tcp_transport(keypair: &identity::Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
-        let noise_config = noise::Config::new(keypair)
-            .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
-
+    fn build_tcp_transport(
+        noise_config: noise::Config,
+    ) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default());
         Ok(tcp_transport
             .upgrade(upgrade::Version::V1Lazy)
@@ -215,9 +218,9 @@ impl TransportConfig {
         local_peer_id: PeerId,
     ) -> (
         Boxed<(PeerId, StreamMuxerBox)>,
-        relay::v2::client::Behaviour,
+        relay::client::Behaviour,
     ) {
-        let (relay_transport, relay_client) = relay::v2::client::new(local_peer_id);
+        let (relay_transport, relay_client) = relay::client::new(local_peer_id);
 
         let relay_transport = relay_transport
             .upgrade(upgrade::Version::V1Lazy)
