@@ -12,8 +12,9 @@ use libp2p::{
     identity,
     swarm::{Swarm, SwarmEvent},
     PeerId,
+    autonat,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::transport::{BehaviourEvent, NetworkBehaviour, TransportConfig};
 
@@ -32,6 +33,7 @@ pub enum PeerCommand {
 #[derive(Clone, Debug)]
 pub struct PeerManagerHandle {
     command_sender: mpsc::Sender<PeerCommand>,
+    autonat_status: watch::Receiver<autonat::NatStatus>,
 }
 
 impl PeerManagerHandle {
@@ -41,6 +43,11 @@ impl PeerManagerHandle {
             .send(PeerCommand::StartListening(address))
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
+
+    /// Returns a watch channel receiver that yields AutoNAT status updates.
+    pub fn autonat_status(&self) -> watch::Receiver<autonat::NatStatus> {
+        self.autonat_status.clone()
     }
 
     /// Enqueues a command to dial the provided address.
@@ -66,6 +73,7 @@ pub struct PeerManager {
     command_receiver: mpsc::Receiver<PeerCommand>,
     local_peer_id: PeerId,
     keypair: identity::Keypair,
+    autonat_status: watch::Sender<autonat::NatStatus>,
 }
 
 impl PeerManager {
@@ -74,6 +82,7 @@ impl PeerManager {
         let (keypair, swarm) = config.build()?;
         let local_peer_id = PeerId::from(keypair.public());
         let (command_sender, command_receiver) = mpsc::channel(32);
+        let (autonat_status, autonat_status_receiver) = watch::channel(autonat::NatStatus::Unknown);
 
         let manager = Self {
             swarm,
@@ -82,7 +91,10 @@ impl PeerManager {
             keypair,
         };
 
-        let handle = PeerManagerHandle { command_sender };
+        let handle = PeerManagerHandle {
+            command_sender,
+            autonat_status: autonat_status_receiver,
+        };
         Ok((manager, handle))
     }
 
@@ -198,6 +210,15 @@ impl PeerManager {
             }
             BehaviourEvent::Autonat(event) => {
                 tracing::debug!(target:"peer", ?event, "autonat event");
+                
+                if let autonat::Event::StatusChanged { new, .. } = event {
+                    if self.autonat_status.send(new.clone()).is_err() {
+                        tracing::trace!(
+                            target: "peer",
+                            "autonat status receiver dropped; skipping update"
+                        );
+                    }
+                }
             }
             BehaviourEvent::RelayClient(event) => {
                 tracing::debug!(target: "peer", ?event, "relay client event");

@@ -33,6 +33,13 @@ pub const CABI_STATUS_INVALID_ARGUMENT: c_int = 2;
 /// Internal runtime error – check logs for details.
 pub const CABI_STATUS_INTERNAL_ERROR: c_int = 3;
 
+/// AutoNAT status has not yet been determined.
+pub const CABI_AUTONAT_UNKNOWN: c_int = 0;
+/// AutoNAT reports the node as privately reachable only.
+pub const CABI_AUTONAT_PRIVATE: c_int = 1;
+/// AutoNAT reports the node as publicly reachable.
+pub const CABI_AUTONAT_PUBLIC: c_int = 2;
+
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
 pub struct CabiNodeHandle {
@@ -44,6 +51,7 @@ struct ManagedNode {
     runtime: Runtime,
     handle: peer::PeerManagerHandle,
     worker: Option<JoinHandle<()>>,
+    autonat_status: watch::Receiver<autonat::NatStatus>,
 }
 
 impl ManagedNode {
@@ -51,6 +59,7 @@ impl ManagedNode {
     fn new(config: transport::TransportConfig) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let (manager, handle) = peer::PeerManager::new(config)?;
+        let autonat_status = handle.autonat_status();
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
                 tracing::error!(target: "ffi", %err, "peer manager exited with error");
@@ -60,6 +69,7 @@ impl ManagedNode {
         Ok(Self {
             runtime,
             handle,
+            autonat_status,
             worker: Some(worker),
         })
     }
@@ -92,6 +102,10 @@ impl ManagedNode {
             });
         }
     }
+
+    fn autonat_status(&self) -> autonat::NatStatus {
+        self.autonat_status.borrow().clone()
+    }
 }
 
 impl Drop for ManagedNode {
@@ -109,6 +123,23 @@ pub extern "C" fn cabi_init_tracing() -> c_int {
             eprintln!("fidonext: failed to init tracing: {err:?}");
             CABI_STATUS_INTERNAL_ERROR
         }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Returns the latest AutoNAT status observed for the node.
+/// Use it to detect the node is public or not, which can be a signal to recreate
+/// node as relay also
+pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    match node.autonat_status() {
+        autonat::NatStatus::Unknown => CABI_AUTONAT_UNKNOWN,
+        autonat::NatStatus::Private => CABI_AUTONAT_PRIVATE,
+        autonat::NatStatus::Public(_) => CABI_AUTONAT_PUBLIC,
     }
 }
 
