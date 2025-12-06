@@ -14,6 +14,7 @@ use std::{
     ffi::CStr,
     os::raw::{c_char, c_int},
     ptr,
+    slice,
     str::FromStr,
 };
 
@@ -39,6 +40,10 @@ pub const CABI_AUTONAT_UNKNOWN: c_int = 0;
 pub const CABI_AUTONAT_PRIVATE: c_int = 1;
 /// AutoNAT reports the node as publicly reachable.
 pub const CABI_AUTONAT_PUBLIC: c_int = 2;
+/// No message available in the internal queue.
+pub const CABI_STATUS_QUEUE_EMPTY: c_int = 4;
+/// Provided buffer is too small to fit the dequeued message.
+pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = 5;
 
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
@@ -52,6 +57,7 @@ struct ManagedNode {
     handle: peer::PeerManagerHandle,
     worker: Option<JoinHandle<()>>,
     autonat_status: watch::Receiver<autonat::NatStatus>,
+    message_queue: messaging::MessageQueue,
 }
 
 impl ManagedNode {
@@ -60,6 +66,7 @@ impl ManagedNode {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let (manager, handle) = peer::PeerManager::new(config)?;
         let autonat_status = handle.autonat_status();
+        let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
                 tracing::error!(target: "ffi", %err, "peer manager exited with error");
@@ -71,6 +78,7 @@ impl ManagedNode {
             handle,
             autonat_status,
             worker: Some(worker),
+            message_queue,
         })
     }
 
@@ -86,6 +94,18 @@ impl ManagedNode {
         self.runtime
             .block_on(self.handle.dial(address))
             .context("failed to dial remote")
+    }
+
+    /// Enqueues a binary payload into the internal message queue.
+    fn enqueue_message(&self, payload: Vec<u8>) -> Result<()> {
+        self.runtime
+            .block_on(self.message_queue.enqueue(payload))
+            .context("failed to enqueue message")
+    }
+
+    /// Attempts to pull a message from the internal queue without blocking.
+    fn try_dequeue_message(&mut self) -> Option<Vec<u8>> {
+        self.message_queue.try_dequeue()
     }
 
     /// Requsets to gracefully shutdown peer manager and joins the background tasks
@@ -215,6 +235,86 @@ pub extern "C" fn cabi_node_dial(handle: *mut CabiNodeHandle, address: *const c_
         Err(err) => {
             tracing::error!(target: "ffi", %err, "dial failed");
             CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Enqueues a binary payload into the node's internal message queue.
+pub extern "C" fn cabi_node_enqueue_message(
+    handle: *mut CabiNodeHandle,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if data_ptr.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if data_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    let payload = unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec();
+    match node.enqueue_message(payload) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to enqueue message");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Attempts to dequeue the next message into the provided buffer.
+///
+/// Returns [`CABI_STATUS_QUEUE_EMPTY`] if no message is currently available,
+/// and [`CABI_STATUS_BUFFER_TOO_SMALL`] when the provided buffer is not large
+/// enough to hold the message (in that case `written_len` is set to the
+/// required length).
+pub extern "C" fn cabi_node_dequeue_message(
+    handle: *mut CabiNodeHandle,
+    out_buffer: *mut u8,
+    buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if out_buffer.is_null() || written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    if buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    // Always clear the written_len output.
+    unsafe {
+        *written_len = 0;
+    }
+
+    match node.try_dequeue_message() {
+        None => CABI_STATUS_QUEUE_EMPTY,
+        Some(message) => {
+            if message.len() > buffer_len {
+                unsafe {
+                    *written_len = message.len();
+                }
+                return CABI_STATUS_BUFFER_TOO_SMALL;
+            }
+
+            unsafe {
+                ptr::copy_nonoverlapping(message.as_ptr(), out_buffer, message.len());
+                *written_len = message.len();
+            }
+
+            CABI_STATUS_SUCCESS
         }
     }
 }

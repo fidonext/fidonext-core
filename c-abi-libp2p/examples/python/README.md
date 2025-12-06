@@ -40,7 +40,10 @@ Small `ctypes` script that:
    ```bash
    python3 examples/python/ping_two_nodes.py --use-quic
    ```
-4. Observe the console: successful runs show both peers listening, dialing, and
+4. The script also pushes a sample payload through the Rust core's internal
+   message queue and reads it back to verify the FFI wiring. Look for
+   `Dequeued payload matches` in the output.
+5. Observe the console: successful runs show both peers listening, dialing, and
    establishing a connection. Ping RTTs appear in the Rust logs when
    `peer=debug` is enabled. The script automatically shuts down both nodes after
    ~5 seconds, so you may see a final “connection closed” warning—this is

@@ -44,6 +44,8 @@ except OSError as e:
 CABI_STATUS_SUCCESS = 0
 CABI_STATUS_NULL_POINTER = 1
 CABI_STATUS_INVALID_ARGUMENT = 2
+CABI_STATUS_QUEUE_EMPTY = 4
+CABI_STATUS_BUFFER_TOO_SMALL = 5
 
 # Define signatures
 lib.cabi_init_tracing.restype = ctypes.c_int
@@ -53,6 +55,19 @@ lib.cabi_node_listen.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 lib.cabi_node_listen.restype = ctypes.c_int
 lib.cabi_node_dial.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 lib.cabi_node_dial.restype = ctypes.c_int
+lib.cabi_node_enqueue_message.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_node_enqueue_message.restype = ctypes.c_int
+lib.cabi_node_dequeue_message.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_node_dequeue_message.restype = ctypes.c_int
 lib.cabi_node_free.argtypes = [ctypes.c_void_p]
 lib.cabi_node_free.restype = None
 
@@ -63,6 +78,8 @@ def _check(status: int, context: str) -> None:
         reason = "null pointer passed into ABI"
     elif status == CABI_STATUS_INVALID_ARGUMENT:
         reason = "invalid argument (multiaddr or UTF-8)"
+    elif status == CABI_STATUS_BUFFER_TOO_SMALL:
+        reason = "provided buffer too small"
     else:
         reason = "internal error – inspect Rust logs for details"
     raise RuntimeError(f"{context} failed: {reason} (status={status})")
@@ -89,6 +106,38 @@ class Node:
             f"dial({multiaddr})",
         )
         print(f"Dialed {multiaddr}")
+
+    def send_message(self, payload: bytes | bytearray | str) -> None:
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+        _check(
+            lib.cabi_node_enqueue_message(
+                self._ptr, buffer, ctypes.c_size_t(len(payload))
+            ),
+            "enqueue_message",
+        )
+
+    def try_receive_message(self, buffer_size: int = 1024) -> bytes | None:
+        out_buffer = (ctypes.c_ubyte * buffer_size)()
+        written = ctypes.c_size_t(0)
+        status = lib.cabi_node_dequeue_message(
+            self._ptr,
+            out_buffer,
+            ctypes.c_size_t(buffer_size),
+            ctypes.byref(written),
+        )
+
+        if status == CABI_STATUS_QUEUE_EMPTY:
+            return None
+        if status == CABI_STATUS_BUFFER_TOO_SMALL:
+            needed = written.value
+            raise RuntimeError(
+                f"dequeue_message failed: buffer too small (need {needed} bytes)"
+            )
+
+        _check(status, "dequeue_message")
+        return bytes(out_buffer[: written.value])
 
     def close(self) -> None:
         if self._ptr:
@@ -128,6 +177,18 @@ def main() -> None:
     _check(lib.cabi_init_tracing(), "init tracing")
 
     node = Node(use_quic=args.use_quic)
+
+    # Demonstrate the internal Rust message queue via the FFI surface.
+    test_payload = b"hello from python via rust queue"
+    print(f"Sending test payload into Rust queue: {test_payload!r}")
+    node.send_message(test_payload)
+    echoed = node.try_receive_message()
+    if echoed == test_payload:
+        print(f"Dequeued payload matches: {echoed!r}")
+    elif echoed is None:
+        print("Queue reported empty when attempting to read the test payload.")
+    else:
+        print(f"Dequeued payload differed: {echoed!r}")
     
     # Handle graceful shutdown
     running = True
