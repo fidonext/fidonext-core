@@ -25,6 +25,7 @@ COPY --from=builder /usr/src/app/c-abi-libp2p/target/release/libcabi_rust_libp2p
 # Set the environment variable so the Python script finds the library
 ENV FIDONEXT_C_ABI=/usr/local/lib/libcabi_rust_libp2p.so
 ENV RUST_LOG=info,peer=info,ffi=info
+ENV PYTHONUNBUFFERED=1
 
 # Copy the Python example scripts
 COPY c-abi-libp2p/examples/python/ping_standalone_nodes.py .
