@@ -19,3 +19,8 @@ specified multiple times. For example:
 ```
 ping --lport 41000 --dport 41001 --bootstrap /ip4/203.0.113.1/tcp/5001/p2p/12D3KooW...
 ```
+
+### Relay hop restart
+The example polls AutoNAT for up to 10 seconds. If the node reports **public**
+reachability, it automatically restarts with relay hop enabled, re-dials the
+bootstrap peers, and continues with the ping dial.
