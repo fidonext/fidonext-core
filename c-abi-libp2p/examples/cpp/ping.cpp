@@ -4,6 +4,7 @@
 #include <thread>
 #include <chrono>
 #include <stdexcept>
+#include <vector>
 
 // Crossplatform
 #ifdef _WIN32
@@ -58,6 +59,7 @@ struct Arguments
   string  dialPort    = "41001";
   string  listenPort  = "41000";
   float   duration      = 10.0f;
+  std::vector<string> bootstrapPeers{};
 };
 
 bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
@@ -96,9 +98,14 @@ Arguments parseArgs(int argc, char** argv)
     {
       args.duration = std::stof(argv[++i]);
     }
+    else if (arg == "--bootstrap" && i + 1 < argc)
+    {
+      args.bootstrapPeers.emplace_back(argv[++i]);
+    }
     else if (arg == "--help" || arg == "-h")
     {
-      cout << "Usage: ping [--use-quic] [--lport <int>] [--dport <int>] [--duration <seconds>]\n";
+      cout << "Usage: ping [--use-quic] [--lport <int>] [--dport <int>] [--duration <seconds>]"
+           << " [--bootstrap <multiaddr>]...\n";
       std::exit(0);
     }
     else
@@ -187,8 +194,19 @@ int main(int argc, char** argv)
     // Start delay, waiting for listener to be ready
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+    // Step 3. Dial bootstrap peers if provided
+    for (const auto& bootstrap : args.bootstrapPeers)
+    {
+      cout << "Dialing bootstrap peer: " << bootstrap << "\n";
+      status = abi.DialNode(node, bootstrap.c_str());
+      if (status != CABI_STATUS_SUCCESS)
+      {
+        cerr << "Failed to dial bootstrap peer (" << bootstrap << "): "
+             << statusMessage(status) << "\n";
+      }
+    }
 
-    // Step 3. Dial to other client
+    // Step 4. Dial to other client
     status = abi.DialNode(node, dialerAddr.c_str());
     if (status != CABI_STATUS_SUCCESS)
     {
@@ -197,10 +215,10 @@ int main(int argc, char** argv)
     }
 
 
-    // Step 4. Keeping node alive for duration
+    // Step 5. Keeping node alive for duration
     std::this_thread::sleep_for(std::chrono::duration<float>(args.duration));
 
-    // Step 5. Don't forget to free node
+    // Step 6. Don't forget to free node
     abi.FreeNode(node);
   }
   catch (const std::exception& ex)
