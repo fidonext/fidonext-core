@@ -64,11 +64,10 @@ impl ManagedNode {
     /// Creates new peer manager for the single peer
     fn new(config: transport::TransportConfig) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
-        let (manager, handle) = peer::PeerManager::new(config)?;
-        let autonat_status = handle.autonat_status();
         let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
         let (manager, handle) =
             peer::PeerManager::new(config, message_queue.sender())?;
+        let autonat_status = handle.autonat_status();
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
                 tracing::error!(target: "ffi", %err, "peer manager exited with error");

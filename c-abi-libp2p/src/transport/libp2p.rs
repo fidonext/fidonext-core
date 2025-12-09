@@ -12,7 +12,6 @@ use libp2p::{
     identify, identity,
     kad::{self, store::MemoryStore},
     noise, ping, quic,
-    swarm,
     swarm::{Config as SwarmConfig, Swarm},
     tcp, PeerId, autonat, 
     relay, swarm::behaviour::toggle::Toggle,
@@ -128,7 +127,6 @@ impl TransportConfig {
     }
 
     /// Constructs the composite network behaviour using the supplied keypair
-    pub(crate) fn build_behaviour(keypair: &identity::Keypair) -> NetworkBehaviour {
     fn build_behaviour(
         keypair: &identity::Keypair,
         relay_client: relay::client::Behaviour,
