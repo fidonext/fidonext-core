@@ -27,6 +27,7 @@ using std::cout;
 using std::cerr;
 using std::string;
 
+// General statuses
 // Operation completed successfully.
 constexpr int CABI_STATUS_SUCCESS = 0;
 // One of the provided pointers was null.
@@ -35,22 +36,35 @@ constexpr int CABI_STATUS_NULL_POINTER = 1;
 constexpr int CABI_STATUS_INVALID_ARGUMENT = 2;
 // Internal runtime error – check logs for details.
 constexpr int CABI_STATUS_INTERNAL_ERROR = 3;
+
+// AutoNAT statuses
+// AutoNAT status has not yet been determined.
+constexpr int CABI_AUTONAT_UNKNOWN = 0;
+// AutoNAT reports the node as privately reachable only.
+constexpr int CABI_AUTONAT_PRIVATE = 1;
+// AutoNAT reports the node as publicly reachable.
+constexpr int CABI_AUTONAT_PUBLIC  = 2;
+
 // Basic IP address for the two peers
 constexpr const char* CLIENT_IP_ADDR = "127.0.0.1";
 
 using InitTracingFunc = int (*)();
 using NewNodeFunc = void* (*)(bool useQuic);
+using NewNodeWithRelayFunc = void* (*)(bool useQuic, bool enableRelayHop);
 using ListenNodeFunc = int (*)(void* handle, const char* multiaddr);
 using DialNodeFunc = int (*)(void* handle, const char* multiaddr);
+using AutonatStatusFunc = int (*)(void* handle);
 using FreeNodeFunc = void (*)(void* handle);
 
 struct CabiRustLibp2p
 {
-  InitTracingFunc InitTracing{};
-  NewNodeFunc     NewNode{};
-  ListenNodeFunc  ListenNode{};
-  DialNodeFunc    DialNode{};
-  FreeNodeFunc    FreeNode{};
+  InitTracingFunc       InitTracing{};
+  NewNodeFunc           NewNode{};
+  NewNodeWithRelayFunc  NewNodeWithRelay{};
+  ListenNodeFunc        ListenNode{};
+  DialNodeFunc          DialNode{};
+  AutonatStatusFunc     AutonatStatus{};
+  FreeNodeFunc          FreeNode{};
 };
 
 struct Arguments
@@ -66,12 +80,14 @@ bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
 {
   abi.InitTracing = reinterpret_cast<InitTracingFunc>(GET_PROC(lib, "cabi_init_tracing"));
   abi.NewNode = reinterpret_cast<NewNodeFunc>(GET_PROC(lib, "cabi_node_new"));
+  abi.NewNodeWithRelay = reinterpret_cast<NewNodeWithRelayFunc>(GET_PROC(lib, "cabi_node_new_with_relay"));
   abi.ListenNode = reinterpret_cast<ListenNodeFunc>(GET_PROC(lib, "cabi_node_listen"));
   abi.DialNode = reinterpret_cast<DialNodeFunc>(GET_PROC(lib, "cabi_node_dial"));
+  abi.AutonatStatus = reinterpret_cast<AutonatStatusFunc>(GET_PROC(lib, "cabi_autonat_status"));
   abi.FreeNode = reinterpret_cast<FreeNodeFunc>(GET_PROC(lib, "cabi_node_free"));
 
-  return  abi.InitTracing && abi.NewNode &&
-          abi.ListenNode && abi.DialNode && abi.FreeNode;
+  return  abi.InitTracing && abi.NewNode && abi.NewNodeWithRelay &&
+          abi.ListenNode && abi.DialNode && abi.AutonatStatus && abi.FreeNode;
 }
 
 Arguments parseArgs(int argc, char** argv)
@@ -143,6 +159,52 @@ string statusMessage(int status)
   }
 }
 
+void* createNode(const CabiRustLibp2p& abi, bool useQuic, bool enableRelayHop)
+{
+  void* node = enableRelayHop
+    ? abi.NewNodeWithRelay(useQuic, true)
+    : abi.NewNode(useQuic);
+
+  if (!node)
+  {
+    throw std::runtime_error("failed to create node; see Rust logs");
+  }
+
+  return node;
+}
+
+void dialBootstraps(const CabiRustLibp2p& abi, void* node, 
+  const const std::vector<string>& bootstrapPeers)
+{
+  for (const auto& bootstrap : bootstrapPeers)
+  {
+    cout << "Dialing bootstrap peer: " << bootstrap << "\n";
+    const int status = abi.DialNode(node, bootstrap.c_str());
+    if (status != CABI_STATUS_SUCCESS)
+    {
+      cerr << "Failed to dial bootstrap peer (" << bootstrap << "): "
+            << statusMessage(status) << "\n";
+    }
+  }
+}
+
+bool waitForPublicAutonat(const CabiRustLibp2p& abi, void* node, std::chrono::seconds timeout)
+{
+  auto start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start < timeout)
+  {
+    const int status = abi.AutonatStatus(node);
+    if (status == CABI_AUTONAT_PUBLIC)
+    {
+      return true;
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+
+  return false;
+}
+
 int main(int argc, char** argv)
 {
   LibHandle lib = LOAD_LIB(LIB_NAME);
@@ -174,12 +236,7 @@ int main(int argc, char** argv)
   try
   {
     // Step 1. Create Node
-    void* node = abi.NewNode(args.useQuic);
-    if (!node)
-    {
-      throw std::runtime_error("cabi_node_new returned NULL, check Rust logs");
-    }
-
+    void* node = createNode(abi, args.useQuic, false);
 
     // Step 2. Listen port. Begin Listening
     auto status = abi.ListenNode(node, listenerAddr.c_str());
@@ -195,18 +252,31 @@ int main(int argc, char** argv)
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Step 3. Dial bootstrap peers if provided
-    for (const auto& bootstrap : args.bootstrapPeers)
+    dialBootstraps(abi, node, args.bootstrapPeers);
+
+    // Step 4. Check AutoNAT and restart with hop relay if public
+    if (waitForPublicAutonat(abi, node, std::chrono::seconds(10)))
     {
-      cout << "Dialing bootstrap peer: " << bootstrap << "\n";
-      status = abi.DialNode(node, bootstrap.c_str());
+      cout << "AutoNAT is public; restarting node with relay hop enabled\n";
+      abi.FreeNode(node);
+
+      node = createNode(abi, args.useQuic, true);
+      status = abi.ListenNode(node, listenerAddr.c_str());
+      cout << "Listening on: " << CLIENT_IP_ADDR << ":" << args.listenPort
+        << " (" << listenerAddr << ") [hop relay]\n";
       if (status != CABI_STATUS_SUCCESS)
       {
-        cerr << "Failed to dial bootstrap peer (" << bootstrap << "): "
-             << statusMessage(status) << "\n";
+        abi.FreeNode(node);
+        throw std::runtime_error("cabi_node_listen failed after restart: " + statusMessage(status));
       }
+
+      // Start delay, waiting for listener to be ready
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      dialBootstraps(abi, node, args.bootstrapPeers);
     }
 
-    // Step 4. Dial to other client
+    // Step 5. Dial to other client
     status = abi.DialNode(node, dialerAddr.c_str());
     if (status != CABI_STATUS_SUCCESS)
     {
@@ -215,10 +285,10 @@ int main(int argc, char** argv)
     }
 
 
-    // Step 5. Keeping node alive for duration
+    // Step 6. Keeping node alive for duration
     std::this_thread::sleep_for(std::chrono::duration<float>(args.duration));
 
-    // Step 6. Don't forget to free node
+    // Step 7. Don't forget to free node
     abi.FreeNode(node);
   }
   catch (const std::exception& ex)
