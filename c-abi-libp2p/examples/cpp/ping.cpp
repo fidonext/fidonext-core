@@ -21,7 +21,7 @@ using LibHandle = void*;
 #define LOAD_LIB(path) dlopen(path, RTLD_LAZY)
 #define GET_PROC(lib, name) dlsym(lib, name)
 #define CLOSE_LIB(lib) dlclose(lib)
-constexpr auto LIB_NAME = "cabi_rust_libp2p.so";
+constexpr auto LIB_NAME = "./libcabi_rust_libp2p.so";
 #endif
 
 using std::cout;
