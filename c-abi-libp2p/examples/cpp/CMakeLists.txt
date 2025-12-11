@@ -15,5 +15,5 @@ add_executable (ping "ping.cpp")
 
 # Need link dl for Linux
 if (UNIX AND NOT APPLE)
-    target_link_libraries(ping_p2p PRIVATE dl)
+    target_link_libraries(ping PRIVATE dl)
 endif()
