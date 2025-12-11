@@ -1,0 +1,8 @@
+services:
+  cpp-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/build
+      - ./docker-out:/out

@@ -1,16 +1,27 @@
-## Build
+# Building
+### Builiding with MSVC
 ```
-mkdir build
-cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -G "Visual Studio 17 2022"
+cmake --build build --config Release
 ```
 
-# Use
-1. Copy .dll or .so into folder near executable
+### Building with GCC/clang
+```
+mkdir build-release
+cd build-release
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build .
+```
+### Building with Docker
+```
+docker compose up --build cpp-build
+```
+
+## Use
+1. Copy .dll or .so of the cabi-rust-libp2p into folder near executable
 2. Run through cmd/terminal
-3. `ping --use-quic --lport 41001 --dport 41002`
-4. `ping --use-quic --lport 41002 --dport 41001`
+3. `./ping --use-quic --lport 41001 --dport 41002`
+4. `./ping --use-quic --lport 41002 --dport 41001`
 
 ### Bootstrap peers
 Optional bootstrapping is supported via `--bootstrap <multiaddr>`, which can be
