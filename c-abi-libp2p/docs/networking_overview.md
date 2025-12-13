@@ -30,12 +30,13 @@ TransportConfig::build() → (identity::Keypair, Swarm<NetworkBehaviour>)
 ## 2. Creating and running the peer manager
 
 ```text
-PeerManager::new(config) → (PeerManager, PeerManagerHandle)
+PeerManager::new(config, bootstrap_peers) → (PeerManager, PeerManagerHandle)
 ```
 
 1. **Retrieve the `Swarm` and keypair.** `TransportConfig::build` yields both values.
 2. **Store the `PeerId`.** `PeerManager` keeps the `PeerId` and `Keypair` so other parts of the program can access the identity.
 3. **Set up the command channel.** An `mpsc` channel with a capacity of 32 is created; `PeerManagerHandle` wraps the sender side.
+4. **Seed the DHT.** Bootstrap multiaddrs supplied via FFI (plus any compiled defaults) are registered with Kademlia and an initial `bootstrap` query is fired so the node joins the network immediately.
 
 ```text
 PeerManager::run() — asynchronous loop

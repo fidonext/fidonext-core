@@ -23,6 +23,7 @@ use crate::{
     messaging::MessageQueueSender,
     transport::{BehaviourEvent, NetworkBehaviour, TransportConfig},
     peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
+    //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
 
 /// Commands supported by the [`PeerManager`] event loop.
@@ -123,7 +124,6 @@ enum DiscoveryKind {
     GetClosestPeers,
 }
 
-
 /// Manages the libp2p swarm (peer orchestrator) and exposes a command-driven control loop.
 pub struct PeerManager {
     swarm: Swarm<NetworkBehaviour>,
@@ -143,6 +143,7 @@ impl PeerManager {
         config: TransportConfig,
         inbound_sender: MessageQueueSender,
         discovery_sender: DiscoveryEventSender,
+        bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<(Self, PeerManagerHandle)> {
         let (keypair, swarm) = config.build()?;
         let local_peer_id = PeerId::from(keypair.public());
@@ -157,7 +158,21 @@ impl PeerManager {
             .subscribe(&gossipsub_topic)
             .map_err(|err| anyhow!("failed to subscribe to gossipsub topic: {err}"))?;
 
-        let manager = Self {
+        /* These are not needed as DEFAULT_BOOTSTRAP_PEERS should be empty
+        bootstrap_peers.extend(
+            DEFAULT_BOOTSTRAP_PEERS
+                .iter()
+                .filter_map(|value| match value.parse::<Multiaddr>() {
+                    Ok(addr) => Some(addr),
+                    Err(err) => {
+                        tracing::warn!(target: "peer", %err, value, "invalid default bootstrap peer; skipping");
+                        None
+                    }
+                }),
+        );
+        */
+
+        let mut manager = Self {
             swarm,
             command_receiver,
             local_peer_id,
@@ -168,6 +183,8 @@ impl PeerManager {
             discovery_sender,
             discovery_queries: HashMap::new(),
         };
+
+        manager.add_bootstrap_peers(bootstrap_peers);
 
         let handle = PeerManagerHandle {
             command_sender,
@@ -540,6 +557,47 @@ impl PeerManager {
 
         if let Err(err) = self.discovery_sender.try_enqueue(event) {
             tracing::warn!(target: "peer", %err, "failed to enqueue discovery completion");
+        }
+    }
+
+    // Adding bootstraps into node's DHT initial network
+    fn add_bootstrap_peers(&mut self, peers: Vec<Multiaddr>) {
+        let mut added = 0usize;
+
+        for mut addr in peers {
+            let peer_component = addr.pop();
+            match peer_component {
+                Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => {
+                    tracing::info!(
+                        target: "peer",
+                        %peer_id,
+                        address = %addr,
+                        "adding bootstrap peer"
+                    );
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                    added += 1;
+                }
+                other => {
+                    tracing::warn!(
+                        target: "peer",
+                        ?other,
+                        address = %addr,
+                        "bootstrap peer missing p2p component"
+                    );
+                }
+            }
+        }
+
+        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+            Ok(query_id) => {
+                tracing::info!(target: "peer", ?query_id, added, "started kademlia bootstrap");
+            }
+            Err(err) => {
+                tracing::warn!(target: "peer", %err, added, "failed to start kademlia bootstrap");
+            }
         }
     }
 }

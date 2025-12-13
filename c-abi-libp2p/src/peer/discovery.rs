@@ -38,7 +38,7 @@ pub enum DiscoveryEvent {
     },
 }
 
-/// Queue used to pass discovery events from the peer manager to the C-ABI layer.
+/// Queue used to pass discovery events from the peer manager to the C-ABI.
 #[derive(Debug)]
 pub struct DiscoveryQueue {
     sender: mpsc::Sender<DiscoveryEvent>,

@@ -78,12 +78,16 @@ struct ManagedNode {
 
 impl ManagedNode {
     /// Creates new peer manager for the single peer
-    fn new(config: transport::TransportConfig) -> Result<Self> {
+    fn new(config: transport::TransportConfig, bootstrap_peers: Vec<Multiaddr>) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
         let discovery_queue = peer::DiscoveryQueue::new(peer::DEFAULT_DISCOVERY_QUEUE_CAPACITY);
-        let (manager, handle) =
-            peer::PeerManager::new(config, message_queue.sender(), discovery_queue.sender())?;
+        let (manager, handle) = peer::PeerManager::new(
+            config,
+            message_queue.sender(),
+            discovery_queue.sender(),
+            bootstrap_peers,
+        )?;
         let autonat_status = handle.autonat_status();
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
@@ -213,24 +217,46 @@ pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
 #[no_mangle]
 /// C-ABI. Creates a new node instance and returns its handle
 pub extern "C" fn cabi_node_new(use_quic: bool) -> *mut CabiNodeHandle {
-    cabi_node_new_with_relay(use_quic, false)
+    cabi_node_new_with_relay_and_bootstrap(use_quic, false, std::ptr::null(), 0)
 }
-
 #[no_mangle]
 /// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode
 pub extern "C" fn cabi_node_new_with_relay(
     use_quic: bool,
     enable_relay_hop: bool,
 ) -> *mut CabiNodeHandle {
+    cabi_node_new_with_relay_and_bootstrap(use_quic, enable_relay_hop, std::ptr::null(), 0)
+}
+
+#[no_mangle]
+/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode and bootstrap peers
+pub extern "C" fn cabi_node_new_with_relay_and_bootstrap(
+    use_quic: bool,
+    enable_relay_hop: bool,
+    bootstrap_peers: *const *const c_char,
+    bootstrap_peers_len: usize,
+) -> *mut CabiNodeHandle {
     // Safe to call multiple times; only the first invocation sets up tracing.
     let _ = config::init_tracing();
+
+    let bootstrap_peers = match parse_bootstrap_peers(bootstrap_peers, bootstrap_peers_len) {
+        Ok(peers) => peers,
+        Err(status) => {
+            tracing::error!(
+                target: "ffi",
+                status,
+                "failed to parse bootstrap peers; node creation aborted"
+            );
+            return ptr::null_mut();
+        }
+    };
 
     let config = transport::TransportConfig {
         use_quic,
         hop_relay: enable_relay_hop,
     };
 
-    match ManagedNode::new(config) {
+    match ManagedNode::new(config, bootstrap_peers) {
         Ok(node) => {
             let boxed = Box::new(node);
             Box::into_raw(boxed) as *mut CabiNodeHandle
@@ -560,6 +586,29 @@ fn parse_multiaddr(address: *const c_char) -> FfiResult<Multiaddr> {
     };
 
     Multiaddr::from_str(addr_str).map_err(|_| CABI_STATUS_INVALID_ARGUMENT)
+}
+
+// Parses a c string into vector with bootstraps.
+fn parse_bootstrap_peers(
+    peers: *const *const c_char,
+    peers_len: usize,
+) -> FfiResult<Vec<Multiaddr>> {
+    if peers_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    if peers.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+
+    let peer_slice = unsafe { slice::from_raw_parts(peers, peers_len) };
+    let mut parsed = Vec::with_capacity(peer_slice.len());
+
+    for &peer in peer_slice {
+        parsed.push(parse_multiaddr(peer)?);
+    }
+
+    Ok(parsed)
 }
 
 /// Parses a c string into a libp2p PeerId.
