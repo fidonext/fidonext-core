@@ -58,8 +58,11 @@ constexpr int DEFAULT_MESSAGE_QUEUE_CAPACITY = 64;
 constexpr const char* CLIENT_IP_ADDR = "127.0.0.1";
 
 using InitTracingFunc = int (*)();
-using NewNodeFunc = void* (*)(bool useQuic);
-using NewNodeWithRelayFunc = void* (*)(bool useQuic, bool enableRelayHop);
+using NewNodeFunc = void* (*)(
+  bool useQuic,
+  bool enableRelayHop,
+  const char* const* bootstrapPeers,
+  size_t bootstrapPeersLen);
 using ListenNodeFunc = int (*)(void* handle, const char* multiaddr);
 using DialNodeFunc = int (*)(void* handle, const char* multiaddr);
 using AutonatStatusFunc = int (*)(void* handle);
@@ -71,7 +74,6 @@ struct CabiRustLibp2p
 {
   InitTracingFunc       InitTracing{};
   NewNodeFunc           NewNode{};
-  NewNodeWithRelayFunc  NewNodeWithRelay{};
   ListenNodeFunc        ListenNode{};
   DialNodeFunc          DialNode{};
   AutonatStatusFunc     AutonatStatus{};
@@ -91,8 +93,7 @@ struct Arguments
 bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
 {
   abi.InitTracing = reinterpret_cast<InitTracingFunc>(GET_PROC(lib, "cabi_init_tracing"));
-  abi.NewNode = reinterpret_cast<NewNodeFunc>(GET_PROC(lib, "cabi_node_new"));
-  abi.NewNodeWithRelay = reinterpret_cast<NewNodeWithRelayFunc>(GET_PROC(lib, "cabi_node_new_with_relay"));
+  abi.NewNode = reinterpret_cast<NewNodeFunc>(GET_PROC(lib, "cabi_node_new_with_relay"));
   abi.ListenNode = reinterpret_cast<ListenNodeFunc>(GET_PROC(lib, "cabi_node_listen"));
   abi.DialNode = reinterpret_cast<DialNodeFunc>(GET_PROC(lib, "cabi_node_dial"));
   abi.AutonatStatus = reinterpret_cast<AutonatStatusFunc>(GET_PROC(lib, "cabi_autonat_status"));
@@ -100,7 +101,7 @@ bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
   abi.DequeueMessage = reinterpret_cast<DequeueMessageFunc>(GET_PROC(lib, "cabi_node_dequeue_message"));
   abi.FreeNode = reinterpret_cast<FreeNodeFunc>(GET_PROC(lib, "cabi_node_free"));
 
-  return  abi.InitTracing && abi.NewNode && abi.NewNodeWithRelay &&
+  return  abi.InitTracing && abi.NewNode && abi.NewNode &&
           abi.ListenNode && abi.DialNode && abi.AutonatStatus && 
           abi.EnqueueMessage && abi.DequeueMessage && abi.FreeNode;
 }
@@ -175,11 +176,25 @@ string statusMessage(int status)
   }
 }
 
-void* createNode(const CabiRustLibp2p& abi, bool useQuic, bool enableRelayHop)
+void* createNode(
+  const CabiRustLibp2p& abi,
+  bool useQuic,
+  bool enableRelayHop,
+  const std::vector<string>& bootstrapPeers)
 {
-  void* node = enableRelayHop
-    ? abi.NewNodeWithRelay(useQuic, true)
-    : abi.NewNode(useQuic);
+  std::vector<const char*> bootstrapPtrs;
+  bootstrapPtrs.reserve(bootstrapPeers.size());
+
+  for (const auto& peer : bootstrapPeers)
+  {
+    bootstrapPtrs.push_back(peer.c_str());
+  }
+
+  void* node = abi.NewNode(
+    useQuic,
+    enableRelayHop,
+    bootstrapPtrs.data(),
+    bootstrapPtrs.size());
 
   if (!node)
   {
@@ -187,21 +202,6 @@ void* createNode(const CabiRustLibp2p& abi, bool useQuic, bool enableRelayHop)
   }
 
   return node;
-}
-
-void dialBootstraps(const CabiRustLibp2p& abi, void* node, 
-  const std::vector<string>& bootstrapPeers)
-{
-  for (const auto& bootstrap : bootstrapPeers)
-  {
-    cout << "Dialing bootstrap peer: " << bootstrap << "\n";
-    const int status = abi.DialNode(node, bootstrap.c_str());
-    if (status != CABI_STATUS_SUCCESS)
-    {
-      cerr << "Failed to dial bootstrap peer (" << bootstrap << "): "
-            << statusMessage(status) << "\n";
-    }
-  }
 }
 
 bool waitForPublicAutonat(const CabiRustLibp2p& abi, void* node, std::chrono::seconds timeout)
@@ -330,7 +330,7 @@ int main(int argc, char** argv)
   try
   {
     // Step 1. Create Node
-    void* node = createNode(abi, args.useQuic, false);
+    void* node = createNode(abi, args.useQuic, false, args.bootstrapPeers);
 
     // Step 2. Listen port. Begin Listening
     auto status = abi.ListenNode(node, listenerAddr.c_str());
@@ -345,16 +345,13 @@ int main(int argc, char** argv)
     // Start delay, waiting for listener to be ready
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Step 3. Dial bootstrap peers if provided
-    dialBootstraps(abi, node, args.bootstrapPeers);
-
-    // Step 4. Check AutoNAT and restart with hop relay if public
+    // Step 3. Check AutoNAT and restart with hop relay if public
     if (waitForPublicAutonat(abi, node, std::chrono::seconds(10)))
     {
       cout << "AutoNAT is public; restarting node with relay hop enabled\n";
       abi.FreeNode(node);
 
-      node = createNode(abi, args.useQuic, true);
+      node = createNode(abi, args.useQuic, true, args.bootstrapPeers);
       status = abi.ListenNode(node, listenerAddr.c_str());
       cout << "Listening on: " << CLIENT_IP_ADDR << ":" << args.listenPort
         << " (" << listenerAddr << ") [hop relay]\n";
@@ -366,11 +363,9 @@ int main(int argc, char** argv)
 
       // Start delay, waiting for listener to be ready
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-      dialBootstraps(abi, node, args.bootstrapPeers);
     }
 
-    // Step 5. Dial to other client
+    // Step 4. Dial to other client
     status = abi.DialNode(node, dialerAddr.c_str());
     if (status != CABI_STATUS_SUCCESS)
     {
