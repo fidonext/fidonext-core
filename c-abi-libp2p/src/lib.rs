@@ -16,10 +16,11 @@ use std::{
     ptr,
     slice,
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
-use ::libp2p::{autonat, Multiaddr};
+use ::libp2p::{autonat, Multiaddr,PeerId};
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 
 /// More suitable alias for results while using C-ABI libp2p rust lib
@@ -34,16 +35,29 @@ pub const CABI_STATUS_INVALID_ARGUMENT: c_int = 2;
 /// Internal runtime error – check logs for details.
 pub const CABI_STATUS_INTERNAL_ERROR: c_int = 3;
 
+/// No message available in the internal queue.
+pub const CABI_STATUS_QUEUE_EMPTY: c_int = 4;
+/// Provided buffer is too small to fit the dequeued message.
+pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = 5;
+
+/// The discovery query timed out.
+pub const CABI_STATUS_TIMEOUT: c_int = 6;
+/// The target peer could not be located in the DHT.
+pub const CABI_STATUS_NOT_FOUND: c_int = 7;
+
+
 /// AutoNAT status has not yet been determined.
 pub const CABI_AUTONAT_UNKNOWN: c_int = 0;
 /// AutoNAT reports the node as privately reachable only.
 pub const CABI_AUTONAT_PRIVATE: c_int = 1;
 /// AutoNAT reports the node as publicly reachable.
 pub const CABI_AUTONAT_PUBLIC: c_int = 2;
-/// No message available in the internal queue.
-pub const CABI_STATUS_QUEUE_EMPTY: c_int = 4;
-/// Provided buffer is too small to fit the dequeued message.
-pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = 5;
+
+
+/// Discovery event carries an address for a peer.
+pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
+/// Discovery query has finished.
+pub const CABI_DISCOVERY_EVENT_FINISHED: c_int = 1;
 
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
@@ -58,6 +72,8 @@ struct ManagedNode {
     worker: Option<JoinHandle<()>>,
     autonat_status: watch::Receiver<autonat::NatStatus>,
     message_queue: messaging::MessageQueue,
+    discovery_queue: peer::DiscoveryQueue,
+    discovery_sequence: AtomicU64,
 }
 
 impl ManagedNode {
@@ -65,8 +81,9 @@ impl ManagedNode {
     fn new(config: transport::TransportConfig) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let discovery_queue = peer::DiscoveryQueue::new(peer::DEFAULT_DISCOVERY_QUEUE_CAPACITY);
         let (manager, handle) =
-            peer::PeerManager::new(config, message_queue.sender())?;
+            peer::PeerManager::new(config, message_queue.sender(), discovery_queue.sender())?;
         let autonat_status = handle.autonat_status();
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
@@ -80,6 +97,8 @@ impl ManagedNode {
             autonat_status,
             worker: Some(worker),
             message_queue,
+            discovery_queue,
+            discovery_sequence: AtomicU64::new(0),
         })
     }
 
@@ -104,6 +123,29 @@ impl ManagedNode {
             .context("failed to publish message")
     }
 
+    /// Initiates a Kademlia find_peer query and returns the request identifier.
+    fn find_peer(&self, peer_id: PeerId) -> Result<u64> {
+        let request_id = self.next_discovery_request_id();
+        self.runtime
+            .block_on(self.handle.find_peer(peer_id, request_id))
+            .context("failed to start find_peer query")
+            .map(|_| request_id)
+    }
+
+    /// Initiates a Kademlia get_closest_peers query and returns the request identifier.
+    fn get_closest_peers(&self, peer_id: PeerId) -> Result<u64> {
+        let request_id = self.next_discovery_request_id();
+        self.runtime
+            .block_on(self.handle.get_closest_peers(peer_id, request_id))
+            .context("failed to start get_closest_peers query")
+            .map(|_| request_id)
+    }
+
+   /// Attempts to dequeue the next discovery event without blocking.
+    fn try_dequeue_discovery(&mut self) -> Option<peer::DiscoveryEvent> {
+        self.discovery_queue.try_dequeue()
+    }
+
     /// Attempts to pull a message from the internal queue without blocking.
     fn try_dequeue_message(&mut self) -> Option<Vec<u8>> {
         self.message_queue.try_dequeue()
@@ -126,6 +168,10 @@ impl ManagedNode {
 
     fn autonat_status(&self) -> autonat::NatStatus {
         self.autonat_status.borrow().clone()
+    }
+
+    fn next_discovery_request_id(&self) -> u64 {
+        self.discovery_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -241,6 +287,72 @@ pub extern "C" fn cabi_node_dial(handle: *mut CabiNodeHandle, address: *const c_
 }
 
 #[no_mangle]
+/// C-ABI. Starts a find_peer query for the given PeerId and returns a request identifier.
+pub extern "C" fn cabi_node_find_peer(
+    handle: *mut CabiNodeHandle,
+    peer_id: *const c_char,
+    request_id: *mut u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if request_id.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(id) => id,
+        Err(status) => return status,
+    };
+
+    match node.find_peer(peer_id) {
+        Ok(id) => unsafe {
+            *request_id = id;
+            CABI_STATUS_SUCCESS
+        },
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "find_peer request failed");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Starts a get_closest_peers query for the given PeerId and returns a request identifier.
+pub extern "C" fn cabi_node_get_closest_peers(
+    handle: *mut CabiNodeHandle,
+    peer_id: *const c_char,
+    request_id: *mut u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if request_id.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(id) => id,
+        Err(status) => return status,
+    };
+
+    match node.get_closest_peers(peer_id) {
+        Ok(id) => unsafe {
+            *request_id = id;
+            CABI_STATUS_SUCCESS
+        },
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "get_closest_peers request failed");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
 /// C-ABI. Enqueues a binary payload into the node's internal message queue.
 pub extern "C" fn cabi_node_enqueue_message(
     handle: *mut CabiNodeHandle,
@@ -321,6 +433,100 @@ pub extern "C" fn cabi_node_dequeue_message(
 }
 
 #[no_mangle]
+/// C-ABI. Attempts to dequeue a discovery result produced by a Kademlia query.
+pub extern "C" fn cabi_node_dequeue_discovery_event(
+    handle: *mut CabiNodeHandle,
+    event_kind: *mut c_int,
+    request_id: *mut u64,
+    status_code: *mut c_int,
+    peer_id_buffer: *mut c_char,
+    peer_id_buffer_len: usize,
+    peer_id_written_len: *mut usize,
+    address_buffer: *mut c_char,
+    address_buffer_len: usize,
+    address_written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if event_kind.is_null()
+        || request_id.is_null()
+        || status_code.is_null()
+        || peer_id_buffer.is_null()
+        || peer_id_written_len.is_null()
+        || address_buffer.is_null()
+        || address_written_len.is_null()
+    {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    if peer_id_buffer_len == 0 || address_buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    unsafe {
+        *peer_id_written_len = 0;
+        *address_written_len = 0;
+    }
+
+    let event = match node.try_dequeue_discovery() {
+        Some(event) => event,
+        None => return CABI_STATUS_QUEUE_EMPTY,
+    };
+
+    let (kind, req_id, status, peer_id, address) = match event {
+        peer::DiscoveryEvent::Address {
+            request_id,
+            peer_id,
+            address,
+            ..
+        } => (
+            CABI_DISCOVERY_EVENT_ADDRESS,
+            request_id,
+            CABI_STATUS_SUCCESS,
+            peer_id.to_string(),
+            address.to_string(),
+        ),
+        peer::DiscoveryEvent::Finished {
+            request_id,
+            target_peer_id,
+            status,
+        } => (
+            CABI_DISCOVERY_EVENT_FINISHED,
+            request_id,
+            discovery_status_to_code(&status),
+            target_peer_id.to_string(),
+            String::new(),
+        ),
+    };
+
+    unsafe {
+        *event_kind = kind;
+        *request_id = req_id;
+        *status_code = status;
+    }
+
+    let peer_status = write_c_string(
+        peer_id.as_str(),
+        peer_id_buffer,
+        peer_id_buffer_len,
+        peer_id_written_len,
+    );
+    if peer_status != CABI_STATUS_SUCCESS {
+        return peer_status;
+    }
+
+    write_c_string(
+        address.as_str(),
+        address_buffer,
+        address_buffer_len,
+        address_written_len,
+    )
+}
+
+#[no_mangle]
 /// C-ABI. Frees node with specified handle
 pub extern "C" fn cabi_node_free(handle: *mut CabiNodeHandle) {
     if handle.is_null() {
@@ -354,4 +560,61 @@ fn parse_multiaddr(address: *const c_char) -> FfiResult<Multiaddr> {
     };
 
     Multiaddr::from_str(addr_str).map_err(|_| CABI_STATUS_INVALID_ARGUMENT)
+}
+
+/// Parses a c string into a libp2p PeerId.
+fn parse_peer_id(peer_id: *const c_char) -> FfiResult<PeerId> {
+    if peer_id.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+
+    let c_str = unsafe { CStr::from_ptr(peer_id) };
+    let peer_str = match c_str.to_str() {
+        Ok(value) => value,
+        Err(_) => return Err(CABI_STATUS_INVALID_ARGUMENT),
+    };
+
+    PeerId::from_str(peer_str).map_err(|_| CABI_STATUS_INVALID_ARGUMENT)
+}
+
+fn write_c_string(
+    value: &str,
+    out_buffer: *mut c_char,
+    buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    if out_buffer.is_null() || written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    if buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    let bytes = value.as_bytes();
+    let required = bytes.len() + 1;
+
+    unsafe {
+        *written_len = bytes.len();
+    }
+
+    if required > buffer_len {
+        return CABI_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out_buffer as *mut u8, bytes.len());
+        *out_buffer.add(bytes.len()) = 0;
+    }
+
+    CABI_STATUS_SUCCESS
+}
+
+fn discovery_status_to_code(status: &peer::DiscoveryStatus) -> c_int {
+    match status {
+        peer::DiscoveryStatus::Success => CABI_STATUS_SUCCESS,
+        peer::DiscoveryStatus::NotFound => CABI_STATUS_NOT_FOUND,
+        peer::DiscoveryStatus::Timeout => CABI_STATUS_TIMEOUT,
+        peer::DiscoveryStatus::InternalError => CABI_STATUS_INTERNAL_ERROR,
+    }
 }
