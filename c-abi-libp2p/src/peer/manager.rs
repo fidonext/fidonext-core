@@ -11,10 +11,12 @@ use libp2p::{
     core::Multiaddr,
     gossipsub,
     identity,
-    swarm::{Swarm, SwarmEvent},
+    swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
     autonat,
     kad::{self, QueryResult},
+    relay,
+    multiaddr::Protocol,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -40,6 +42,8 @@ pub enum PeerCommand {
     GetClosestPeers { peer_id: PeerId, request_id: u64 },
     /// Dial the given remote multi-address.
     Dial(Multiaddr),
+    /// Dial a public relay and request a reservation.
+    ReserveRelay(Multiaddr),
     /// Publish a payload to the gossipsub topic.
     Publish(Vec<u8>),
     /// Shut the manager down gracefully.
@@ -97,6 +101,14 @@ impl PeerManagerHandle {
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
 
+    /// Requests a reservation on a relay reachable at the given address.
+    pub async fn reserve_relay(&self, address: Multiaddr) -> Result<()> {
+        self.command_sender
+            .send(PeerCommand::ReserveRelay(address))
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
+
     /// Publishes a message to connected peers via gossipsub.
     pub async fn publish(&self, payload: Vec<u8>) -> Result<()> {
         self.command_sender
@@ -139,6 +151,8 @@ pub struct PeerManager {
     discovery_sender: DiscoveryEventSender,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
     discovery_dial_backoff: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
+    relay_base_address: Option<Multiaddr>,
+    relay_peer_id: Option<PeerId>,
 }
 
 impl PeerManager {
@@ -187,6 +201,8 @@ impl PeerManager {
             discovery_sender,
             discovery_queries: HashMap::new(),
             discovery_dial_backoff: HashMap::new(),
+            relay_base_address: None,
+            relay_peer_id: None,
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -240,6 +256,23 @@ impl PeerManager {
                     Ok(_) => tracing::info!(target: "peer", %address, "dialing remote"),
                     Err(err) => tracing::error!(target: "peer", %address, %err, "failed to dial"),
                 }
+                Ok(false)
+            }
+            PeerCommand::ReserveRelay(address) => {
+                if let Some(peer_id) = extract_peer_id(&address) {
+                    self.relay_peer_id = Some(peer_id);
+                }
+
+                match self.swarm.listen_on(address.clone()) {
+                    Ok(_) => tracing::info!(target: "peer", %address, "listening via relay"),
+                    Err(err) => tracing::error!(
+                        target: "peer",
+                        %address,
+                        %err,
+                        "failed to start relay reservation"
+                    ),
+                }
+
                 Ok(false)
             }
             PeerCommand::FindPeer {
@@ -323,12 +356,15 @@ impl PeerManager {
     fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(event) => self.handle_behaviour_event(event),
+
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(target: "peer", %address, "listening on new address");
             }
+
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 tracing::info!(target: "peer", %peer_id, "connection established");
             }
+
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 if let Some(error) = cause {
                     tracing::warn!(target: "peer", %peer_id, %error, "connection closed with error");
@@ -336,9 +372,11 @@ impl PeerManager {
                     tracing::info!(target: "peer", %peer_id, "connection closed");
                 }
             }
+
             SwarmEvent::IncomingConnection { send_back_addr, .. } => {
                 tracing::debug!(target: "peer", %send_back_addr, "incoming connection");
             }
+
             SwarmEvent::IncomingConnectionError {
                 send_back_addr,
                 error,
@@ -346,17 +384,39 @@ impl PeerManager {
             } => {
                 tracing::warn!(target: "peer", %send_back_addr, %error, "incoming connection error");
             }
+
+            SwarmEvent::NewExternalAddrCandidate { address } => {
+                tracing::info!(target: "peer", %address, "new external address candidate");
+            }
+
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                tracing::info!(target: "peer", %address, "external address confirmed");
+                self.update_relay_address(address);
+            }
+
+            SwarmEvent::ExternalAddrExpired { address } => {
+                tracing::warn!(target: "peer", %address, "external address expired");
+                self.clear_relay_address(&address);
+            }
+
             SwarmEvent::ListenerClosed {
                 addresses, reason, ..
             } => {
                 tracing::warn!(target: "peer", ?addresses, ?reason, "listener closed");
             }
+
             SwarmEvent::ListenerError { error, .. } => {
                 tracing::error!(target: "peer", %error, "listener error");
             }
+
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::warn!(target: "peer", ?peer_id, %error, "outgoing connection error");
+
+                if let Some(peer_id) = peer_id {
+                    self.try_dial_via_relay(&peer_id, &error);
+                }
             }
+            
             _ => {}
         }
     }
@@ -367,6 +427,7 @@ impl PeerManager {
             BehaviourEvent::Kademlia(event) => {
                 self.handle_kademlia_event(event);
             }
+
             BehaviourEvent::Ping(event) => match event.result {
                 Ok(rtt) => {
                     tracing::debug!(target: "peer", ?rtt, "ping success");
@@ -375,9 +436,11 @@ impl PeerManager {
                     tracing::warn!(target: "peer", %error, "ping failure");
                 }
             },
+
             BehaviourEvent::Identify(event) => {
                 tracing::debug!(target: "peer", ?event, "identify event");
             }
+
             BehaviourEvent::Gossipsub(event) => {
                 if let gossipsub::Event::Message {
                     message, propagation_source, ..
@@ -388,6 +451,7 @@ impl PeerManager {
                     }
                 }
             }
+
             BehaviourEvent::Autonat(event) => {
                 tracing::debug!(target:"peer", ?event, "autonat event");
                 
@@ -400,14 +464,42 @@ impl PeerManager {
                     }
                 }
             }
-            BehaviourEvent::RelayClient(event) => {
-                tracing::debug!(target: "peer", ?event, "relay client event");
-            }
+
+            BehaviourEvent::RelayClient(event) => match event {
+                relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    limit,
+                } => {
+                    self.relay_peer_id = Some(relay_peer_id);
+                    tracing::info!(
+                        target: "peer",
+                        relay_id = %relay_peer_id,
+                        renewal,
+                        ?limit,
+                        "relay reservation accepted",
+                    );
+                }
+
+                relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+                    tracing::info!(
+                        target: "peer",
+                        relay_id = %relay_peer_id,
+                        "outbound circuit established",
+                    );
+                }
+
+                other => {
+                    tracing::debug!(target: "peer", ?other, "relay client event");
+                }
+            },
+
             BehaviourEvent::RelayServer(event) => {
                 tracing::debug!(target: "peer", ?event, "relay server event");
             }
         }
     }
+
     fn handle_kademlia_event(&mut self, event: kad::Event) {
         match event {
             kad::Event::OutboundQueryProgressed {
@@ -653,5 +745,124 @@ impl PeerManager {
                 tracing::warn!(target: "peer", %err, added, "failed to start kademlia bootstrap");
             }
         }
+    }
+
+    fn try_dial_via_relay(&mut self, target_peer_id: &PeerId, error: &DialError) {
+        if self.relay_peer_id.as_ref() == Some(target_peer_id) {
+            tracing::debug!(
+                target: "peer",
+                %target_peer_id,
+                "skipping relay fallback when dialing relay peer itself",
+            );
+            return;
+        }
+
+        let Some(relay_base_address) = self.relay_base_address.clone() else {
+            tracing::debug!(
+                target: "peer",
+                %target_peer_id,
+                "no relay reservation available for fallback dialing",
+            );
+            return;
+        };
+
+        if dial_error_involves_circuit(error) {
+            tracing::debug!(
+                target: "peer",
+                %target_peer_id,
+                "dial attempt already used a relay circuit; skipping fallback",
+            );
+            return;
+        }
+
+        let mut relay_circuit_addr = relay_base_address.clone();
+        relay_circuit_addr.push(Protocol::P2pCircuit);
+        relay_circuit_addr.push(Protocol::P2p(target_peer_id.clone()));
+
+        match self.swarm.dial(relay_circuit_addr.clone()) {
+            Ok(_) => tracing::info!(
+                target: "peer",
+                %relay_circuit_addr,
+                %target_peer_id,
+                "retrying dial via relay circuit",
+            ),
+            Err(err) => tracing::error!(
+                target: "peer",
+                %relay_circuit_addr,
+                %target_peer_id,
+                %err,
+                "failed to dial via relay circuit",
+            ),
+        }
+    }
+
+    fn update_relay_address(&mut self, address: Multiaddr) {
+        if let Some((base_address, relay_peer_id)) =
+            relay_base_from_external(&address, &self.local_peer_id)
+        {
+            tracing::info!(
+                target: "peer",
+                %base_address,
+                relay_id = %relay_peer_id,
+                "updated relay base address",
+            );
+
+            self.relay_base_address = Some(base_address);
+            if self.relay_peer_id.is_none() {
+                self.relay_peer_id = Some(relay_peer_id);
+            }
+        } else {
+            tracing::debug!(
+                target: "peer",
+                %address,
+                "external address is not a relay reservation for this peer",
+            );
+        }
+    }
+
+    fn clear_relay_address(&mut self, address: &Multiaddr) {
+        if let Some((base_address, _)) = relay_base_from_external(address, &self.local_peer_id) {
+            if self.relay_base_address.as_ref() == Some(&base_address) {
+                tracing::info!(target: "peer", %base_address, "clearing relay base address");
+                self.relay_base_address = None;
+            }
+        }
+    }
+}
+
+fn extract_peer_id(address: &Multiaddr) -> Option<PeerId> {
+    address
+        .iter()
+        .filter_map(|component| match component {
+            Protocol::P2p(peer_id) => Some(peer_id),
+            _ => None,
+        })
+        .last()
+}
+
+fn dial_error_involves_circuit(error: &DialError) -> bool {
+    match error {
+        DialError::Transport(address_errors) => address_errors.iter().any(|(addr, _)| {
+            addr.iter()
+                .any(|component| matches!(component, Protocol::P2pCircuit))
+        }),
+        _ => false,
+    }
+}
+
+fn relay_base_from_external(
+    address: &Multiaddr,
+    local_peer_id: &PeerId,
+) -> Option<(Multiaddr, PeerId)> {
+    let mut addr = address.clone();
+
+    match (addr.pop(), addr.pop()) {
+        (Some(Protocol::P2p(local)), Some(Protocol::P2pCircuit)) if local == *local_peer_id => {
+            match addr.iter().last() {
+                Some(Protocol::P2p(relay_peer_id)) => Some((addr, relay_peer_id.clone())),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

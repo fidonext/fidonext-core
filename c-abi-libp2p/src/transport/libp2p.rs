@@ -215,9 +215,7 @@ impl TransportConfig {
     }
 
     /// Configures TCP with Noise authentication and Yamux multiplexing
-    fn build_tcp_transport(
-        noise_config: noise::Config,
-    ) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    fn build_tcp_transport(noise_config: noise::Config) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default());
         Ok(tcp_transport
             .upgrade(upgrade::Version::V1Lazy)
