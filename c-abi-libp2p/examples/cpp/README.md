@@ -23,15 +23,39 @@ docker compose up --build cpp-build
 3. `./ping --use-quic --lport 41001 --dport 41002`
 4. `./ping --use-quic --lport 41002 --dport 41001`
 
-### Bootstrap peers
-Optional bootstrapping is supported via `--bootstrap <multiaddr>`, which can be
-specified multiple times. The example now feeds these peers directly into node
-creation so they are registered with Kademlia and bootstrapped immediately. For
-example:
+## Running a relay + two peers (deterministic IDs)
 
-```
-ping --lport 41000 --dport 41001 --bootstrap /ip4/203.0.113.1/tcp/5001/p2p/12D3KooW...
-```
+You can pin the `PeerId` of each node by supplying either a 32-byte hex seed
+(`--seed <64 hex chars>`) **or** a human-friendly seed phrase that is
+deterministically expanded to 32 bytes (`--seed-phrase <string>`). This allows
+you to pre-compute relay/peer multiaddrs and wire them together reproducibly:
+
+1. Start the public relay (waits for PUBLIC AutoNAT and restarts with hop):
+   ```
+   ./ping --role relay --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one
+   ```
+   Note the `Local PeerId` printed to the console; call it `<RELAY_ID>`.
+
+2. Start peer A with a fixed seed, dialing the relay as a bootstrap peer:
+   ```
+   ./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a
+   ```
+   The logged `Local PeerId` for this node is `<PEER_A_ID>`.
+
+3. Start peer B the same way (different seed) and bootstrap through the relay:
+   ```
+   ./ping --listen /ip4/0.0.0.0/tcp/41002 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-b
+   ```
+   Its `Local PeerId` is `<PEER_B_ID>`.
+
+Once the relay reports PUBLIC reachability and the peers have dialed the relay
+bootstrap address, they will exchange gossipsub messages via the relay. Enter
+text in either peer terminal to broadcast payloads.
+
+### Bootstrap peers (manual)
+Optional bootstrapping is also supported via `--bootstrap <multiaddr>`, which
+can be specified multiple times. The example feeds these peers directly into
+node creation so they are registered with Kademlia and bootstrapped immediately.
 
 ### Relay hop restart
 The example polls AutoNAT for up to 10 seconds. If the node reports **public**

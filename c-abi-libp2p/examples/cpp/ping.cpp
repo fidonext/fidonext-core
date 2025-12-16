@@ -1,5 +1,4 @@
 ﻿#include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -10,8 +9,10 @@
 #include <iostream>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
+#include <array>
+#include <thread>
+#include <atomic>
 
 // Crossplatform
 #ifdef _WIN32
@@ -67,12 +68,15 @@ using NewNodeFunc = void* (*)(
   bool useQuic,
   bool enableRelayHop,
   const char* const* bootstrapPeers,
-  size_t bootstrapPeersLen);
+  size_t bootstrapPeersLen,
+  const uint8_t* identitySeedPtr,
+  size_t identitySeedLen);
 using ListenNodeFunc = int (*)(void* handle, const char* multiaddr);
 using DialNodeFunc = int (*)(void* handle, const char* multiaddr);
 using AutonatStatusFunc = int (*)(void* handle);
 using EnqueueMessageFunc = int (*)(void* handle, const uint8_t* data_ptr, size_t data_len);
 using DequeueMessageFunc = int (*)(void* handle, uint8_t* out_buffer, size_t buffer_len, size_t* written_len);
+using LocalPeerIdFunc = int (*)(void* handle, char* out_buffer, size_t buffer_len, size_t* written_len);
 using FreeNodeFunc = void (*)(void* handle);
 
 struct CabiRustLibp2p
@@ -84,6 +88,7 @@ struct CabiRustLibp2p
   AutonatStatusFunc     AutonatStatus{};
   EnqueueMessageFunc    EnqueueMessage{};
   DequeueMessageFunc    DequeueMessage{};
+  LocalPeerIdFunc       LocalPeerId{};
   FreeNodeFunc          FreeNode{};
 };
 
@@ -100,6 +105,7 @@ struct Arguments
   string listen;
   std::vector<string> bootstrapPeers{};
   std::vector<string> targetPeers{};
+  std::optional<std::array<uint8_t, 32>> identitySeed{};
 };
 
 // RAII for handle of the node
@@ -152,11 +158,12 @@ bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
   abi.AutonatStatus = reinterpret_cast<AutonatStatusFunc>(GET_PROC(lib, "cabi_autonat_status"));
   abi.EnqueueMessage = reinterpret_cast<EnqueueMessageFunc>(GET_PROC(lib, "cabi_node_enqueue_message"));
   abi.DequeueMessage = reinterpret_cast<DequeueMessageFunc>(GET_PROC(lib, "cabi_node_dequeue_message"));
+  abi.LocalPeerId = reinterpret_cast<LocalPeerIdFunc>(GET_PROC(lib, "cabi_node_local_peer_id"));
   abi.FreeNode = reinterpret_cast<FreeNodeFunc>(GET_PROC(lib, "cabi_node_free"));
 
-  return  abi.InitTracing && abi.NewNode &&
-          abi.ListenNode && abi.DialNode && abi.AutonatStatus && 
-          abi.EnqueueMessage && abi.DequeueMessage && abi.FreeNode;
+  return  abi.InitTracing && abi.NewNode && abi.ListenNode &&
+          abi.DialNode && abi.AutonatStatus && abi.EnqueueMessage &&
+          abi.DequeueMessage && abi.LocalPeerId && abi.FreeNode;
 }
 
 string defaultListen(bool useQuic)
@@ -169,10 +176,75 @@ string defaultListen(bool useQuic)
   return "/ip4/127.0.0.1/tcp/41000";
 }
 
+std::array<uint8_t, 32> parseSeed(const string& hexSeed)
+{
+  if (hexSeed.size() != 64)
+  {
+    throw std::invalid_argument("seed must contain exactly 64 hex characters (32 bytes)");
+  }
+
+  std::array<uint8_t, 32> seed{};
+  for (size_t i = 0; i < 32; ++i)
+  {
+    const auto byteStr = hexSeed.substr(i * 2, 2);
+    char* endPtr = nullptr;
+    const auto value = std::strtoul(byteStr.c_str(), &endPtr, 16);
+    if (endPtr == byteStr.c_str() || value > 0xFF)
+    {
+      throw std::invalid_argument("seed contains non-hex characters");
+    }
+    seed[i] = static_cast<uint8_t>(value);
+  }
+
+  return seed;
+}
+
+// Simple FNV-1a-inspired mixer across four lanes to fill 32 bytes deterministically.
+// This one was needed as it is easier to provide string seed rather 32 len num
+std::array<uint8_t, 32> deriveSeedFromString(const string& seedPhrase)
+{
+  constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
+  constexpr uint64_t FNV_PRIME  = 0x100000001b3ULL;
+
+  std::array<uint64_t, 4> lanes{
+    FNV_OFFSET ^ 0x736565646c616e65ULL, // "seedlane"
+    FNV_OFFSET ^ 0x706872617365313ULL,  // "phrase1"
+    FNV_OFFSET ^ 0x706872617365323ULL,  // "phrase2"
+    FNV_OFFSET ^ 0x706872617365333ULL,  // "phrase3"
+  };
+
+  for (const unsigned char byte : seedPhrase)
+  {
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+      lanes[i] ^= static_cast<uint64_t>(byte) + (0x9e3779b97f4a7c15ULL * i);
+      lanes[i] *= (FNV_PRIME + (i * 2));
+      lanes[i] ^= lanes[(i + 1) % lanes.size()] >> (8 * (i + 1));
+    }
+  }
+
+  std::array<uint8_t, 32> seed{};
+  for (size_t i = 0; i < lanes.size(); ++i)
+  {
+    const uint64_t value = lanes[i];
+    seed[i * 8 + 0] = static_cast<uint8_t>((value >> 0) & 0xFF);
+    seed[i * 8 + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    seed[i * 8 + 2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    seed[i * 8 + 3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    seed[i * 8 + 4] = static_cast<uint8_t>((value >> 32) & 0xFF);
+    seed[i * 8 + 5] = static_cast<uint8_t>((value >> 40) & 0xFF);
+    seed[i * 8 + 6] = static_cast<uint8_t>((value >> 48) & 0xFF);
+    seed[i * 8 + 7] = static_cast<uint8_t>((value >> 56) & 0xFF);
+  }
+
+  return seed;
+}
+
 Arguments parseArgs(int argc, char** argv)
 {
   Arguments args;
   bool listenProvided = false;
+  bool seedProvided = false;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -211,6 +283,24 @@ Arguments parseArgs(int argc, char** argv)
     {
       args.targetPeers.emplace_back(argv[++i]);
     }
+        else if (arg == "--seed" && i + 1 < argc)
+    {
+      if (seedProvided)
+      {
+        throw std::invalid_argument("--seed/--seed-phrase are mutually exclusive");
+      }
+      args.identitySeed = parseSeed(argv[++i]);
+      seedProvided = true;
+    }
+    else if (arg == "--seed-phrase" && i + 1 < argc)
+    {
+      if (seedProvided)
+      {
+        throw std::invalid_argument("--seed/--seed-phrase are mutually exclusive");
+      }
+      args.identitySeed = deriveSeedFromString(argv[++i]);
+      seedProvided = true;
+    }
     else if (arg == "--help" || arg == "-h")
     {
       cout  << "relay_chat usage:\n"
@@ -218,7 +308,9 @@ Arguments parseArgs(int argc, char** argv)
             << "  --use-quic\n"
             << "  --listen <multiaddr>\n"
             << "  --bootstrap <multiaddr> (repeatable)\n"
-            << "  --target <multiaddr> (repeatable)\n";
+            << "  --target <multiaddr> (repeatable)\n"
+            << "  --seed <64-hex-bytes> (deterministic PeerId)\n"
+            << "  --seed-phrase <string> (derive 32-byte seed deterministically)\n";
 
       std::exit(0);
     }
@@ -253,14 +345,29 @@ void* createNode(
   const CabiRustLibp2p& abi,
   bool useQuic,
   bool enableRelayHop,
-  const std::vector<string>& bootstrapPeers)
+  const std::vector<string>& bootstrapPeers,
+  const std::optional<std::array<uint8_t, 32>>& seed)
 {
   auto bootstrapPtrs = toCStrVector(bootstrapPeers);
+
+  const uint8_t* seedPtr = nullptr;
+  size_t seedLen = 0;
+
+  std::array<uint8_t, 32> seedStorage{};
+  if (seed.has_value())
+  {
+    seedStorage = seed.value();
+    seedPtr = seedStorage.data();
+    seedLen = seedStorage.size();
+  }
+
   void* node = abi.NewNode(
     useQuic,
     enableRelayHop,
     bootstrapPtrs.data(),
-    bootstrapPtrs.size());
+    bootstrapPtrs.size(),
+    seedPtr,
+    seedLen);
 
   if (!node)
   {
@@ -268,6 +375,29 @@ void* createNode(
   }
 
   return node;
+}
+
+std::string readPeerId(const CabiRustLibp2p& abi, void* node)
+{
+  std::vector<char> buffer(128);
+  size_t written = 0;
+  const int status = abi.LocalPeerId(node, buffer.data(), buffer.size(), &written);
+
+  if (status == CABI_STATUS_BUFFER_TOO_SMALL)
+  {
+    buffer.resize(written + 1);
+    const int retry = abi.LocalPeerId(node, buffer.data(), buffer.size(), &written);
+    if (retry != CABI_STATUS_SUCCESS)
+    {
+      throw std::runtime_error("failed to read peer id: " + statusMessage(retry));
+    }
+  }
+  else if (status != CABI_STATUS_SUCCESS)
+  {
+    throw std::runtime_error("failed to read peer id: " + statusMessage(status));
+  }
+
+  return string(buffer.data(), written);
 }
 
 // Get Autonat status in order to have a possibility
@@ -453,7 +583,8 @@ int main(int argc, char** argv)
   try
   {
     // Step 4. Create node for this peer
-    node.reset(createNode(abi, args.useQuic, false, args.bootstrapPeers));
+    node.reset(createNode(abi, args.useQuic, false, args.bootstrapPeers, args.identitySeed));
+    cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
 
     // Step 5. Try listen on provided addr
     auto status = abi.ListenNode(node.handle, args.listen.c_str());
@@ -475,7 +606,7 @@ int main(int argc, char** argv)
       {
         cout << "AutoNAT is PUBLIC; restarting with relay hop enabled\n";
         node.reset();
-        node.reset(createNode(abi, args.useQuic, true, args.bootstrapPeers));
+        node.reset(createNode(abi, args.useQuic, true, args.bootstrapPeers, args.identitySeed));
 
         status = abi.ListenNode(node.handle, args.listen.c_str());
         cout << "Listening with hop relay on " << args.listen << "\n";
@@ -483,6 +614,7 @@ int main(int argc, char** argv)
         {
           throw std::runtime_error("cabi_node_listen failed after hop restart: " + statusMessage(status));
         }
+        cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
       }
       else
       {
