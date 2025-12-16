@@ -254,6 +254,7 @@ pub extern "C" fn cabi_node_new_with_relay_and_bootstrap(
     let config = transport::TransportConfig {
         use_quic,
         hop_relay: enable_relay_hop,
+        ..Default::default()
     };
 
     match ManagedNode::new(config, bootstrap_peers) {

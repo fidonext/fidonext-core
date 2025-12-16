@@ -99,6 +99,8 @@ pub struct TransportConfig {
     pub use_quic: bool,
     /// Controls whether the node should also act as a hop relay.
     pub hop_relay: bool,
+    /// Optional seed for deriving an exact Ed25519 identity keypair.
+    pub identity_seed: Option<[u8; 32]>,
 }
 
 impl Default for TransportConfig {
@@ -106,14 +108,39 @@ impl Default for TransportConfig {
         Self {
             use_quic: false, // Turn on for quic
             hop_relay: false, // Turn on for node act as relay (at least try)
+            identity_seed: None, // Pass to use identity seed for generating keypair
         }
     }
 }
 
 impl TransportConfig {
+     /// Creates a new configuration with the provided flags.
+    pub fn new(use_quic: bool, hop_relay: bool) -> Self {
+        Self {
+            use_quic,
+            hop_relay,
+            ..Default::default()
+        }
+    }
+
+    /// Sets a exact seed for the Ed25519 identity keypair.
+    /// Using the same seed yields the same `PeerId` and
+    /// predictable connection paths (e.g., for tests or reproducible setups).
+    pub fn with_identity_seed(mut self, seed: [u8; 32]) -> Self {
+        self.identity_seed = Some(seed);
+        self
+    }
+
     /// Builds the swarm using the provided configuration.
     pub fn build(&self) -> Result<(identity::Keypair, Swarm<NetworkBehaviour>)> {
-        let keypair = identity::Keypair::generate_ed25519();
+        let keypair = if let Some(seed) = self.identity_seed {
+            let secret = identity::ed25519::SecretKey::try_from_bytes(seed)
+                .map_err(|err| anyhow!("invalid ed25519 seed provided: {err}"))?;
+            let keypair = identity::ed25519::Keypair::from(secret);
+            identity::Keypair::from(keypair)
+        } else {
+            identity::Keypair::generate_ed25519()
+        };
         let local_peer_id = PeerId::from(keypair.public());
         let (transport, relay_client) = self.build_transport(&keypair, local_peer_id)?;
         let behaviour = Self::build_behaviour(&keypair, relay_client, self.hop_relay);
