@@ -13,6 +13,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Add source to this project's executable.
 add_executable (ping "ping.cpp")
 
+# Defines
+target_compile_definitions(ping PRIVATE
+  $<$<CONFIG:Debug>:_DEBUG>
+)
+
+# Environment
+set_target_properties(ping PROPERTIES
+  VS_DEBUGGER_ENVIRONMENT "RUST_LOG=trace\nRUST_BACKTRACE=1"
+)
+
 # Need link dl for Linux
 if (UNIX AND NOT APPLE)
     target_link_libraries(ping PRIVATE dl)

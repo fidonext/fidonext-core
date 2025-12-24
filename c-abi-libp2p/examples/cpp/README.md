@@ -40,8 +40,8 @@ docker compose up --build cpp-build
 1. Copy .dll or .so of the cabi-rust-libp2p into folder near executable
 2. Run through cmd/terminal
 3. `./ping --role relay --force-hop --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one`
-4. `./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a`
-5. `./ping --listen /ip4/0.0.0.0/tcp/41002 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-b`
+4. `./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<RELAY_IP>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a --target /ip4/<PEERB_IP>/tcp/41000/p2p/<PEERB_ID>`
+5. `./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<RELAY_IP>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a --target /ip4/<PEERA_IP>/tcp/41000/p2p/<PEERA_ID>`
 
 ### Running a relay + two peers (deterministic IDs)
 
