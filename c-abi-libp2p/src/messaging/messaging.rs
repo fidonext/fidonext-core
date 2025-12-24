@@ -12,6 +12,8 @@ pub struct MessageQueue {
 }
 
 #[derive(Clone, Debug)]
+
+// Multiple producer, single consumer queue
 pub struct MessageQueueSender {
     sender: mpsc::Sender<Vec<u8>>,
 }
