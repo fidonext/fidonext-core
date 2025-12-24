@@ -277,9 +277,6 @@ pub extern "C" fn cabi_node_new_with_relay_bootstrap_and_seed(
     identity_seed_ptr: *const u8,
     identity_seed_len: usize,
 ) -> *mut CabiNodeHandle {
-    // Safe to call multiple times; only the first invocation sets up tracing.
-    let _ = config::init_tracing();
-
     let bootstrap_peers = match parse_bootstrap_peers(bootstrap_peers, bootstrap_peers_len) {
         Ok(peers) => peers,
         Err(status) => {
