@@ -170,8 +170,6 @@ impl TransportConfig {
         let autonat_config = autonat::Config::default();
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .validation_mode(gossipsub::ValidationMode::None)
-            .heartbeat_interval(Duration::from_secs(5))
             .build()
             .expect("valid gossipsub config");
 
