@@ -504,6 +504,14 @@ impl PeerManager {
             BehaviourEvent::RelayServer(event) => {
                 tracing::debug!(target: "peer", ?event, "relay server event");
             }
+
+            BehaviourEvent::RendezvousClient(event) => {
+                tracing::info!(target: "peer", ?event, "rendezvous client event");
+            }
+
+            BehaviourEvent::RendezvousServer(event) => {
+                tracing::info!(target: "peer", ?event, "rendezvous server event");
+            }
         }
     }
 
