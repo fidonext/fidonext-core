@@ -15,6 +15,7 @@ use libp2p::{
     swarm::{Config as SwarmConfig, Swarm},
     tcp, PeerId, autonat, 
     relay, swarm::behaviour::toggle::Toggle,
+    rendezvous
 };
 use std::time::Duration;
 
@@ -36,6 +37,10 @@ pub struct NetworkBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// Optional relay server (hop) behaviour for acting as a public relay.
     pub relay_server: Toggle<relay::Behaviour>,
+    /// Rendezvous client for asking for a catalog of peers 
+    pub rendezvous_client: rendezvous::client::Behaviour,
+    /// Optional Rendezvous server for storing and sharing catalog of peers
+    pub rendezvous_server: Toggle<rendezvous::server::Behaviour>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -48,6 +53,8 @@ pub enum BehaviourEvent {
     Gossipsub(gossipsub::Event),
     RelayClient(relay::client::Event),
     RelayServer(relay::Event),
+    RendezvousClient(rendezvous::client::Event),
+    RendezvousServer(rendezvous::server::Event),
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -89,6 +96,18 @@ impl From<relay::client::Event> for BehaviourEvent {
 impl From<relay::Event> for BehaviourEvent {
     fn from(event: relay::Event) -> Self {
         Self::RelayServer(event)
+    }
+}
+
+impl From<rendezvous::client::Event> for BehaviourEvent {
+    fn from(event: rendezvous::client::Event) -> Self {
+        Self::RendezvousClient(event)
+    }
+}
+
+impl From<rendezvous::server::Event> for BehaviourEvent {
+    fn from(event: rendezvous::server::Event) -> Self {
+        Self::RendezvousServer(event)
     }
 }
 
@@ -188,6 +207,16 @@ impl TransportConfig {
             Toggle::from(None)
         };
 
+        let rendezvous_client = rendezvous::client::Behaviour::new(keypair.clone());
+
+        let rendezvous_server = if hop_relay {
+            Toggle::from(
+                Some(rendezvous::server::Behaviour::new(rendezvous::server::Config::default()))
+            )
+        } else {
+            Toggle::from(None)
+        };
+
         NetworkBehaviour {
             kademlia: kad::Behaviour::with_config(peer_id, store, kad_config),
             ping: ping::Behaviour::new(ping_config),
@@ -196,6 +225,8 @@ impl TransportConfig {
             gossipsub,
             relay_client,
             relay_server,
+            rendezvous_client,
+            rendezvous_server,
         }
     }
 
