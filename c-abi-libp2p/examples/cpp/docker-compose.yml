@@ -1,123 +1,122 @@
 services:
-  nat1:
-    image: alpine:3.20
-    container_name: nat1
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    sysctls:
-      net.ipv4.ip_forward: "1"
-    environment:
-      INTERNAL_IP: 172.20.0.2   # netA side
-      EXTERNAL_IP: 10.0.0.2   # netB side
-    networks:
-      netA:
-        ipv4_address: 172.20.0.2
-      netB:
-        ipv4_address: 10.0.0.2
-    command: >
-      sh -c '
-        set -eux;
-        apk add --no-cache iptables iproute2;
-        internal_if=$(ip -o -4 addr show | awk -v ip="$${INTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
-        external_if=$(ip -o -4 addr show | awk -v ip="$${EXTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
-        sysctl -w net.ipv4.ip_forward=1;
+#   nat1:
+#     image: alpine:3.20
+#     container_name: nat1
+#     cap_add:
+#       - NET_ADMIN
+#       - NET_RAW
+#     sysctls:
+#       net.ipv4.ip_forward: "1"
+#     environment:
+#       INTERNAL_IP: 172.20.0.2   # netA side
+#       EXTERNAL_IP: 10.0.0.2   # netB side
+#     networks:
+#       netA:
+#         ipv4_address: 172.20.0.2
+#       netB:
+#         ipv4_address: 10.0.0.2
+#     command: >
+#       sh -c '
+#         set -eux;
+#         apk add --no-cache iptables iproute2;
+#         internal_if=$(ip -o -4 addr show | awk -v ip="$${INTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
+#         external_if=$(ip -o -4 addr show | awk -v ip="$${EXTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
+#         sysctl -w net.ipv4.ip_forward=1;
 
-        # NAT (masquerade) A -> B
-        iptables -t nat -A POSTROUTING -o "$$external_if" -j MASQUERADE;
+#         # NAT (masquerade) A -> B
+#         iptables -t nat -A POSTROUTING -o "$$external_if" -j MASQUERADE;
 
-        # Forwarding rules
-        iptables -A FORWARD -i "$$internal_if" -o "$$external_if" -j ACCEPT;
-        iptables -A FORWARD -i "$$external_if" -o "$$internal_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT;
+#         # Forwarding rules
+#         iptables -A FORWARD -i "$$internal_if" -o "$$external_if" -j ACCEPT;
+#         iptables -A FORWARD -i "$$external_if" -o "$$internal_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT;
 
-        tail -f /dev/null
-      '
+#         tail -f /dev/null
+#       '
 
-  nat2:
-    image: alpine:3.20
-    container_name: nat2
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    sysctls:
-      net.ipv4.ip_forward: "1"
-    environment:
-      INTERNAL_IP: 192.168.0.2   # netC side
-      EXTERNAL_IP: 10.0.0.3   # netB side
-    networks:
-      netC:
-        ipv4_address: 192.168.0.2
-      netB:
-        ipv4_address: 10.0.0.3
-    command: >
-      sh -c '
-        set -eux;
-        apk add --no-cache iptables iproute2;
-        internal_if=$(ip -o -4 addr show | awk -v ip="$${INTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
-        external_if=$(ip -o -4 addr show | awk -v ip="$${EXTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
-        sysctl -w net.ipv4.ip_forward=1;
+#   nat2:
+#     image: alpine:3.20
+#     container_name: nat2
+#     cap_add:
+#       - NET_ADMIN
+#       - NET_RAW
+#     sysctls:
+#       net.ipv4.ip_forward: "1"
+#     environment:
+#       INTERNAL_IP: 192.168.0.2   # netC side
+#       EXTERNAL_IP: 10.0.0.3   # netB side
+#     networks:
+#       netC:
+#         ipv4_address: 192.168.0.2
+#       netB:
+#         ipv4_address: 10.0.0.3
+#     command: >
+#       sh -c '
+#         set -eux;
+#         apk add --no-cache iptables iproute2;
+#         internal_if=$(ip -o -4 addr show | awk -v ip="$${INTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
+#         external_if=$(ip -o -4 addr show | awk -v ip="$${EXTERNAL_IP}" "$$4 ~ ip\"/\" {print $$2; exit}");
+#         sysctl -w net.ipv4.ip_forward=1;
 
-        # NAT (masquerade) C -> B
-        iptables -t nat -A POSTROUTING -o "$$external_if" -j MASQUERADE;
+#         # NAT (masquerade) C -> B
+#         iptables -t nat -A POSTROUTING -o "$$external_if" -j MASQUERADE;
 
-        # Forwarding rules
-        iptables -A FORWARD -i "$$internal_if" -o "$$external_if" -j ACCEPT;
-        iptables -A FORWARD -i "$$external_if" -o "$$internal_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT;
+#         # Forwarding rules
+#         iptables -A FORWARD -i "$$internal_if" -o "$$external_if" -j ACCEPT;
+#         iptables -A FORWARD -i "$$external_if" -o "$$internal_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT;
 
-        tail -f /dev/null
-      '
+#         tail -f /dev/null
+#       '
 
   relay:
-    image: hashicorp/http-echo:alpine
+    build:
+      context: ../../
+      dockerfile: examples/cpp/Dockerfile
+    image: relay
     container_name: relay
-    command: ["-listen=:5678", "-text=hello from relay (Network B)"]
+    command: ["/app/ping", "--role", "relay", "--force-hop", "--listen", "/ip4/0.0.0.0/tcp/41000", "--seed-phrase", "relay-one"]
     networks:
       netB:
         ipv4_address: 10.0.0.10
-    # optional: expose to host
-    # ports:
-    #   - "5678:5678"
-    # http-echo default port behavior is documented by the project :contentReference[oaicite:1]{index=1}
+    ports:
+      - "41000:41000"
 
   client_a:
-    image: alpine:3.20
+    build:
+      context: ../../
+      dockerfile: examples/cpp/Dockerfile
+    image: client
     container_name: client_a
     cap_add:
       - NET_ADMIN
-    depends_on:
-      - nat1
-      - relay
+    # depends_on:
+    #   - nat1
+    #   - relay
     networks:
       netA:
         ipv4_address: 172.20.0.10
-    command: >
-      sh -c '
-        set -eux;
-        apk add --no-cache iproute2 curl;
-        ip route del default;
-        ip route add default via 172.20.0.2;
-        tail -f /dev/null
-      '
+    ports:
+      - "41001:41001"
+    command: ["/app/ping", "--listen", "/ip4/0.0.0.0/tcp/41001"]
 
-  client_c:
-    image: alpine:3.20
-    container_name: client_c
-    cap_add:
-      - NET_ADMIN
-    depends_on:
-      - nat2
-      - relay
-    networks:
-      netC:
-        ipv4_address: 192.168.0.10
-    command: >
-      sh -c '
-        set -eux;
-        apk add --no-cache iproute2 curl;
-        ip route del default;
-        ip route add default via 192.168.0.2;
-        tail -f /dev/null
-      '
+#   client_c:
+#     image: alpine:3.20
+#     container_name: client_c
+#     cap_add:
+#       - NET_ADMIN
+#     depends_on:
+#       - nat2
+#       - relay
+#     networks:
+#       netC:
+#         ipv4_address: 192.168.0.10
+#     command: >
+#       sh -c '
+#         set -eux;
+#         apk add --no-cache iproute2 curl;
+#         ip route del default;
+#         ip route add default via 192.168.0.2;
+#         tail -f /dev/null
+#       '
 
 networks:
   netA:
@@ -130,8 +129,8 @@ networks:
     ipam:
       config:
         - subnet: 10.0.0.0/24
-  netC:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 192.168.0.0/24
+#   netC:
+#     driver: bridge
+#     ipam:
+#       config:
+#         - subnet: 192.168.0.0/24
