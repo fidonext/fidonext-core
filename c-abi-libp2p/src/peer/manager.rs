@@ -265,11 +265,20 @@ impl PeerManager {
                 }
                 Ok(false)
             }
-            PeerCommand::ReserveRelay(address) => {
+            PeerCommand::ReserveRelay(mut address) => {
+                // This one should contain relay peerId
                 if let Some(peer_id) = extract_peer_id(&address) {
                     self.relay_peer_id = Some(peer_id);
                 }
 
+                // ensure /p2p-circuit is present
+                let has_circuit = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                if !has_circuit {
+                    // Force it be a p2p-circuit (relay)
+                    address.push(Protocol::P2pCircuit);
+                }
+
+                // This one is a reservation itself
                 match self.swarm.listen_on(address.clone()) {
                     Ok(_) => tracing::info!(target: "peer", %address, "listening via relay"),
                     Err(err) => tracing::error!(
@@ -366,6 +375,7 @@ impl PeerManager {
 
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(target: "peer", %address, "listening on new address");
+                self.update_relay_address(address);
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -872,12 +882,27 @@ fn relay_base_from_external(
     let mut addr = address.clone();
 
     match (addr.pop(), addr.pop()) {
+        // .../p2p-circuit/p2p/<local> Format of addr
         (Some(Protocol::P2p(local)), Some(Protocol::P2pCircuit)) if local == *local_peer_id => {
             match addr.iter().last() {
                 Some(Protocol::P2p(relay_peer_id)) => Some((addr, relay_peer_id.clone())),
                 _ => None,
             }
         }
+
+        // .../p2p-circuit Format of addr
+        (Some(Protocol::P2pCircuit), _) => {
+            // addr is already popped, so need to take address from param 
+            // and use it as a base
+            let mut base = address.clone();
+            base.pop(); // poping p2p-circuit
+
+            match base.iter().last() {
+                Some(Protocol::P2p(relay_peer_id)) => Some((base, relay_peer_id)),
+                _ => None,
+            }
+        }
+        
         _ => None,
     }
 }

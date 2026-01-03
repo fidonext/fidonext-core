@@ -106,6 +106,12 @@ impl ManagedNode {
         })
     }
 
+    fn reserve_relay(&self, address: Multiaddr) -> Result<()> {
+        self.runtime
+            .block_on(self.handle.reserve_relay(address))
+            .context("failed to reserver relay")
+    }
+
     /// Requests to start listening operation on provided address
     fn start_listening(&self, address: Multiaddr) -> Result<()> {
         self.runtime
@@ -288,6 +294,31 @@ pub extern "C" fn cabi_node_local_peer_id(
 
     let peer_id = node.local_peer_id().to_string();
     write_c_string(&peer_id, out_buffer, buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Requests a circuit-relay reservation on the given relay address.
+pub extern "C" fn cabi_node_reserve_relay(
+    handle: *mut CabiNodeHandle,
+    address: *const c_char
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    let multiaddr = match parse_multiaddr(address) {
+        Ok(addr) => addr,
+        Err(status) => return status,
+    };
+
+    match node.reserve_relay(multiaddr) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "reserve_relay failed");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
 }
 
 #[no_mangle]
