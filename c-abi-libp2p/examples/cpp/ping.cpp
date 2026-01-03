@@ -534,7 +534,24 @@ void dialPeers(const CabiRustLibp2p& abi, void* node, const std::vector<string>&
     }
     else
     {
-      cerr << "Failed to dial " << label << " peer " << addr << ": " << statusMessage(status) << "\n";
+      cerr << "Failed to dial " << label << " peer " << addr << " : " << statusMessage(status) << "\n";
+    }
+  }
+}
+
+void reserveOnRelays(const CabiRustLibp2p& abi, void* node, const std::vector<string>& peers)
+{
+  for (const auto& addr : peers)
+  {
+    const auto status = abi.ReserveRelay(node, addr.c_str());
+
+    if (status == CABI_STATUS_SUCCESS)
+    {
+      cout << "Reserved relay on " << addr << "\n";
+    }
+    else
+    {
+      cerr << "Failed to reserve relay on " << addr << " : " << statusMessage(status) << "\n";
     }
   }
 }
@@ -634,7 +651,7 @@ int main(int argc, char** argv)
         else
         {
           cout << "AutoNAT did not report PUBLIC within window; staying without hop\n";
-
+          reserveOnRelays(abi, node.handle, args.bootstrapPeers);
         }
       }
     }
