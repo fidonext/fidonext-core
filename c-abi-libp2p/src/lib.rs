@@ -220,56 +220,9 @@ pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
 }
 
 #[no_mangle]
-/// C-ABI. Creates a new node instance and returns its handle
-pub extern "C" fn cabi_node_new(use_quic: bool) -> *mut CabiNodeHandle {
-    cabi_node_new_with_relay_bootstrap_and_seed(
-        use_quic,
-        false,
-        std::ptr::null(),
-        0,
-        std::ptr::null(),
-        0,
-    )
-}
-
-#[no_mangle]
-/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode
-pub extern "C" fn cabi_node_new_with_relay(
-    use_quic: bool,
-    enable_relay_hop: bool,
-) -> *mut CabiNodeHandle {
-    cabi_node_new_with_relay_bootstrap_and_seed(
-        use_quic,
-        enable_relay_hop,
-        std::ptr::null(),
-        0,
-        std::ptr::null(),
-        0,
-    )
-}
-
-#[no_mangle]
-/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode and bootstrap peers
-pub extern "C" fn cabi_node_new_with_relay_and_bootstrap(
-    use_quic: bool,
-    enable_relay_hop: bool,
-    bootstrap_peers: *const *const c_char,
-    bootstrap_peers_len: usize,
-) -> *mut CabiNodeHandle {
-    cabi_node_new_with_relay_bootstrap_and_seed(
-        use_quic,
-        enable_relay_hop,
-        bootstrap_peers,
-        bootstrap_peers_len,
-        std::ptr::null(),
-        0,
-    )
-}
-
-#[no_mangle]
 /// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode, bootstrap peers,
 /// and a fixed Ed25519 identity seed.
-pub extern "C" fn cabi_node_new_with_relay_bootstrap_and_seed(
+pub extern "C" fn cabi_node_new(
     use_quic: bool,
     enable_relay_hop: bool,
     bootstrap_peers: *const *const c_char,
