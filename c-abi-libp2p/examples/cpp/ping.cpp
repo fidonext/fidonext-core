@@ -71,6 +71,7 @@ using NewNodeFunc = void* (*)(
   size_t bootstrapPeersLen,
   const uint8_t* identitySeedPtr,
   size_t identitySeedLen);
+using ReserveRelayFunc = int (*)(void* handle, const char* multiaddr);
 using ListenNodeFunc = int (*)(void* handle, const char* multiaddr);
 using DialNodeFunc = int (*)(void* handle, const char* multiaddr);
 using AutonatStatusFunc = int (*)(void* handle);
@@ -83,6 +84,7 @@ struct CabiRustLibp2p
 {
   InitTracingFunc       InitTracing{};
   NewNodeFunc           NewNode{};
+  ReserveRelayFunc      ReserveRelay{};
   ListenNodeFunc        ListenNode{};
   DialNodeFunc          DialNode{};
   AutonatStatusFunc     AutonatStatus{};
@@ -154,6 +156,7 @@ bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
 {
   abi.InitTracing = reinterpret_cast<InitTracingFunc>(GET_PROC(lib, "cabi_init_tracing"));
   abi.NewNode = reinterpret_cast<NewNodeFunc>(GET_PROC(lib, "cabi_node_new"));
+  abi.ReserveRelay = reinterpret_cast<ReserveRelayFunc>(GET_PROC(lib, "cabi_node_reserve_relay"));
   abi.ListenNode = reinterpret_cast<ListenNodeFunc>(GET_PROC(lib, "cabi_node_listen"));
   abi.DialNode = reinterpret_cast<DialNodeFunc>(GET_PROC(lib, "cabi_node_dial"));
   abi.AutonatStatus = reinterpret_cast<AutonatStatusFunc>(GET_PROC(lib, "cabi_autonat_status"));
@@ -631,6 +634,7 @@ int main(int argc, char** argv)
         else
         {
           cout << "AutoNAT did not report PUBLIC within window; staying without hop\n";
+
         }
       }
     }
