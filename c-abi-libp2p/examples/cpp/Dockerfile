@@ -33,9 +33,14 @@ RUN cmake -S . -B build-docker -DCMAKE_BUILD_TYPE=Release
 RUN cmake --build build-docker --config Release -j"$(nproc)"
 
 
-FROM --platform=linux/amd64 gcr.io/distroless/cc-debian12 AS runtime
-
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
 WORKDIR /app
+
+# Required for the dynamically-linked Rust .so and C++ binary
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgcc-s1 \
+    iproute2 \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust_builder /build/target/x86_64-unknown-linux-gnu/release/libcabi_rust_libp2p.so /app/
 COPY --from=cpp_builder /build/build-docker/ping /app/
