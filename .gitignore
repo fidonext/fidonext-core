@@ -32,3 +32,6 @@ $RECYCLE.BIN/
 .directory
 .Trash-*
 
+# logs
+c-abi-libp2p/examples/python/logs/
+

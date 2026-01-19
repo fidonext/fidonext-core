@@ -10,6 +10,7 @@ on:
 
 env:
   RUST_TOOLCHAIN: "1.91.0"
+  ANDROID_NDK_VERSION: "27.3.13750724"
 
 jobs:
   build:
@@ -30,10 +31,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Java (for Android SDK tools)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install system dependencies
         run: |
@@ -50,7 +60,17 @@ jobs:
           rustup target add \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
-            x86_64-pc-windows-gnu
+            x86_64-pc-windows-gnu \
+            aarch64-linux-android
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "${GITHUB_ENV}"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - name: Build Linux (GNU)
         run: cargo build --release --target x86_64-unknown-linux-gnu
@@ -60,6 +80,9 @@ jobs:
 
       - name: Build Windows (GNU)
         run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Build Android (arm64-v8a)
+        run: cargo ndk -t arm64-v8a build --release
 
       - name: Run tests
         run: cargo test --release --verbose
@@ -81,6 +104,10 @@ jobs:
           # Windows x86_64 (GNU)
           cp target/x86_64-pc-windows-gnu/release/cabi_rust_libp2p.dll \
             "${OUTPUT_DIR}/cabi_rust_libp2p-windows-x86_64.dll" 2>/dev/null || true
+
+          # Android arm64-v8a
+          cp target/aarch64-linux-android/release/libcabi_rust_libp2p.so \
+            "${OUTPUT_DIR}/libcabi_rust_libp2p-android-arm64-v8a.so" 2>/dev/null || true
 
           # Header
           cargo build
