@@ -36,9 +36,9 @@ pub const CABI_STATUS_INVALID_ARGUMENT: c_int = 2;
 pub const CABI_STATUS_INTERNAL_ERROR: c_int = 3;
 
 /// No message available in the internal queue.
-pub const CABI_STATUS_QUEUE_EMPTY: c_int = 4;
+pub const CABI_STATUS_QUEUE_EMPTY: c_int = -1;
 /// Provided buffer is too small to fit the dequeued message.
-pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = 5;
+pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = -2;
 
 /// The discovery query timed out.
 pub const CABI_STATUS_TIMEOUT: c_int = 6;
@@ -58,6 +58,12 @@ pub const CABI_AUTONAT_PUBLIC: c_int = 2;
 pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
 /// Discovery query has finished.
 pub const CABI_DISCOVERY_EVENT_FINISHED: c_int = 1;
+
+pub const CABI_ADDR_EVENT_LISTEN_ADDED: c_int = 0;
+pub const CABI_ADDR_EVENT_LISTEN_REMOVED: c_int = 1;
+pub const CABI_ADDR_EVENT_EXTERNAL_CONFIRMED: c_int = 2;
+pub const CABI_ADDR_EVENT_EXTERNAL_EXPIRED: c_int = 3;
+pub const CABI_ADDR_EVENT_RELAY_READY: c_int = 4;
 
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
@@ -614,6 +620,71 @@ pub extern "C" fn cabi_node_dequeue_discovery_event(
         address_buffer_len,
         address_written_len,
     )
+}
+
+#[no_mangle]
+/// C-ABI. Attempts to dequeue an addr event from the node
+pub extern "C" fn cabi_node_dequeue_addr_event(
+    handle: *mut CabiNodeHandle,
+    out_kind: *mut c_int,
+    addr_buf: *mut c_char,
+    addr_buf_len: usize,
+    out_written: *mut usize
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if out_kind.is_null() || addr_buf.is_null() || out_written.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    if addr_buf_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    unsafe {
+        *out_written = 0;
+    }
+
+    let ev = match node.try_dequeue_addr_event() {
+        Some(ev) => ev,
+        None => return CABI_STATUS_QUEUE_EMPTY,
+    };
+
+    let (kind, addr_str) = match ev {
+        peer::AddrEvent::ListenerAdded { address } => (
+            CABI_ADDR_EVENT_LISTEN_ADDED,
+            address.to_string(),
+        ),
+
+        peer::AddrEvent::ListenRemoved { address } => (
+            CABI_ADDR_EVENT_LISTEN_REMOVED,
+            address.to_string(),
+        ),
+
+        peer::AddrEvent::ExternalConfirmed { address } => (
+            CABI_ADDR_EVENT_EXTERNAL_CONFIRMED,
+            address.to_string(),
+        ),
+
+        peer::AddrEvent::ExternalExpired { address } => (
+            CABI_ADDR_EVENT_EXTERNAL_EXPIRED,
+            address.to_string(),
+        ),
+
+        peer::AddrEvent::RelayReachableReady { address } => (
+            CABI_ADDR_EVENT_RELAY_READY,
+            address.to_string(),
+        ),
+    };
+
+    unsafe {
+        *out_kind = kind;
+    }
+
+    write_c_string(addr_str.as_str(), addr_buf, addr_buf_len, out_written)
 }
 
 #[no_mangle]

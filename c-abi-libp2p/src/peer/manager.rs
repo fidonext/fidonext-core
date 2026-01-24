@@ -870,7 +870,7 @@ impl PeerManager {
                 "updated relay base address",
             );
 
-            let changed = (self.relay_base_address.as_ref() != Some(&base_address));
+            let changed = self.relay_base_address.as_ref() != Some(&base_address);
             if changed {
                 // Creating rachable addr of the current peer 
                 // <relay_base>/p2p-circuit/p2p/<yourPeerId>
