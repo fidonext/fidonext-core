@@ -25,9 +25,7 @@ use tokio::sync::{mpsc, watch};
 const DISCOVERY_DIAL_BACKOFF: Duration = Duration::from_secs(30);
 
 use crate::{
-    messaging::MessageQueueSender,
-    transport::{BehaviourEvent, NetworkBehaviour, TransportConfig},
-    peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
+    AddrEventSender, AddrEvent, messaging::MessageQueueSender, peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus}, transport::{BehaviourEvent, NetworkBehaviour, TransportConfig}
     //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
 
@@ -159,6 +157,7 @@ pub struct PeerManager {
     discovery_dial_backoff: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     relay_base_address: Option<Multiaddr>,
     relay_peer_id: Option<PeerId>,
+    addr_event_sender: AddrEventSender,
 }
 
 impl PeerManager {
@@ -167,6 +166,7 @@ impl PeerManager {
         config: TransportConfig,
         inbound_sender: MessageQueueSender,
         discovery_sender: DiscoveryEventSender,
+        addr_event_sender: AddrEventSender,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<(Self, PeerManagerHandle)> {
         let (keypair, swarm) = config.build()?;
@@ -209,6 +209,7 @@ impl PeerManager {
             discovery_dial_backoff: HashMap::new(),
             relay_base_address: None,
             relay_peer_id: None,
+            addr_event_sender,
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -375,6 +376,15 @@ impl PeerManager {
 
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(target: "peer", %address, "listening on new address");
+
+                if let Err(err) = self.addr_event_sender
+                    .try_enqueue(AddrEvent::ListenerAdded { 
+                        address: address.clone() 
+                    })
+                {
+                    tracing::warn!(target: "peer", %err, "failed to enqueue ListenerAdded event");
+                }
+
                 self.update_relay_address(address);
             }
 
@@ -408,18 +418,46 @@ impl PeerManager {
 
             SwarmEvent::ExternalAddrConfirmed { address } => {
                 tracing::info!(target: "peer", %address, "external address confirmed");
+
+                if let Err(err) = self.addr_event_sender
+                    .try_enqueue(AddrEvent::ExternalConfirmed { 
+                        address: address.clone() 
+                    })
+                {
+                    tracing::warn!(target: "peer", %err, "failed to enqueue ExternalConfirmed event");
+                }
+
                 self.update_relay_address(address);
             }
 
             SwarmEvent::ExternalAddrExpired { address } => {
                 tracing::warn!(target: "peer", %address, "external address expired");
                 self.clear_relay_address(&address);
+
+                if let Err(err) = self.addr_event_sender
+                    .try_enqueue(AddrEvent::ExternalExpired { 
+                        address: address.clone() 
+                    })
+                {
+                    tracing::warn!(target: "peer", %err, "failed to enqueue ExternalExpired event");
+                }
             }
 
             SwarmEvent::ListenerClosed {
                 addresses, reason, ..
             } => {
                 tracing::warn!(target: "peer", ?addresses, ?reason, "listener closed");
+
+                // ListenerClosed can contain multiple addresses. Emit removal for each.
+                for address in addresses {
+                    if let Err(err) = self.addr_event_sender
+                        .try_enqueue(AddrEvent::ListenRemoved {
+                        address
+                        })
+                    {
+                        tracing::warn!(target: "peer", %err, "failed to enqueue ListenRemoved event");
+                    }
+                }
             }
 
             SwarmEvent::ListenerError { error, .. } => {
@@ -832,7 +870,21 @@ impl PeerManager {
                 "updated relay base address",
             );
 
+            let changed = (self.relay_base_address.as_ref() != Some(&base_address));
+            if changed {
+                // Creating rachable addr of the current peer 
+                // <relay_base>/p2p-circuit/p2p/<yourPeerId>
+                let mut reachable = base_address.clone();
+                reachable.push(Protocol::P2pCircuit);
+                reachable.push(Protocol::P2p(self.local_peer_id.clone()));
+
+                let _ = self.addr_event_sender.try_enqueue(AddrEvent::RelayReachableReady {
+                    address: reachable,
+                });
+            }
+
             self.relay_base_address = Some(base_address);
+
             if self.relay_peer_id.is_none() {
                 self.relay_peer_id = Some(relay_peer_id);
             }
@@ -898,7 +950,7 @@ fn relay_base_from_external(
             base.pop(); // poping p2p-circuit
 
             match base.iter().last() {
-                Some(Protocol::P2p(relay_peer_id)) => Some((base, relay_peer_id)),
+                Some(Protocol::P2p(relay_peer_id)) => Some((base, relay_peer_id.clone())),
                 _ => None,
             }
         }

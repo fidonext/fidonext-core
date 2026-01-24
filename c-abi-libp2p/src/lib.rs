@@ -74,6 +74,7 @@ struct ManagedNode {
     message_queue: messaging::MessageQueue,
     discovery_queue: peer::DiscoveryQueue,
     discovery_sequence: AtomicU64,
+    addr_event_queue: peer::AddrEventQueue
 }
 
 impl ManagedNode {
@@ -82,12 +83,16 @@ impl ManagedNode {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
         let discovery_queue = peer::DiscoveryQueue::new(peer::DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_event_queue = peer::AddrEventQueue::new(peer::DEFAULT_ADDR_EVENTS_CAPACITY);
+
         let (manager, handle) = peer::PeerManager::new(
             config,
             message_queue.sender(),
             discovery_queue.sender(),
+            addr_event_queue.sender(),
             bootstrap_peers,
         )?;
+
         let autonat_status = handle.autonat_status();
         let worker = runtime.spawn(async move {
             if let Err(err) = manager.run().await {
@@ -103,6 +108,7 @@ impl ManagedNode {
             message_queue,
             discovery_queue,
             discovery_sequence: AtomicU64::new(0),
+            addr_event_queue,
         })
     }
 
@@ -151,9 +157,14 @@ impl ManagedNode {
             .map(|_| request_id)
     }
 
-   /// Attempts to dequeue the next discovery event without blocking.
+    /// Attempts to dequeue the next discovery event without blocking.
     fn try_dequeue_discovery(&mut self) -> Option<peer::DiscoveryEvent> {
         self.discovery_queue.try_dequeue()
+    }
+
+    /// Tries to dequeue the next Addr event without blocking.
+    fn try_dequeue_addr_event(&mut self) -> Option<peer::AddrEvent> {
+        self.addr_event_queue.try_dequeue()
     }
 
     /// Attempts to pull a message from the internal queue without blocking.

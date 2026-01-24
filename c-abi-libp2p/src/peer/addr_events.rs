@@ -1,6 +1,6 @@
 
 use anyhow::{anyhow, Result};
-use libp2p::{core::Multiaddr, PeerId};
+use libp2p::core::Multiaddr;
 use tokio::sync::mpsc;
 
 pub const DEFAULT_ADDR_EVENTS_CAPACITY: usize = 64;
@@ -11,7 +11,13 @@ pub enum AddrEvent {
     /// New local listen addr added
     /// Source: `SwarmEvent::NewListenAddr`
     /// May be not publicly reachable
-    ListenAdded {
+    ListenerAdded {
+        address: Multiaddr,
+    },
+
+    /// Local listen addr was removed
+    /// Source: `SwarmEvent::ListenerClosed`
+    ListenRemoved { 
         address: Multiaddr,
     },
 
@@ -24,12 +30,12 @@ pub enum AddrEvent {
 
     /// External publicly reachable addr expired
     /// Source: `SwarmEvent::ExternalAddrExpired`
-    ExtrnalExpired {
+    ExternalExpired {
         address: Multiaddr,
     },
 
     /// Relay-based addr is added and ready to use
-    /// 
+    /// Source: `PeerManager::`
     RelayReachableReady{
         address: Multiaddr,
     },
