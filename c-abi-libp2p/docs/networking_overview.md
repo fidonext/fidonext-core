@@ -82,3 +82,36 @@ Sharing the same seed between two nodes yields identical `PeerId`s so tests and 
 - Unit tests in `src/transport/libp2p.rs` and `src/peer/manager.rs` assert that the `PeerId` matches the public key.
 
 This layout mirrors the steps described in the official libp2p tutorial while keeping the project code organised into focused modules.
+
+## 5. C-ABI dequeue event APIs (short reference)
+
+These functions poll FIFO queues owned by the node. Each returns a `CABI_STATUS_*` code and writes to out-parameters on success (or to report required buffer sizes).
+
+### What functions exist and what they do
+
+- `cabi_node_dequeue_message`: pops the next message payload into `out_buffer`.
+- `cabi_node_dequeue_discovery_event`: pops the next Kademlia discovery event (address found or query finished).
+- `cabi_node_dequeue_addr_event`: pops the next address-related event (listen/external/relay-ready).
+
+### How to use
+
+1. Call the dequeue function in a polling loop.
+2. If it returns `CABI_STATUS_QUEUE_EMPTY`, wait and retry.
+3. If it returns `CABI_STATUS_BUFFER_TOO_SMALL`, resize the target buffer to the reported `*_written_len` and call again.
+4. On `CABI_STATUS_SUCCESS`, read the out-parameters and continue.
+
+### Status codes
+
+- `CABI_STATUS_SUCCESS`: event/message written to out-params.
+- `CABI_STATUS_QUEUE_EMPTY`: no event/message available.
+- `CABI_STATUS_NULL_POINTER`: required pointer is null.
+- `CABI_STATUS_INVALID_ARGUMENT`: invalid input (e.g., zero-length buffer).
+- `CABI_STATUS_BUFFER_TOO_SMALL`: buffer too small; `*_written_len` reports required length (bytes, excluding the null terminator for strings).
+
+### Address event kinds (`cabi_node_dequeue_addr_event`)
+
+- `CABI_ADDR_EVENT_LISTEN_ADDED`: started listening on a new address.
+- `CABI_ADDR_EVENT_LISTEN_REMOVED`: listening address removed.
+- `CABI_ADDR_EVENT_EXTERNAL_CONFIRMED`: AutoNAT confirmed an external address.
+- `CABI_ADDR_EVENT_EXTERNAL_EXPIRED`: external address expired.
+- `CABI_ADDR_EVENT_RELAY_READY`: relay-ready address is reachable.
