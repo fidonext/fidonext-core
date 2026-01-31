@@ -11,7 +11,7 @@ use libp2p::{
     core::Multiaddr,
     gossipsub,
     identity,
-    swarm::{DialError, Swarm, SwarmEvent},
+    swarm::{behaviour::toggle::Toggle, DialError, Swarm, SwarmEvent},
     PeerId,
     autonat,
     kad::{self, QueryResult},
@@ -29,7 +29,7 @@ use crate::{
     addr_events::{AddrState, AddrEvent}, 
     messaging::MessageQueueSender, 
     discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus}, 
-    transport::{BehaviourEvent, NetworkBehaviour, TransportConfig},
+    transport::{BehaviourEvent, NetworkBehaviour, RelayHopMode, TransportConfig},
     //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
 
@@ -156,6 +156,7 @@ pub struct PeerManager {
     inbound_sender: MessageQueueSender,
     gossipsub_topic: gossipsub::IdentTopic,
     autonat_status: watch::Sender<autonat::NatStatus>,
+    relay_hop_mode: RelayHopMode,
     discovery_sender: DiscoveryEventSender,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
     discovery_dial_backoff: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
@@ -173,6 +174,7 @@ impl PeerManager {
         addr_state: Arc<RwLock<AddrState>>,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<(Self, PeerManagerHandle)> {
+        let relay_hop_mode = config.relay_hop_mode;
         let (keypair, swarm) = config.build()?;
         let local_peer_id = PeerId::from(keypair.public());
         let (command_sender, command_receiver) = mpsc::channel(32);
@@ -208,6 +210,7 @@ impl PeerManager {
             inbound_sender,
             gossipsub_topic,
             autonat_status,
+            relay_hop_mode,
             discovery_sender,
             discovery_queries: HashMap::new(),
             discovery_dial_backoff: HashMap::new(),
@@ -503,6 +506,8 @@ impl PeerManager {
                             "autonat status receiver dropped; skipping update"
                         );
                     }
+
+                    self.apply_autonat_relay_policy(&new);
                 }
             }
 
@@ -606,6 +611,35 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    fn apply_autonat_relay_policy(&mut self, status: &autonat::NatStatus) {
+        if self.relay_hop_mode != RelayHopMode::AutoOnPublic {
+            return;
+        }
+
+        match status {
+            autonat::NatStatus::Public(address) => {
+                self.swarm.add_external_address(address.clone());
+                self.enable_relay_hop();
+            }
+            autonat::NatStatus::Private | autonat::NatStatus::Unknown => {
+                self.disable_relay_hop();
+            }
+        }
+    }
+
+    fn enable_relay_hop(&mut self) {
+        self.swarm.behaviour_mut().relay_server = Toggle::from(Some(relay::Behaviour::new(
+            self.local_peer_id.clone(),
+            relay::Config::default(),
+        )));
+        tracing::info!(target: "peer", "relay hop enabled after AutoNAT public");
+    }
+
+    fn disable_relay_hop(&mut self) {
+        self.swarm.behaviour_mut().relay_server = Toggle::from(None);
+        tracing::info!(target: "peer", "relay hop disabled after AutoNAT private/unknown");
     }
 
     fn handle_find_peer_response(
