@@ -52,8 +52,8 @@ PeerManager::run() — asynchronous loop
 ### AutoNAT reachability hints
 
 - `PeerManager` subscribes to `BehaviourEvent::Autonat` and stores the most recent `NatStatus` update (public, private, or unknown) in a watch channel.
-- The new C-ABI helper `cabi_autonat_status` exposes that status to clients
-- Client apps can watch the status and restart the node with `hop_relay = true` once AutoNAT reports a public address, enabling relay services after public reachability is confirmed.
+- The C-ABI helper `cabi_autonat_status` exposes that status to clients for observability.
+- When relay hop mode is set to `AutoOnPublic`, the library enables hop relay behaviour automatically after AutoNAT reports public reachability, so clients do not need to recreate the node.
 
 ## 3. Where the network identity comes from
 
@@ -70,7 +70,7 @@ PeerManager::run() — asynchronous loop
 use cabi_rust_libp2p::transport::TransportConfig;
 
 let seed = [0u8; 32];
-let config = TransportConfig::new(true, false).with_identity_seed(seed);
+let config = TransportConfig::new(true, RelayHopMode::Disabled).with_identity_seed(seed);
 let (keypair, swarm) = config.build()?;
 ```
 

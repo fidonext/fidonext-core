@@ -111,13 +111,30 @@ impl From<rendezvous::server::Event> for BehaviourEvent {
     }
 }
 
+/// Policy for enabling relay hop behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayHopMode {
+    /// Never enable hop relay behaviour.
+    Disabled,
+    /// Enable hop relay behaviour immediately.
+    Enabled,
+    /// Enable hop relay behaviour only after AutoNAT reports public reachability.
+    AutoOnPublic,
+}
+
+impl RelayHopMode {
+    fn initial_hop_enabled(self) -> bool {
+        matches!(self, RelayHopMode::Enabled)
+    }
+}
+
 /// Transport configuration builder.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     /// When set, enable QUIC support alongside TCP.
     pub use_quic: bool,
-    /// Controls whether the node should also act as a hop relay.
-    pub hop_relay: bool,
+    /// Controls when the node should act as a hop relay.
+    pub relay_hop_mode: RelayHopMode,
     /// Controls whether rendezvous behaviours are enabled.
     pub enable_rendezvous: bool,
     /// Optional seed for deriving an exact Ed25519 identity keypair.
@@ -128,7 +145,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             use_quic: false, // Turn on for quic
-            hop_relay: false, // Turn on for node act as relay (at least try)
+            relay_hop_mode: RelayHopMode::Disabled, // Turn on for node act as relay (at least try)
             enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
             identity_seed: None, // Pass to use identity seed for generating keypair
         }
@@ -137,10 +154,10 @@ impl Default for TransportConfig {
 
 impl TransportConfig {
      /// Creates a new configuration with the provided flags.
-    pub fn new(use_quic: bool, hop_relay: bool) -> Self {
+    pub fn new(use_quic: bool, relay_hop_mode: RelayHopMode) -> Self {
         Self {
             use_quic,
-            hop_relay,
+            relay_hop_mode,
             ..Default::default()
         }
     }
@@ -175,7 +192,7 @@ impl TransportConfig {
         let behaviour = Self::build_behaviour(
             &keypair,
             relay_client,
-            self.hop_relay,
+            self.relay_hop_mode.initial_hop_enabled(),
             self.enable_rendezvous,
         );
 
