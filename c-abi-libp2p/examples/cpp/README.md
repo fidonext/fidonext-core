@@ -5,7 +5,7 @@ Small C++ CLI that loads a node via Rust `cabi_rust_libp2p` lib through a C-ABI 
 - `listen` on a multiaddr
 - `dial` bootstrap/target peers
 - send/receive payloads via an internal message queue
-- (relay) optionally enable **hop relay** when AutoNAT reports PUBLIC (or force it)
+- (relay) auto-enable **hop relay** when AutoNAT reports PUBLIC (or force it immediately)
 
 ## Requirements
 
@@ -50,7 +50,7 @@ You can pin the `PeerId` of each node by supplying either a 32-byte hex seed
 deterministically expanded to 32 bytes (`--seed-phrase <string>`). This allows
 you to pre-compute relay/peer multiaddrs and wire them together reproducibly:
 
-1. Start the public relay (waits for PUBLIC AutoNAT and restarts with hop):
+1. Start the public relay (auto-enables hop once AutoNAT reports PUBLIC):
    ```
    ./ping --role relay --force-hop --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one
    ```
@@ -77,7 +77,7 @@ Optional bootstrapping is also supported via `--bootstrap <multiaddr>`, which
 can be specified multiple times. The example feeds these peers directly into
 node creation so they are registered with Kademlia and bootstrapped immediately.
 
-### Relay hop restart
-The example polls AutoNAT for up to 10 seconds. If the node reports **public**
-reachability, it automatically restarts with relay hop enabled and continues
-with the ping dial using the same bootstrap list.
+### Relay hop auto-enable
+The example no longer restarts the node to enable hop relay. When started as a
+relay, hop relay is enabled automatically after AutoNAT reports **public**
+reachability. Use `--force-hop` to enable hop immediately.

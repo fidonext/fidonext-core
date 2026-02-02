@@ -1,4 +1,4 @@
-﻿#include <algorithm>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -47,13 +47,13 @@ constexpr int CABI_STATUS_INVALID_ARGUMENT = 2;
 // Internal runtime error – check logs for details.
 constexpr int CABI_STATUS_INTERNAL_ERROR = 3;
 
-// AutoNAT statuses
-// AutoNAT status has not yet been determined.
-constexpr int CABI_AUTONAT_UNKNOWN = 0;
-// AutoNAT reports the node as privately reachable only.
-constexpr int CABI_AUTONAT_PRIVATE = 1;
-// AutoNAT reports the node as publicly reachable.
-constexpr int CABI_AUTONAT_PUBLIC  = 2;
+// Relay hop modes
+// Relay hop mode: never enable hop relay behaviour.
+constexpr int CABI_RELAY_HOP_MODE_DISABLED = 0;
+// Relay hop mode: enable hop relay behaviour immediately.
+constexpr int CABI_RELAY_HOP_MODE_ENABLED = 1;
+// Relay hop mode: enable hop relay behaviour after AutoNAT reports public.
+constexpr int CABI_RELAY_HOP_MODE_AUTO_ON_PUBLIC = 2;
 
 // Payload statuses
 // Queue contains no new messages.
@@ -64,9 +64,9 @@ constexpr int CABI_STATUS_BUFFER_TOO_SMALL = -2;
 constexpr int DEFAULT_MESSAGE_QUEUE_CAPACITY = 64;
 
 using InitTracingFunc = int (*)();
-using NewNodeFunc = void* (*)(
+using NewNodeWithRelayModeFunc = void* (*)(
   bool useQuic,
-  bool enableRelayHop,
+  int relayHopMode,
   const char* const* bootstrapPeers,
   size_t bootstrapPeersLen,
   const uint8_t* identitySeedPtr,
@@ -74,7 +74,6 @@ using NewNodeFunc = void* (*)(
 using ReserveRelayFunc = int (*)(void* handle, const char* multiaddr);
 using ListenNodeFunc = int (*)(void* handle, const char* multiaddr);
 using DialNodeFunc = int (*)(void* handle, const char* multiaddr);
-using AutonatStatusFunc = int (*)(void* handle);
 using EnqueueMessageFunc = int (*)(void* handle, const uint8_t* data_ptr, size_t data_len);
 using DequeueMessageFunc = int (*)(void* handle, uint8_t* out_buffer, size_t buffer_len, size_t* written_len);
 using GetAddrsSnapshotFunc = int (*)(void* handle, uint64_t* out_version, char* out_buf, size_t out_buf_len, size_t* out_written);
@@ -84,11 +83,10 @@ using FreeNodeFunc = void (*)(void* handle);
 struct CabiRustLibp2p
 {
   InitTracingFunc       InitTracing{};
-  NewNodeFunc           NewNode{};
+  NewNodeWithRelayModeFunc NewNodeWithRelayMode{};
   ReserveRelayFunc      ReserveRelay{};
   ListenNodeFunc        ListenNode{};
   DialNodeFunc          DialNode{};
-  AutonatStatusFunc     AutonatStatus{};
   EnqueueMessageFunc    EnqueueMessage{};
   DequeueMessageFunc    DequeueMessage{};
   GetAddrsSnapshotFunc  GetAddrsSnapshot{};
@@ -157,19 +155,19 @@ string statusMessage(int status)
 bool loadAbi(LibHandle lib, CabiRustLibp2p& abi)
 {
   abi.InitTracing = reinterpret_cast<InitTracingFunc>(GET_PROC(lib, "cabi_init_tracing"));
-  abi.NewNode = reinterpret_cast<NewNodeFunc>(GET_PROC(lib, "cabi_node_new"));
+  abi.NewNodeWithRelayMode = reinterpret_cast<NewNodeWithRelayModeFunc>(
+    GET_PROC(lib, "cabi_node_new_with_relay_mode"));
   abi.ReserveRelay = reinterpret_cast<ReserveRelayFunc>(GET_PROC(lib, "cabi_node_reserve_relay"));
   abi.ListenNode = reinterpret_cast<ListenNodeFunc>(GET_PROC(lib, "cabi_node_listen"));
   abi.DialNode = reinterpret_cast<DialNodeFunc>(GET_PROC(lib, "cabi_node_dial"));
-  abi.AutonatStatus = reinterpret_cast<AutonatStatusFunc>(GET_PROC(lib, "cabi_autonat_status"));
   abi.EnqueueMessage = reinterpret_cast<EnqueueMessageFunc>(GET_PROC(lib, "cabi_node_enqueue_message"));
   abi.DequeueMessage = reinterpret_cast<DequeueMessageFunc>(GET_PROC(lib, "cabi_node_dequeue_message"));
   abi.GetAddrsSnapshot = reinterpret_cast<GetAddrsSnapshotFunc>(GET_PROC(lib, "cabi_node_get_addrs_snapshot"));
   abi.LocalPeerId = reinterpret_cast<LocalPeerIdFunc>(GET_PROC(lib, "cabi_node_local_peer_id"));
   abi.FreeNode = reinterpret_cast<FreeNodeFunc>(GET_PROC(lib, "cabi_node_free"));
 
-  return  abi.InitTracing && abi.NewNode && abi.ListenNode &&
-          abi.DialNode && abi.AutonatStatus && abi.EnqueueMessage &&
+  return  abi.InitTracing && abi.NewNodeWithRelayMode && abi.ListenNode &&
+          abi.DialNode && abi.EnqueueMessage &&
           abi.DequeueMessage && abi.GetAddrsSnapshot && abi.LocalPeerId &&
           abi.FreeNode;
 }
@@ -320,7 +318,7 @@ Arguments parseArgs(int argc, char** argv)
             << "  --use-quic\n"
             << "  --listen <multiaddr>\n"
             << "  --bootstrap <multiaddr> (repeatable)\n"
-            << "  --force-hop (relay only; start with hop enabled without waiting for AutoNAT)\n"
+            << "  --force-hop (relay only; start with hop enabled immediately)\n"
             << "  --target <multiaddr> (repeatable)\n"
             << "  --seed <64-hex-bytes> (deterministic PeerId)\n"
             << "  --seed-phrase <string> (derive 32-byte seed deterministically)\n";
@@ -357,7 +355,7 @@ std::vector<const char*> toCStrVector(const std::vector<string>& values)
 void* createNode(
   const CabiRustLibp2p& abi,
   bool useQuic,
-  bool enableRelayHop,
+  int relayHopMode,
   const std::vector<string>& bootstrapPeers,
   const std::optional<std::array<uint8_t, 32>>& seed)
 {
@@ -374,9 +372,9 @@ void* createNode(
     seedLen = seedStorage.size();
   }
 
-  void* node = abi.NewNode(
+  void* node = abi.NewNodeWithRelayMode(
     useQuic,
-    enableRelayHop,
+    relayHopMode,
     bootstrapPtrs.data(),
     bootstrapPtrs.size(),
     seedPtr,
@@ -411,36 +409,6 @@ std::string readPeerId(const CabiRustLibp2p& abi, void* node)
   }
 
   return string(buffer.data(), written);
-}
-
-// Get Autonat status in order to have a possibility
-// to detect whether it is public or private
-bool waitForPublicAutonat(const CabiRustLibp2p& abi, void* node,
-  std::chrono::seconds timeout = std::chrono::seconds(10))
-{
-  auto start = std::chrono::steady_clock::now();
-
-  while (std::chrono::steady_clock::now() - start < timeout)
-  {
-    const int status = abi.AutonatStatus(node);
-    if (status == CABI_AUTONAT_PUBLIC)
-    {
-      return true;
-    }
-
-    if (status == CABI_AUTONAT_PRIVATE)
-    {
-      cout << "AutoNAT: private\n";
-    }
-    else if (status == CABI_AUTONAT_UNKNOWN)
-    {
-      cout << "AutoNAT: unknown\n";
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-  }
-
-  return false;
 }
 
 void recvLoop(
@@ -594,23 +562,6 @@ void dialPeers(const CabiRustLibp2p& abi, void* node, const std::vector<string>&
   }
 }
 
-void reserveOnRelays(const CabiRustLibp2p& abi, void* node, const std::vector<string>& peers)
-{
-  for (const auto& addr : peers)
-  {
-    const auto status = abi.ReserveRelay(node, addr.c_str());
-
-    if (status == CABI_STATUS_SUCCESS)
-    {
-      cout << "Reserved relay on " << addr << "\n";
-    }
-    else
-    {
-      cerr << "Failed to reserve relay on " << addr << " : " << statusMessage(status) << "\n";
-    }
-  }
-}
-
 int main(int argc, char** argv)
 {
   // Step 1. Load lib
@@ -664,7 +615,15 @@ int main(int argc, char** argv)
   try
   {
     // Step 4. Create node for this peer
-    node.reset(createNode(abi, args.useQuic, false, args.bootstrapPeers, args.identitySeed));
+    int relayHopMode = CABI_RELAY_HOP_MODE_DISABLED;
+    if (args.role == Role::Relay)
+    {
+      relayHopMode = args.forceHop
+        ? CABI_RELAY_HOP_MODE_ENABLED
+        : CABI_RELAY_HOP_MODE_AUTO_ON_PUBLIC;
+    }
+
+    node.reset(createNode(abi, args.useQuic, relayHopMode, args.bootstrapPeers, args.identitySeed));
     cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
 
     // Step 5. Try listen on provided addr
@@ -680,34 +639,11 @@ int main(int argc, char** argv)
     {
       if (args.forceHop)
       {
-        cout << "Force hop enabled; skipping AutoNAT wait\n";
+        cout << "Force hop enabled; relay hop will start immediately\n";
       }
       else
       {
-        std::chrono::seconds waitTime(10);
-        cout << "Waiting up to " << waitTime.count() << "s for PUBLIC AutoNAT status before enabling relay hop...\n";
-        
-        // Step 6. Try understand wheter node is public or private
-        // And if public, remake the node
-        if (waitForPublicAutonat(abi, node.handle, waitTime))
-        {
-          cout << "AutoNAT is PUBLIC; restarting with relay hop enabled\n";
-          node.reset();
-          node.reset(createNode(abi, args.useQuic, true, args.bootstrapPeers, args.identitySeed));
-
-          status = abi.ListenNode(node.handle, args.listen.c_str());
-          cout << "Listening with hop relay on " << args.listen << "\n";
-          if (status != CABI_STATUS_SUCCESS)
-          {
-            throw std::runtime_error("cabi_node_listen failed after hop restart: " + statusMessage(status));
-          }
-          cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
-        }
-        else
-        {
-          cout << "AutoNAT did not report PUBLIC within window; staying without hop\n";
-          reserveOnRelays(abi, node.handle, args.bootstrapPeers);
-        }
+        cout << "Relay hop will enable automatically once AutoNAT reports PUBLIC\n";
       }
     }
 
