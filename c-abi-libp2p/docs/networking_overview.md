@@ -80,6 +80,10 @@ Sharing the same seed between two nodes yields identical `PeerId`s so tests and 
 
 - `tests/peer_manager.rs` contains integration-test scaffolding.
 - Unit tests in `src/transport/libp2p.rs` and `src/peer/manager.rs` assert that the `PeerId` matches the public key.
+- Relay governance and offline delivery draft:
+  - `docs/relay-policy-offline-mailbox-spec.md`
+- Node role/capability policy (single-device stage):
+  - `docs/node-capabilities-policy.md`
 
 This layout mirrors the steps described in the official libp2p tutorial while keeping the project code organised into focused modules.
 

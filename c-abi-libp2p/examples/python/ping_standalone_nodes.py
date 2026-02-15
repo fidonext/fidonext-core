@@ -9,13 +9,14 @@ forwards stdin payloads over the gossipsub bridge.
 
 import argparse
 import ctypes
+import json
 import os
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Tuple, Union
 
 # Setup similar to ping_two_nodes.py
 try:
@@ -48,6 +49,12 @@ CABI_STATUS_INVALID_ARGUMENT = 2
 CABI_STATUS_INTERNAL_ERROR = 3
 CABI_STATUS_QUEUE_EMPTY = 4
 CABI_STATUS_BUFFER_TOO_SMALL = 5
+CABI_STATUS_TIMEOUT = 6
+CABI_STATUS_NOT_FOUND = 7
+CABI_IDENTITY_SEED_LEN = 32
+CABI_E2EE_MESSAGE_KIND_UNKNOWN = 0
+CABI_E2EE_MESSAGE_KIND_PREKEY = 1
+CABI_E2EE_MESSAGE_KIND_SESSION = 2
 
 # AutoNAT statuses
 CABI_AUTONAT_UNKNOWN = 0
@@ -92,6 +99,54 @@ lib.cabi_node_local_peer_id.argtypes = [
 lib.cabi_node_local_peer_id.restype = ctypes.c_int
 lib.cabi_node_free.argtypes = [ctypes.c_void_p]
 lib.cabi_node_free.restype = None
+lib.cabi_identity_load_or_create.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_identity_load_or_create.restype = ctypes.c_int
+lib.cabi_e2ee_build_prekey_bundle.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_e2ee_build_prekey_bundle.restype = ctypes.c_int
+lib.cabi_e2ee_build_message_auto.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_e2ee_build_message_auto.restype = ctypes.c_int
+lib.cabi_e2ee_decrypt_message_auto.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_int),
+]
+lib.cabi_e2ee_decrypt_message_auto.restype = ctypes.c_int
+lib.cabi_e2ee_libsignal_probe.argtypes = []
+lib.cabi_e2ee_libsignal_probe.restype = ctypes.c_int
 
 
 def _check(status: int, context: str) -> None:
@@ -103,6 +158,10 @@ def _check(status: int, context: str) -> None:
         reason = "invalid argument (multiaddr or UTF-8)"
     elif status == CABI_STATUS_BUFFER_TOO_SMALL:
         reason = "provided buffer too small"
+    elif status == CABI_STATUS_TIMEOUT:
+        reason = "operation timed out"
+    elif status == CABI_STATUS_NOT_FOUND:
+        reason = "record not found"
     else:
         reason = "internal error – inspect Rust logs for details"
     raise RuntimeError(f"{context} failed: {reason} (status={status})")
@@ -144,6 +203,144 @@ def derive_seed_from_phrase(seed_phrase: str) -> bytes:
         for shift in range(8):
             seed[i * 8 + shift] = (value >> (8 * shift)) & 0xFF
     return bytes(seed)
+
+
+def load_or_create_identity_profile(profile_path: Union[str, Path]) -> Tuple[str, str, bytes, bytes]:
+    profile_path = Path(profile_path).expanduser().resolve()
+    account_buffer_len = 256
+    device_buffer_len = 256
+    account_buffer = (ctypes.c_char * account_buffer_len)()
+    account_written = ctypes.c_size_t(0)
+    device_buffer = (ctypes.c_char * device_buffer_len)()
+    device_written = ctypes.c_size_t(0)
+    libp2p_seed_buffer = (ctypes.c_ubyte * CABI_IDENTITY_SEED_LEN)()
+    signal_seed_buffer = (ctypes.c_ubyte * CABI_IDENTITY_SEED_LEN)()
+
+    status = lib.cabi_identity_load_or_create(
+        str(profile_path).encode("utf-8"),
+        account_buffer,
+        ctypes.c_size_t(account_buffer_len),
+        ctypes.byref(account_written),
+        device_buffer,
+        ctypes.c_size_t(device_buffer_len),
+        ctypes.byref(device_written),
+        libp2p_seed_buffer,
+        ctypes.c_size_t(CABI_IDENTITY_SEED_LEN),
+        signal_seed_buffer,
+        ctypes.c_size_t(CABI_IDENTITY_SEED_LEN),
+    )
+    _check(status, f"identity_load_or_create({profile_path})")
+
+    account_id = bytes(account_buffer[: account_written.value]).decode("utf-8")
+    device_id = bytes(device_buffer[: device_written.value]).decode("utf-8")
+    libp2p_seed = bytes(libp2p_seed_buffer)
+    signal_seed = bytes(signal_seed_buffer)
+    return account_id, device_id, libp2p_seed, signal_seed
+
+
+def build_prekey_bundle(
+    profile_path: Union[str, Path],
+    one_time_prekey_count: int = 32,
+    ttl_seconds: int = 7 * 24 * 60 * 60,
+) -> bytes:
+    profile_path = Path(profile_path).expanduser().resolve()
+    output_len = 64 * 1024
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    status = lib.cabi_e2ee_build_prekey_bundle(
+        str(profile_path).encode("utf-8"),
+        ctypes.c_size_t(max(one_time_prekey_count, 1)),
+        ctypes.c_uint64(max(ttl_seconds, 1)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+    )
+    _check(status, f"e2ee_build_prekey_bundle({profile_path})")
+    return bytes(output[: written.value])
+
+
+def build_message_auto(
+    profile_path: Union[str, Path],
+    recipient_prekey_bundle: bytes,
+    plaintext: Union[bytes, bytearray, str],
+    aad: Union[bytes, bytearray, str] = b"",
+) -> bytes:
+    profile_path = Path(profile_path).expanduser().resolve()
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode("utf-8")
+    if isinstance(aad, str):
+        aad = aad.encode("utf-8")
+
+    bundle_buf = (ctypes.c_ubyte * len(recipient_prekey_bundle)).from_buffer_copy(
+        recipient_prekey_bundle
+    )
+    plain_buf = (ctypes.c_ubyte * len(plaintext)).from_buffer_copy(plaintext)
+    if aad:
+        aad_buf = (ctypes.c_ubyte * len(aad)).from_buffer_copy(aad)
+    else:
+        aad_buf = None
+
+    output_len = 64 * 1024
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    status = lib.cabi_e2ee_build_message_auto(
+        str(profile_path).encode("utf-8"),
+        bundle_buf,
+        ctypes.c_size_t(len(recipient_prekey_bundle)),
+        plain_buf,
+        ctypes.c_size_t(len(plaintext)),
+        aad_buf,
+        ctypes.c_size_t(len(aad)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+    )
+    _check(status, f"e2ee_build_message_auto({profile_path})")
+    return bytes(output[: written.value])
+
+
+def decrypt_message_auto(profile_path: Union[str, Path], payload: bytes) -> Tuple[int, bytes]:
+    profile_path = Path(profile_path).expanduser().resolve()
+    payload_buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    output_len = 64 * 1024
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    kind = ctypes.c_int(CABI_E2EE_MESSAGE_KIND_UNKNOWN)
+    status = lib.cabi_e2ee_decrypt_message_auto(
+        str(profile_path).encode("utf-8"),
+        payload_buf,
+        ctypes.c_size_t(len(payload)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+        ctypes.byref(kind),
+    )
+    _check(status, f"e2ee_decrypt_message_auto({profile_path})")
+    return int(kind.value), bytes(output[: written.value])
+
+
+def message_kind_name(kind: int) -> str:
+    if kind == CABI_E2EE_MESSAGE_KIND_PREKEY:
+        return "prekey"
+    if kind == CABI_E2EE_MESSAGE_KIND_SESSION:
+        return "session"
+    return "unknown"
+
+
+def run_libsignal_probe() -> None:
+    status = lib.cabi_e2ee_libsignal_probe()
+    _check(status, "e2ee_libsignal_probe")
+
+
+def extract_session_id(message_payload: bytes) -> Optional[str]:
+    try:
+        decoded = json.loads(message_payload.decode("utf-8"))
+    except Exception:
+        return None
+    session_id = decoded.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id
+    return None
 
 
 class Node:
@@ -239,7 +436,7 @@ class Node:
             "enqueue_message",
         )
 
-    def try_receive_message(self, buffer_size: int = 1024) -> Optional[bytes]:
+    def try_receive_message(self, buffer_size: int = 64 * 1024) -> Optional[bytes]:
         current_size = buffer_size
         while True:
             out_buffer = (ctypes.c_ubyte * current_size)()
@@ -295,7 +492,13 @@ def dial_peers(node: Node, peers: Sequence[str], label: str) -> None:
             print(f"Failed to dial {label} peer {addr}: {exc}", file=sys.stderr)
 
 
-def recv_loop(node: Node, running: threading.Event, poll_interval: float = 0.1) -> None:
+def recv_loop(
+    node: Node,
+    running: threading.Event,
+    profile_path: Optional[Path] = None,
+    decrypt_auto_enabled: bool = False,
+    poll_interval: float = 0.1,
+) -> None:
     while running.is_set():
         try:
             payload = node.try_receive_message()
@@ -306,11 +509,29 @@ def recv_loop(node: Node, running: threading.Event, poll_interval: float = 0.1) 
         if payload is None:
             time.sleep(poll_interval)
             continue
+        if decrypt_auto_enabled and profile_path is not None:
+            try:
+                kind, plaintext = decrypt_message_auto(profile_path, payload)
+                text = plaintext.decode("utf-8", "replace")
+                print(
+                    f"Received {message_kind_name(kind)} payload: '{text}'",
+                    flush=True,
+                )
+                continue
+            except RuntimeError:
+                # Payload may be plain (non-E2EE) in mixed mode.
+                pass
         text = payload.decode("utf-8", "replace")
         print(f"Received payload: '{text}'", flush=True)
 
 
-def interactive_send_loop(node: Node, running: threading.Event) -> None:
+def interactive_send_loop(
+    node: Node,
+    running: threading.Event,
+    profile_path: Optional[Path] = None,
+    recipient_prekey_bundle: Optional[bytes] = None,
+    prekey_aad: str = "",
+) -> None:
     print("Enter payload (empty line or /quit to exit):")
     while running.is_set():
         try:
@@ -326,7 +547,18 @@ def interactive_send_loop(node: Node, running: threading.Event) -> None:
             running.clear()
             break
         try:
-            node.send_message(line.rstrip("\n"))
+            payload_text = line.rstrip("\n")
+            if recipient_prekey_bundle is not None and profile_path is not None:
+                payload = build_message_auto(
+                    profile_path,
+                    recipient_prekey_bundle,
+                    payload_text,
+                    prekey_aad,
+                )
+                node.send_message(payload)
+            else:
+                node.send_message(payload_text)
+
         except RuntimeError as exc:
             print(f"Failed to send message: {exc}", file=sys.stderr)
             running.clear()
@@ -380,6 +612,42 @@ def parse_args() -> argparse.Namespace:
         help="Seed phrase expanded deterministically to 32 bytes.",
     )
     parser.add_argument(
+        "--profile",
+        help="Path to local identity profile (creates on first run). "
+        "Provides stable account/device IDs and libp2p identity seed.",
+    )
+    parser.add_argument(
+        "--dump-prekey-bundle",
+        action="store_true",
+        help="Build and print a signed pre-key bundle JSON (requires --profile), then exit.",
+    )
+    parser.add_argument(
+        "--prekey-count",
+        type=int,
+        default=32,
+        help="Number of one-time pre-keys to include when building pre-key bundle.",
+    )
+    parser.add_argument(
+        "--prekey-ttl",
+        type=int,
+        default=7 * 24 * 60 * 60,
+        help="Pre-key bundle lifetime in seconds.",
+    )
+    parser.add_argument(
+        "--encrypt-to-prekey-bundle-file",
+        help="Path to recipient pre-key bundle JSON file. Outgoing payloads use libsignal auto E2EE.",
+    )
+    parser.add_argument(
+        "--prekey-aad",
+        default="",
+        help="Optional AAD string for libsignal message encryption.",
+    )
+    parser.add_argument(
+        "--libsignal-probe",
+        action="store_true",
+        help="Run official libsignal in-memory probe through C-ABI and exit.",
+    )
+    parser.add_argument(
         "--message",
         help="Publish a scripted payload once after startup.",
     )
@@ -402,9 +670,53 @@ def main() -> None:
     args = parse_args()
     _check(lib.cabi_init_tracing(), "init tracing")
 
+    if args.libsignal_probe:
+        run_libsignal_probe()
+        print("libsignal probe OK")
+        return
+
+    if args.dump_prekey_bundle:
+        if not args.profile:
+            raise ValueError("--dump-prekey-bundle requires --profile")
+        bundle = build_prekey_bundle(
+            args.profile,
+            one_time_prekey_count=max(args.prekey_count, 1),
+            ttl_seconds=max(args.prekey_ttl, 1),
+        )
+        print(bundle.decode("utf-8"))
+        return
+
+    if args.encrypt_to_prekey_bundle_file and not args.profile:
+        raise ValueError("--encrypt-to-prekey-bundle-file requires --profile")
+
+    recipient_prekey_bundle: Optional[bytes] = None
+    profile_path_obj: Optional[Path] = None
+    if args.profile:
+        profile_path_obj = Path(args.profile).expanduser().resolve()
+    if args.encrypt_to_prekey_bundle_file:
+        bundle_path = Path(args.encrypt_to_prekey_bundle_file).expanduser().resolve()
+        recipient_prekey_bundle = bundle_path.read_bytes()
+    encrypt_auto_enabled = (
+        profile_path_obj is not None
+        and recipient_prekey_bundle is not None
+    )
+    decrypt_auto_enabled = (
+        profile_path_obj is not None
+    )
+
     listen_addr = args.listen or default_listen(args.use_quic)
     identity_seed: Optional[bytes] = None
-    if args.seed:
+    if args.profile and (args.seed or args.seed_phrase):
+        raise ValueError("--profile cannot be combined with --seed or --seed-phrase")
+
+    if args.profile:
+        account_id, device_id, profile_seed, _signal_seed = load_or_create_identity_profile(
+            args.profile
+        )
+        print(f"Local AccountId: {account_id}")
+        print(f"Local DeviceId: {device_id}")
+        identity_seed = profile_seed
+    elif args.seed:
         identity_seed = parse_seed(args.seed)
     elif args.seed_phrase:
         identity_seed = derive_seed_from_phrase(args.seed_phrase)
@@ -458,7 +770,14 @@ def main() -> None:
         dial_peers(node, args.target, "target")
 
         recv_thread = threading.Thread(
-            target=recv_loop, args=(node, running), daemon=True
+            target=recv_loop,
+            kwargs={
+                "node": node,
+                "running": running,
+                "profile_path": profile_path_obj,
+                "decrypt_auto_enabled": decrypt_auto_enabled,
+            },
+            daemon=True,
         )
         recv_thread.start()
 
@@ -474,8 +793,30 @@ def main() -> None:
                     time.sleep(0.5)
                     waited += 0.5
             if running.is_set():
-                node.send_message(args.message)
-                print(f"Scripted payload published: {args.message!r}", flush=True)
+                payloads: list[Union[bytes, str]] = []
+                if encrypt_auto_enabled and recipient_prekey_bundle is not None and profile_path_obj is not None:
+                    payload = build_message_auto(
+                        profile_path_obj,
+                        recipient_prekey_bundle,
+                        args.message,
+                        args.prekey_aad,
+                    )
+                    payloads.append(payload)
+                    session_id = extract_session_id(payload)
+                    print(
+                        "Scripted payload published as libsignal auto E2EE message"
+                        + (
+                            f" (session_id={session_id})."
+                            if session_id is not None
+                            else "."
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(f"Scripted payload published: {args.message!r}", flush=True)
+                    payloads.append(args.message)
+                for payload in payloads:
+                    node.send_message(payload)
             wait_after = max(args.post_message_wait, 0.0)
             waited = 0.0
             while running.is_set() and waited < wait_after:
@@ -485,7 +826,13 @@ def main() -> None:
         elif sys.stdin.isatty() or force_stdin:
             if force_stdin and not sys.stdin.isatty():
                 print("STDIN override enabled; reading scripted input.", flush=True)
-            interactive_send_loop(node, running)
+            interactive_send_loop(
+                node,
+                running,
+                profile_path=profile_path_obj,
+                recipient_prekey_bundle=recipient_prekey_bundle,
+                prekey_aad=args.prekey_aad,
+            )
         else:
             print("STDIN is non-interactive; running receive-only mode. Press Ctrl+C to exit.")
             while running.is_set():

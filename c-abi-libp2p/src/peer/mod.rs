@@ -12,7 +12,7 @@ pub use discovery::{
     DiscoveryEvent, DiscoveryEventSender, DiscoveryQueue, DiscoveryStatus,
     DEFAULT_DISCOVERY_QUEUE_CAPACITY,
 };
-pub use manager::{PeerCommand, PeerManager, PeerManagerHandle};
+pub use manager::{DhtQueryError, PeerCommand, PeerManager, PeerManagerHandle};
 
 
 /// Represents the local peer identity and metadata.

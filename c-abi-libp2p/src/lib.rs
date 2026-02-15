@@ -2,6 +2,7 @@
 //! surface that can be consumed by other runtimes.
 
 pub mod config;
+pub mod e2ee;
 pub mod messaging;
 pub mod peer;
 pub mod transport;
@@ -13,15 +14,16 @@ pub use transport::*;
 use std::{
     ffi::CStr,
     os::raw::{c_char, c_int},
-    ptr,
-    slice,
+    path::PathBuf,
+    ptr, slice,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
 use ::libp2p::{autonat, Multiaddr, PeerId};
+use anyhow::{Context, Result};
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 
 /// More suitable alias for results while using C-ABI libp2p rust lib
@@ -46,6 +48,14 @@ pub const CABI_STATUS_TIMEOUT: c_int = 6;
 /// The target peer could not be located in the DHT.
 pub const CABI_STATUS_NOT_FOUND: c_int = 7;
 
+/// Fixed seed length used by E2EE identity profile APIs.
+pub const CABI_IDENTITY_SEED_LEN: c_int = e2ee::IDENTITY_SEED_LEN as c_int;
+/// Unknown decrypted E2EE message kind.
+pub const CABI_E2EE_MESSAGE_KIND_UNKNOWN: c_int = 0;
+/// Decrypted E2EE message was a prekey message.
+pub const CABI_E2EE_MESSAGE_KIND_PREKEY: c_int = 1;
+/// Decrypted E2EE message was a session message.
+pub const CABI_E2EE_MESSAGE_KIND_SESSION: c_int = 2;
 
 /// AutoNAT status has not yet been determined.
 pub const CABI_AUTONAT_UNKNOWN: c_int = 0;
@@ -53,7 +63,6 @@ pub const CABI_AUTONAT_UNKNOWN: c_int = 0;
 pub const CABI_AUTONAT_PRIVATE: c_int = 1;
 /// AutoNAT reports the node as publicly reachable.
 pub const CABI_AUTONAT_PUBLIC: c_int = 2;
-
 
 /// Discovery event carries an address for a peer.
 pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
@@ -158,6 +167,24 @@ impl ManagedNode {
             .map(|_| request_id)
     }
 
+    /// Stores a key/value record in Kademlia.
+    fn dht_put_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+    ) -> std::result::Result<(), peer::DhtQueryError> {
+        self.runtime
+            .block_on(self.handle.dht_put_record(key, value, ttl_seconds))
+    }
+
+    /// Resolves a binary record from Kademlia.
+    fn dht_get_record(
+        &self,
+        key: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
+        self.runtime.block_on(self.handle.dht_get_record(key))
+    }
     /// Attempts to dequeue the next discovery event without blocking.
     fn try_dequeue_discovery(&mut self) -> Option<peer::DiscoveryEvent> {
         self.discovery_queue.try_dequeue()
@@ -213,6 +240,830 @@ pub extern "C" fn cabi_init_tracing() -> c_int {
             CABI_STATUS_INTERNAL_ERROR
         }
     }
+}
+
+#[no_mangle]
+/// C-ABI. Loads an identity profile from disk or creates one when missing.
+///
+/// Returns account and device identifiers along with fixed-size identity seeds
+/// used for deterministic libp2p/device bootstrap and Signal identity setup.
+pub extern "C" fn cabi_identity_load_or_create(
+    profile_path: *const c_char,
+    account_id_buffer: *mut c_char,
+    account_id_buffer_len: usize,
+    account_id_written_len: *mut usize,
+    device_id_buffer: *mut c_char,
+    device_id_buffer_len: usize,
+    device_id_written_len: *mut usize,
+    libp2p_seed_buffer: *mut u8,
+    libp2p_seed_buffer_len: usize,
+    signal_identity_seed_buffer: *mut u8,
+    signal_identity_seed_buffer_len: usize,
+) -> c_int {
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load or create identity profile"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let account_status = write_c_string(
+        &profile.account_id,
+        account_id_buffer,
+        account_id_buffer_len,
+        account_id_written_len,
+    );
+    if account_status != CABI_STATUS_SUCCESS {
+        return account_status;
+    }
+
+    let device_status = write_c_string(
+        &profile.device_id,
+        device_id_buffer,
+        device_id_buffer_len,
+        device_id_written_len,
+    );
+    if device_status != CABI_STATUS_SUCCESS {
+        return device_status;
+    }
+
+    let libp2p_status = write_fixed_seed(
+        &profile.libp2p_seed,
+        libp2p_seed_buffer,
+        libp2p_seed_buffer_len,
+    );
+    if libp2p_status != CABI_STATUS_SUCCESS {
+        return libp2p_status;
+    }
+
+    write_fixed_seed(
+        &profile.signal_identity_seed,
+        signal_identity_seed_buffer,
+        signal_identity_seed_buffer_len,
+    )
+}
+
+#[no_mangle]
+/// C-ABI. Builds a signed key update document for the local profile.
+///
+/// The output is a UTF-8 JSON document written to `out_buffer`.
+pub extern "C" fn cabi_e2ee_build_key_update(
+    profile_path: *const c_char,
+    peer_id: *const c_char,
+    revision: u64,
+    ttl_seconds: u64,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(peer_id) => peer_id,
+        Err(status) => return status,
+    };
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load profile for key update"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let effective_ttl = if ttl_seconds == 0 {
+        e2ee::DEFAULT_KEY_UPDATE_TTL_SECONDS
+    } else {
+        ttl_seconds
+    };
+    let payload = match e2ee::build_key_update(&profile, &peer_id, revision, effective_ttl) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to build key update payload");
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Validates a signed key update JSON document.
+///
+/// `now_unix = 0` uses current UNIX timestamp for expiry checks.
+pub extern "C" fn cabi_e2ee_validate_key_update(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    now_unix: u64,
+) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+    let now = if now_unix == 0 {
+        unix_seconds_now()
+    } else {
+        now_unix
+    };
+
+    match e2ee::validate_key_update(&payload, now) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "key update validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Builds an encrypted envelope JSON document.
+///
+/// This function only wraps encrypted bytes + metadata. Actual encryption is
+/// expected to happen in the caller/libsignal layer.
+pub extern "C" fn cabi_e2ee_build_envelope(
+    sender_account_id: *const c_char,
+    sender_device_id: *const c_char,
+    recipient_account_id: *const c_char,
+    recipient_device_id: *const c_char,
+    ciphertext_ptr: *const u8,
+    ciphertext_len: usize,
+    aad_ptr: *const u8,
+    aad_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let sender_account_id = match parse_required_c_string(sender_account_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let sender_device_id = match parse_required_c_string(sender_device_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let recipient_account_id = match parse_required_c_string(recipient_account_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let recipient_device_id = match parse_required_c_string(recipient_device_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let ciphertext = match parse_payload(ciphertext_ptr, ciphertext_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let aad = if aad_len == 0 {
+        Vec::new()
+    } else {
+        match parse_payload(aad_ptr, aad_len) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    };
+
+    let payload = match e2ee::build_envelope(
+        &sender_account_id,
+        &sender_device_id,
+        &recipient_account_id,
+        &recipient_device_id,
+        &ciphertext,
+        &aad,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to build encrypted envelope");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Validates an encrypted envelope JSON document.
+pub extern "C" fn cabi_e2ee_validate_envelope(payload_ptr: *const u8, payload_len: usize) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    match e2ee::validate_envelope(&payload) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "encrypted envelope validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Builds a signed pre-key bundle JSON document from local signal state.
+///
+/// The profile file controls where both identity and signal state are stored.
+pub extern "C" fn cabi_e2ee_build_prekey_bundle(
+    profile_path: *const c_char,
+    one_time_prekey_count: usize,
+    ttl_seconds: u64,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+
+    let prekey_count = if one_time_prekey_count == 0 {
+        e2ee::DEFAULT_ONE_TIME_PREKEY_COUNT
+    } else {
+        one_time_prekey_count
+    };
+    let effective_ttl = if ttl_seconds == 0 {
+        e2ee::DEFAULT_PREKEY_BUNDLE_TTL_SECONDS
+    } else {
+        ttl_seconds
+    };
+
+    let payload = match e2ee::build_prekey_bundle(&profile_path, prekey_count, effective_ttl) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to build prekey bundle"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Validates a signed pre-key bundle JSON document.
+///
+/// `now_unix = 0` uses current UNIX timestamp for expiry checks.
+pub extern "C" fn cabi_e2ee_validate_prekey_bundle(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    now_unix: u64,
+) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+    let now = if now_unix == 0 {
+        unix_seconds_now()
+    } else {
+        now_unix
+    };
+
+    match e2ee::validate_prekey_bundle(&payload, now) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "prekey bundle validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI legacy endpoint kept for ABI compatibility.
+///
+/// Explicit prekey-message APIs are disabled; use `cabi_e2ee_build_message_auto`.
+pub extern "C" fn cabi_e2ee_build_prekey_message(
+    profile_path: *const c_char,
+    recipient_prekey_bundle_ptr: *const u8,
+    recipient_prekey_bundle_len: usize,
+    plaintext_ptr: *const u8,
+    plaintext_len: usize,
+    aad_ptr: *const u8,
+    aad_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let _ = (
+        profile_path,
+        recipient_prekey_bundle_ptr,
+        recipient_prekey_bundle_len,
+        plaintext_ptr,
+        plaintext_len,
+        aad_ptr,
+        aad_len,
+        out_buffer,
+        out_buffer_len,
+        written_len,
+    );
+    tracing::warn!(
+        target: "ffi",
+        "legacy prekey message API is disabled; use cabi_e2ee_build_message_auto"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI. Validates prekey message envelope and metadata.
+pub extern "C" fn cabi_e2ee_validate_prekey_message(
+    payload_ptr: *const u8,
+    payload_len: usize,
+) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    match e2ee::validate_prekey_message(&payload) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "prekey message validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI legacy endpoint kept for ABI compatibility.
+///
+/// Explicit prekey-decrypt APIs are disabled; use `cabi_e2ee_decrypt_message_auto`.
+pub extern "C" fn cabi_e2ee_decrypt_prekey_message(
+    profile_path: *const c_char,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    out_plaintext_buffer: *mut u8,
+    out_plaintext_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let _ = (
+        profile_path,
+        payload_ptr,
+        payload_len,
+        out_plaintext_buffer,
+        out_plaintext_buffer_len,
+        written_len,
+    );
+    tracing::warn!(
+        target: "ffi",
+        "legacy prekey decrypt API is disabled; use cabi_e2ee_decrypt_message_auto"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI legacy endpoint kept for ABI compatibility.
+///
+/// Explicit session-message APIs are disabled; use `cabi_e2ee_build_message_auto`.
+pub extern "C" fn cabi_e2ee_build_session_message(
+    profile_path: *const c_char,
+    session_id: *const c_char,
+    plaintext_ptr: *const u8,
+    plaintext_len: usize,
+    aad_ptr: *const u8,
+    aad_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let _ = (
+        profile_path,
+        session_id,
+        plaintext_ptr,
+        plaintext_len,
+        aad_ptr,
+        aad_len,
+        out_buffer,
+        out_buffer_len,
+        written_len,
+    );
+    tracing::warn!(
+        target: "ffi",
+        "legacy session message API is disabled; use cabi_e2ee_build_message_auto"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI. Validates session message envelope and metadata.
+pub extern "C" fn cabi_e2ee_validate_session_message(
+    payload_ptr: *const u8,
+    payload_len: usize,
+) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    match e2ee::validate_session_message(&payload) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "session message validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI legacy endpoint kept for ABI compatibility.
+///
+/// Explicit session-decrypt APIs are disabled; use `cabi_e2ee_decrypt_message_auto`.
+pub extern "C" fn cabi_e2ee_decrypt_session_message(
+    profile_path: *const c_char,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    out_plaintext_buffer: *mut u8,
+    out_plaintext_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let _ = (
+        profile_path,
+        payload_ptr,
+        payload_len,
+        out_plaintext_buffer,
+        out_plaintext_buffer_len,
+        written_len,
+    );
+    tracing::warn!(
+        target: "ffi",
+        "legacy session decrypt API is disabled; use cabi_e2ee_decrypt_message_auto"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI. Builds and publishes the latest prekey bundle to DHT for local account/device.
+pub extern "C" fn cabi_e2ee_publish_prekey_bundle(
+    handle: *mut CabiNodeHandle,
+    profile_path: *const c_char,
+    one_time_prekey_count: usize,
+    bundle_ttl_seconds: u64,
+    dht_ttl_seconds: u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to load profile for prekey publish");
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+    let prekey_count = if one_time_prekey_count == 0 {
+        e2ee::DEFAULT_ONE_TIME_PREKEY_COUNT
+    } else {
+        one_time_prekey_count
+    };
+    let effective_bundle_ttl = if bundle_ttl_seconds == 0 {
+        e2ee::DEFAULT_PREKEY_BUNDLE_TTL_SECONDS
+    } else {
+        bundle_ttl_seconds
+    };
+    let payload = match e2ee::build_prekey_bundle(&profile_path, prekey_count, effective_bundle_ttl) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to build prekey bundle for dht publish");
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+    let key = match e2ee::prekey_bundle_dht_key(&profile.account_id, &profile.device_id) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "invalid prekey dht key inputs");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    let effective_dht_ttl = if dht_ttl_seconds == 0 {
+        effective_bundle_ttl
+    } else {
+        dht_ttl_seconds
+    };
+
+    match node.dht_put_record(key, payload, effective_dht_ttl) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => dht_error_to_status(err),
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Fetches and validates a prekey bundle from DHT by account/device id.
+pub extern "C" fn cabi_e2ee_fetch_prekey_bundle(
+    handle: *mut CabiNodeHandle,
+    account_id: *const c_char,
+    device_id: *const c_char,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let account_id = match parse_required_c_string(account_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let device_id = match parse_required_c_string(device_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let key = match e2ee::prekey_bundle_dht_key(&account_id, &device_id) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "invalid prekey dht key inputs");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    let payload = match node.dht_get_record(key) {
+        Ok(value) => value,
+        Err(err) => return dht_error_to_status(err),
+    };
+    if let Err(err) = e2ee::validate_prekey_bundle(&payload, unix_seconds_now()) {
+        tracing::warn!(target: "ffi", %err, "fetched prekey bundle validation failed");
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Builds and publishes key-update document to DHT for local account/device.
+pub extern "C" fn cabi_e2ee_publish_key_update(
+    handle: *mut CabiNodeHandle,
+    profile_path: *const c_char,
+    revision: u64,
+    key_update_ttl_seconds: u64,
+    dht_ttl_seconds: u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to load profile for key update publish");
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+    let effective_update_ttl = if key_update_ttl_seconds == 0 {
+        e2ee::DEFAULT_KEY_UPDATE_TTL_SECONDS
+    } else {
+        key_update_ttl_seconds
+    };
+    let effective_revision = match e2ee::resolve_key_update_revision(&profile_path, revision) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "invalid key update revision");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    let payload = match e2ee::build_key_update(
+        &profile,
+        &node.local_peer_id(),
+        effective_revision,
+        effective_update_ttl,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to build key update for dht publish");
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+    let key = match e2ee::key_update_dht_key(&profile.account_id, &profile.device_id) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "invalid key update dht key inputs");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    let effective_dht_ttl = if dht_ttl_seconds == 0 {
+        effective_update_ttl
+    } else {
+        dht_ttl_seconds
+    };
+
+    match node.dht_put_record(key, payload, effective_dht_ttl) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => dht_error_to_status(err),
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Fetches and validates latest key-update document from DHT by account/device id.
+pub extern "C" fn cabi_e2ee_fetch_key_update(
+    handle: *mut CabiNodeHandle,
+    account_id: *const c_char,
+    device_id: *const c_char,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let account_id = match parse_required_c_string(account_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let device_id = match parse_required_c_string(device_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let key = match e2ee::key_update_dht_key(&account_id, &device_id) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "invalid key update dht key inputs");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    let payload = match node.dht_get_record(key) {
+        Ok(value) => value,
+        Err(err) => return dht_error_to_status(err),
+    };
+    if let Err(err) = e2ee::validate_key_update(&payload, unix_seconds_now()) {
+        tracing::warn!(target: "ffi", %err, "fetched key update validation failed");
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Legacy device-directory validation API (disabled in single-device mode).
+pub extern "C" fn cabi_e2ee_validate_device_directory(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    now_unix: u64,
+) -> c_int {
+    let _ = (payload_ptr, payload_len, now_unix);
+    tracing::warn!(
+        target: "ffi",
+        "device directory API is disabled in single-device mode"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI. Legacy device-directory fetch API (disabled in single-device mode).
+pub extern "C" fn cabi_e2ee_fetch_device_directory(
+    handle: *mut CabiNodeHandle,
+    account_id: *const c_char,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let _ = (handle, account_id, out_buffer, out_buffer_len, written_len);
+    tracing::warn!(
+        target: "ffi",
+        "device directory API is disabled in single-device mode"
+    );
+    CABI_STATUS_INVALID_ARGUMENT
+}
+
+#[no_mangle]
+/// C-ABI. Probe that executes an in-memory official libsignal roundtrip.
+pub extern "C" fn cabi_e2ee_libsignal_probe() -> c_int {
+    match futures::executor::block_on(e2ee::official_libsignal_roundtrip_smoke()) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "official libsignal roundtrip probe failed");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Builds an outbound E2EE payload automatically:
+/// - prekey message when no session exists for recipient account/device,
+/// - session message when local session already exists.
+pub extern "C" fn cabi_e2ee_build_message_auto(
+    profile_path: *const c_char,
+    recipient_prekey_bundle_ptr: *const u8,
+    recipient_prekey_bundle_len: usize,
+    plaintext_ptr: *const u8,
+    plaintext_len: usize,
+    aad_ptr: *const u8,
+    aad_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let recipient_prekey_bundle =
+        match parse_payload(recipient_prekey_bundle_ptr, recipient_prekey_bundle_len) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+    let plaintext = match parse_payload(plaintext_ptr, plaintext_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let aad = if aad_len == 0 {
+        Vec::new()
+    } else {
+        match parse_payload(aad_ptr, aad_len) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    };
+
+    let outbound = match e2ee::build_message_auto(
+        &profile_path,
+        &recipient_prekey_bundle,
+        &plaintext,
+        &aad,
+    ) {
+        Ok(outbound) => outbound,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build auto e2ee message");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    write_bytes(&outbound.payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Automatically decrypts incoming E2EE payload and returns plaintext.
+///
+/// `message_kind` is set to one of:
+/// - [`CABI_E2EE_MESSAGE_KIND_PREKEY`]
+/// - [`CABI_E2EE_MESSAGE_KIND_SESSION`]
+pub extern "C" fn cabi_e2ee_decrypt_message_auto(
+    profile_path: *const c_char,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    out_plaintext_buffer: *mut u8,
+    out_plaintext_buffer_len: usize,
+    written_len: *mut usize,
+    message_kind: *mut c_int,
+) -> c_int {
+    if message_kind.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    let decrypted = match e2ee::decrypt_message_auto(&profile_path, &payload) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to decrypt auto e2ee payload");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    let kind = match decrypted.kind {
+        e2ee::DecryptedMessageKind::PreKey => CABI_E2EE_MESSAGE_KIND_PREKEY,
+        e2ee::DecryptedMessageKind::Session => CABI_E2EE_MESSAGE_KIND_SESSION,
+    };
+    unsafe {
+        *message_kind = kind;
+    }
+
+    write_bytes(
+        &decrypted.plaintext,
+        out_plaintext_buffer,
+        out_plaintext_buffer_len,
+        written_len,
+    )
 }
 
 #[no_mangle]
@@ -436,6 +1287,64 @@ pub extern "C" fn cabi_node_get_closest_peers(
             CABI_STATUS_INTERNAL_ERROR
         }
     }
+}
+
+#[no_mangle]
+/// C-ABI. Stores a binary key/value record in Kademlia DHT.
+///
+/// `ttl_seconds = 0` means "node default / no explicit TTL override".
+pub extern "C" fn cabi_node_dht_put_record(
+    handle: *mut CabiNodeHandle,
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+    ttl_seconds: u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let key = match parse_payload(key_ptr, key_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+    let value = match parse_payload(value_ptr, value_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    match node.dht_put_record(key, value, ttl_seconds) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => dht_error_to_status(err),
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Resolves a binary value by key from Kademlia DHT.
+pub extern "C" fn cabi_node_dht_get_record(
+    handle: *mut CabiNodeHandle,
+    key_ptr: *const u8,
+    key_len: usize,
+    out_buffer: *mut u8,
+    buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let key = match parse_payload(key_ptr, key_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+
+    let value = match node.dht_get_record(key) {
+        Ok(value) => value,
+        Err(err) => return dht_error_to_status(err),
+    };
+
+    write_bytes(&value, out_buffer, buffer_len, written_len)
 }
 
 #[no_mangle]
@@ -680,6 +1589,52 @@ fn parse_multiaddr(address: *const c_char) -> FfiResult<Multiaddr> {
     Multiaddr::from_str(addr_str).map_err(|_| CABI_STATUS_INVALID_ARGUMENT)
 }
 
+fn parse_required_c_string(value: *const c_char) -> FfiResult<String> {
+    if value.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+    let c_str = unsafe { CStr::from_ptr(value) };
+    let value = c_str
+        .to_str()
+        .map_err(|_| CABI_STATUS_INVALID_ARGUMENT)?
+        .trim();
+    if value.is_empty() {
+        return Err(CABI_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(value.to_string())
+}
+
+/// Parses a c string into a filesystem path.
+fn parse_path(path: *const c_char) -> FfiResult<PathBuf> {
+    if path.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+
+    let c_str = unsafe { CStr::from_ptr(path) };
+    let raw = match c_str.to_str() {
+        Ok(value) => value.trim(),
+        Err(_) => return Err(CABI_STATUS_INVALID_ARGUMENT),
+    };
+
+    if raw.is_empty() {
+        return Err(CABI_STATUS_INVALID_ARGUMENT);
+    }
+
+    Ok(PathBuf::from(raw))
+}
+
+fn parse_payload(data_ptr: *const u8, data_len: usize) -> FfiResult<Vec<u8>> {
+    if data_ptr.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+    if data_len == 0 {
+        return Err(CABI_STATUS_INVALID_ARGUMENT);
+    }
+
+    let payload = unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec();
+    Ok(payload)
+}
+
 // Parses a c string into vector with bootstraps.
 fn parse_bootstrap_peers(
     peers: *const *const c_char,
@@ -775,11 +1730,70 @@ fn write_c_string(
     CABI_STATUS_SUCCESS
 }
 
+fn write_fixed_seed(
+    seed: &[u8; e2ee::IDENTITY_SEED_LEN],
+    out_buffer: *mut u8,
+    buffer_len: usize,
+) -> c_int {
+    if out_buffer.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+
+    if buffer_len < e2ee::IDENTITY_SEED_LEN {
+        return CABI_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(seed.as_ptr(), out_buffer, e2ee::IDENTITY_SEED_LEN);
+    }
+
+    CABI_STATUS_SUCCESS
+}
+
+fn write_bytes(value: &[u8], out_buffer: *mut u8, buffer_len: usize, written_len: *mut usize) -> c_int {
+    if out_buffer.is_null() || written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    unsafe {
+        *written_len = value.len();
+    }
+    if value.len() > buffer_len {
+        return CABI_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(value.as_ptr(), out_buffer, value.len());
+    }
+
+    CABI_STATUS_SUCCESS
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn discovery_status_to_code(status: &peer::DiscoveryStatus) -> c_int {
     match status {
         peer::DiscoveryStatus::Success => CABI_STATUS_SUCCESS,
         peer::DiscoveryStatus::NotFound => CABI_STATUS_NOT_FOUND,
         peer::DiscoveryStatus::Timeout => CABI_STATUS_TIMEOUT,
         peer::DiscoveryStatus::InternalError => CABI_STATUS_INTERNAL_ERROR,
+    }
+}
+
+fn dht_error_to_status(err: peer::DhtQueryError) -> c_int {
+    match err {
+        peer::DhtQueryError::NotFound => CABI_STATUS_NOT_FOUND,
+        peer::DhtQueryError::Timeout => CABI_STATUS_TIMEOUT,
+        peer::DhtQueryError::Internal(message) => {
+            tracing::warn!(target: "ffi", %message, "dht query failed");
+            CABI_STATUS_INTERNAL_ERROR
+        }
     }
 }

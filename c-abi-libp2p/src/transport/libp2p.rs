@@ -226,6 +226,9 @@ impl TransportConfig {
             Toggle::from(None)
         };
 
+        let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
+        kademlia.set_mode(Some(kad::Mode::Server));
+
         let rendezvous_client = if enable_rendezvous {
             Toggle::from(Some(rendezvous::client::Behaviour::new(
                 keypair.clone(),
@@ -243,7 +246,7 @@ impl TransportConfig {
         };
 
         NetworkBehaviour {
-            kademlia: kad::Behaviour::with_config(peer_id, store, kad_config),
+            kademlia,
             ping: ping::Behaviour::new(ping_config),
             identify: identify::Behaviour::new(identify_config),
             autonat: autonat::Behaviour::new(peer_id, autonat_config),
