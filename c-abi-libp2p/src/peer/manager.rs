@@ -10,7 +10,7 @@ use futures::StreamExt;
 use libp2p::{
     core::Multiaddr,
     gossipsub,
-    identity,
+    identity, identify,
     swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
     autonat,
@@ -478,9 +478,28 @@ impl PeerManager {
                 }
             },
 
-            BehaviourEvent::Identify(event) => {
-                tracing::debug!(target: "peer", ?event, "identify event");
-            }
+            BehaviourEvent::Identify(event) => match event {
+                identify::Event::Received { peer_id, info, .. } => {
+                    tracing::debug!(
+                        target: "peer",
+                        %peer_id,
+                        listen_addrs = info.listen_addrs.len(),
+                        protocols = info.protocols.len(),
+                        "identify received",
+                    );
+
+                    let mut unique_addresses = HashSet::new();
+
+                    for address in info.listen_addrs {
+                        if let Some(normalized) =
+                            self.valid_kademlia_address(&peer_id, &address, &mut unique_addresses)
+                        {
+                            self.add_kademlia_address(&peer_id, &normalized, "identify");
+                        }
+                    }
+                }
+                other => tracing::debug!(target: "peer", ?other, "identify event"),
+            },
 
             BehaviourEvent::Gossipsub(event) => {
                 if let gossipsub::Event::Message {
@@ -678,21 +697,25 @@ impl PeerManager {
             }
 
             let now = Instant::now();
-            let backoff = self
-                .discovery_dial_backoff
-                .entry(peer.peer_id.clone())
-                .or_default();
-
             let mut unique_addresses = HashSet::new();
 
-            for address in peer
-                .addrs
-                .iter()
-                .cloned()
-                .filter(|addr| unique_addresses.insert(addr.clone()))
-            {
-                if let Some(next_allowed) = backoff.get(&address) {
-                    if *next_allowed > now {
+            // Processing peer addresses
+            for address in peer.addrs.iter().cloned() {
+                let Some(address) =
+                    self.valid_kademlia_address(&peer.peer_id, &address, &mut unique_addresses)
+                else {
+                    continue;
+                };
+
+                self.add_kademlia_address(&peer.peer_id, &address, "discovery");
+
+                let next_allowed = self
+                    .discovery_dial_backoff
+                    .get(&peer.peer_id)
+                    .and_then(|per_peer| per_peer.get(&address).copied());
+
+                if let Some(next_allowed) = next_allowed {
+                    if next_allowed > now {
                         tracing::debug!(
                             target: "peer",
                             peer_id = %peer.peer_id,
@@ -731,7 +754,10 @@ impl PeerManager {
                     ),
                 }
 
-                backoff.insert(address, now + DISCOVERY_DIAL_BACKOFF);
+                self.discovery_dial_backoff
+                    .entry(peer.peer_id.clone())
+                    .or_default()
+                    .insert(address, now + DISCOVERY_DIAL_BACKOFF);
             }
         }
     }
@@ -753,6 +779,94 @@ impl PeerManager {
         if let Err(err) = self.discovery_sender.try_enqueue(event) {
             tracing::warn!(target: "peer", %err, "failed to enqueue discovery completion");
         }
+    }
+
+    /// Adds address to Kademlia networking
+    fn add_kademlia_address(&mut self, peer_id: &PeerId, address: &Multiaddr, source: &str) {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(peer_id, address.clone());
+
+        tracing::info!(
+            target: "peer",
+            %peer_id,
+            %address,
+            source,
+            "added address to kademlia",
+        );
+    }
+
+    // Processes address to find valid, and non dublicated
+    fn valid_kademlia_address(
+        &self,
+        peer_id: &PeerId,
+        address: &Multiaddr,
+        unique_addresses: &mut HashSet<Multiaddr>,
+    ) -> Option<Multiaddr> {
+        if *peer_id == self.local_peer_id {
+            tracing::debug!(
+                target: "peer",
+                %peer_id,
+                %address,
+                "skipping self address for kademlia",
+            );
+            return None;
+        }
+
+        let mut normalized = address.clone();
+        match normalized.iter().last() {
+            Some(Protocol::P2p(last_peer_id)) if last_peer_id == *peer_id => {
+                normalized.pop();
+            }
+            Some(Protocol::P2p(last_peer_id)) => {
+                tracing::debug!(
+                    target: "peer",
+                    %peer_id,
+                    %address,
+                    last_peer_id = %last_peer_id,
+                    "skipping address with mismatched trailing peer id",
+                );
+                return None;
+            }
+            _ => {}
+        }
+
+        if normalized.is_empty() {
+            tracing::debug!(
+                target: "peer",
+                %peer_id,
+                %address,
+                "skipping empty address for kademlia",
+            );
+            return None;
+        }
+
+        let relay_only = normalized
+            .iter()
+            .all(|protocol| matches!(protocol, Protocol::P2pCircuit));
+        if relay_only {
+            tracing::debug!(
+                target: "peer",
+                %peer_id,
+                %address,
+                "skipping relay-only address without base transport",
+            );
+            return None;
+        }
+
+        if !unique_addresses.insert(normalized.clone()) {
+            tracing::debug!(
+                target: "peer",
+                %peer_id,
+                %address,
+                normalized = %normalized,
+                "skipping duplicate address",
+            );
+            return None;
+        }
+
+        Some(normalized)
     }
 
     // Adding bootstraps into node's DHT initial network

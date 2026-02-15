@@ -48,6 +48,7 @@ pub struct NetworkBehaviour {
 pub enum BehaviourEvent {
     Kademlia(kad::Event),
     Ping(ping::Event),
+    /// Appears on creating connection and handshake on identity
     Identify(identify::Event),
     Autonat(autonat::Event),
     Gossipsub(gossipsub::Event),
