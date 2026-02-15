@@ -12,17 +12,30 @@ MESSAGE="${MESSAGE:-hello-from-shell}"
 MESSAGE_DELAY="${MESSAGE_DELAY:-2}"
 POST_MESSAGE_WAIT="${POST_MESSAGE_WAIT:-5}"
 TRANSPORT="${TRANSPORT:-tcp}"
+E2EE_MODE="${E2EE_MODE:-off}"
 
 mkdir -p "${LOG_DIR}"
 rm -f "${LOG_DIR}"/*.log 2>/dev/null || true
 
-if [[ ! -x "${PYTHON_BIN}" ]]; then
-    echo "[run_local_mesh] Python binary not found: ${PYTHON_BIN}" >&2
-    exit 1
+if [[ "${PYTHON_BIN}" == */* ]]; then
+    if [[ ! -x "${PYTHON_BIN}" ]]; then
+        echo "[run_local_mesh] Python binary not found: ${PYTHON_BIN}" >&2
+        exit 1
+    fi
+else
+    if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+        echo "[run_local_mesh] Python binary not found in PATH: ${PYTHON_BIN}" >&2
+        exit 1
+    fi
 fi
 
 if [[ "${TRANSPORT}" != "tcp" && "${TRANSPORT}" != "quic" ]]; then
     echo "[run_local_mesh] Unsupported TRANSPORT value: ${TRANSPORT} (use 'tcp' or 'quic')" >&2
+    exit 1
+fi
+
+if [[ "${E2EE_MODE}" != "off" && "${E2EE_MODE}" != "on" ]]; then
+    echo "[run_local_mesh] Unsupported E2EE_MODE value: ${E2EE_MODE} (use 'off' or 'on')" >&2
     exit 1
 fi
 
@@ -56,6 +69,22 @@ wait_for_pattern() {
     done
 }
 
+wait_for_regex() {
+    local file="$1" pattern="$2" timeout="$3"
+    local start
+    start=$(date +%s)
+    while true; do
+        if [[ -f "${file}" ]] && grep -Eq "${pattern}" "${file}"; then
+            return 0
+        fi
+        if (( "$(date +%s)" - start >= timeout )); then
+            echo "[run_local_mesh] Timed out waiting for regex '${pattern}' in ${file}" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
 cleanup() {
     local exit_code=$?
     if [[ -n "${RELAY_PID:-}" ]]; then
@@ -77,6 +106,9 @@ LEAF_B_LOG="${LOG_DIR}/leafB.log"
 RELAY_ADDR="$(multiaddr "${RELAY_PORT}")"
 LEAF_A_ADDR="$(multiaddr "${LEAF_A_PORT}")"
 LEAF_B_ADDR="$(multiaddr "${LEAF_B_PORT}")"
+LEAF_A_PROFILE="${LOG_DIR}/leafA.profile.json"
+LEAF_B_PROFILE="${LOG_DIR}/leafB.profile.json"
+LEAF_B_BUNDLE="${LOG_DIR}/leafB.prekey_bundle.json"
 
 echo "[run_local_mesh] Starting relay on port ${RELAY_PORT}..."
 "${PYTHON_BIN}" -u "${PROJECT_ROOT}/examples/python/ping_standalone_nodes.py" \
@@ -99,11 +131,26 @@ BOOTSTRAP="${RELAY_ADDR}/p2p/${RELAY_ID}"
 sleep 2
 
 echo "[run_local_mesh] Starting leaf B on port ${LEAF_B_PORT}..."
+LEAF_B_ARGS=(
+    --listen "${LEAF_B_ADDR}"
+    --bootstrap "${BOOTSTRAP}"
+    "${QUIC_FLAGS[@]}"
+)
+if [[ "${E2EE_MODE}" == "on" ]]; then
+    echo "[run_local_mesh] Preparing leaf B prekey bundle..."
+    "${PYTHON_BIN}" -u "${PROJECT_ROOT}/examples/python/ping_standalone_nodes.py" \
+        --profile "${LEAF_B_PROFILE}" \
+        --dump-prekey-bundle >"${LEAF_B_BUNDLE}"
+    if [[ ! -s "${LEAF_B_BUNDLE}" ]]; then
+        echo "[run_local_mesh] Failed to generate leaf B prekey bundle" >&2
+        exit 1
+    fi
+    LEAF_B_ARGS+=(--profile "${LEAF_B_PROFILE}")
+else
+    LEAF_B_ARGS+=(--seed-phrase peer-b-local)
+fi
 "${PYTHON_BIN}" -u "${PROJECT_ROOT}/examples/python/ping_standalone_nodes.py" \
-    --listen "${LEAF_B_ADDR}" \
-    --bootstrap "${BOOTSTRAP}" \
-    --seed-phrase peer-b-local \
-    "${QUIC_FLAGS[@]}" >"${LEAF_B_LOG}" 2>&1 &
+    "${LEAF_B_ARGS[@]}" >"${LEAF_B_LOG}" 2>&1 &
 LEAFB_PID=$!
 wait_for_pattern "${LEAF_B_LOG}" "Dialed bootstrap peer" 20 || { cat "${LEAF_B_LOG}"; exit 1; }
 wait_for_pattern "${LEAF_B_LOG}" "connection established" 20 || { cat "${LEAF_B_LOG}"; exit 1; }
@@ -111,21 +158,51 @@ wait_for_pattern "${LEAF_B_LOG}" "connection established" 20 || { cat "${LEAF_B_
 sleep 5
 
 echo "[run_local_mesh] Running leaf A on port ${LEAF_A_PORT} and publishing payload..."
+LEAF_A_ARGS=(
+    --listen "${LEAF_A_ADDR}"
+    --bootstrap "${BOOTSTRAP}"
+    --message "${MESSAGE}"
+    --message-delay "${MESSAGE_DELAY}"
+    --post-message-wait "${POST_MESSAGE_WAIT}"
+    "${QUIC_FLAGS[@]}"
+)
+if [[ "${E2EE_MODE}" == "on" ]]; then
+    LEAF_A_ARGS+=(
+        --profile "${LEAF_A_PROFILE}"
+        --encrypt-to-prekey-bundle-file "${LEAF_B_BUNDLE}"
+    )
+else
+    LEAF_A_ARGS+=(--seed-phrase peer-a-local)
+fi
 "${PYTHON_BIN}" -u "${PROJECT_ROOT}/examples/python/ping_standalone_nodes.py" \
-    --listen "${LEAF_A_ADDR}" \
-    --bootstrap "${BOOTSTRAP}" \
-    --seed-phrase peer-a-local \
-    --message "${MESSAGE}" \
-    --message-delay "${MESSAGE_DELAY}" \
-    --post-message-wait "${POST_MESSAGE_WAIT}" \
-    "${QUIC_FLAGS[@]}" >"${LEAF_A_LOG}" 2>&1 || true
+    "${LEAF_A_ARGS[@]}" >"${LEAF_A_LOG}" 2>&1 || true
 
-wait_for_pattern "${LEAF_B_LOG}" "Received payload" 20 || {
-    echo "[run_local_mesh] Leaf B did not receive payload in time." >&2
-    cat "${LEAF_B_LOG}"
-    exit 1
-}
-echo "[run_local_mesh] Leaf B received payload."
+if [[ "${E2EE_MODE}" == "on" ]]; then
+    wait_for_regex "${LEAF_B_LOG}" "Received (prekey|session) payload" 20 || {
+        echo "[run_local_mesh] Leaf B did not receive libsignal decrypted payload in time." >&2
+        cat "${LEAF_A_LOG}"
+        cat "${LEAF_B_LOG}"
+        exit 1
+    }
+    wait_for_pattern "${LEAF_A_LOG}" "libsignal auto E2EE message" 20 || {
+        echo "[run_local_mesh] Leaf A did not publish libsignal auto payload." >&2
+        cat "${LEAF_A_LOG}"
+        exit 1
+    }
+    if grep -q "Received payload: '" "${LEAF_B_LOG}"; then
+        echo "[run_local_mesh] Unexpected plain payload detected in E2EE mode." >&2
+        cat "${LEAF_B_LOG}"
+        exit 1
+    fi
+    echo "[run_local_mesh] Leaf B received libsignal payload."
+else
+    wait_for_pattern "${LEAF_B_LOG}" "Received payload" 20 || {
+        echo "[run_local_mesh] Leaf B did not receive payload in time." >&2
+        cat "${LEAF_B_LOG}"
+        exit 1
+    }
+    echo "[run_local_mesh] Leaf B received payload."
+fi
 
 echo "[run_local_mesh] Logs stored in ${LOG_DIR}"
 

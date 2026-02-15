@@ -92,7 +92,9 @@ python3 ping_standalone_nodes.py \
   --bootstrap /ip4/<host>/tcp/41000/p2p/<PEER_ID> \
   --target /ip4/<host>/tcp/41001/p2p/<PEER_ID> \
   --force-hop \
-  --seed <64-hex-chars> | --seed-phrase "<text>"
+  --seed <64-hex-chars> | --seed-phrase "<text>" \
+  --profile /path/to/profile.json \
+  --encrypt-to-prekey-bundle-file /path/to/recipient.bundle.json
 ```
 
 Omit `--listen` to fall back to `/ip4/127.0.0.1/tcp/41000` (or the QUIC variant
@@ -148,6 +150,12 @@ The script performs the following steps:
 3. starts leaf **A** on `127.0.0.1:41001`, publishes a scripted payload via
    `--message`, then waits a few seconds before shutting down.
 
+When `E2EE_MODE=on`, the same flow runs with strict libsignal auto E2EE:
+
+1. leaf **B** creates/loads a profile and exports a signed prekey bundle;
+2. leaf **A** sends via `--profile + --encrypt-to-prekey-bundle-file`;
+3. leaf **B** auto-decrypts and logs `Received prekey payload: ...`.
+
 All stdout/stderr goes to `examples/python/logs/local_mesh/{relay,leafA,leafB}.log`.
 Check those files to inspect the mesh behaviour or to attach the logs to reports.
 
@@ -158,11 +166,25 @@ MESSAGE="custom payload" ./run_local_mesh.sh          # change payload
 RELAY_PORT=42000 LEAF_A_PORT=42001 LEAF_B_PORT=42002 ./run_local_mesh.sh
 TRANSPORT=quic ./run_local_mesh.sh                    # run over QUIC (uses udp/..../quic-v1)
 PYTHON_BIN=/path/to/python ./run_local_mesh.sh        # override interpreter
+E2EE_MODE=on ./run_local_mesh.sh                      # strict libsignal auto smoke
 ```
 
 > **Note:** `run_local_mesh.sh` is intended only for single-host smoke tests.
 > For a realistic deployment run the three `ping_standalone_nodes.py` commands
 > on separate machines using their public IPs/DNS as described above.
+
+### Native Rust E2EE smoke test
+
+If you want a non-Python smoke test that uses the Rust code path directly, run:
+
+```bash
+cd c-abi-libp2p
+cargo run --example e2ee_local_mesh
+```
+
+The example starts relay + 2 leaf peers, sends one prekey-encrypted message,
+then one session-encrypted message, and verifies replay protection.
+The source lives in `examples/rust/e2ee_local_mesh.rs`.
 
 ## Docker Example (Standalone Nodes)
 
