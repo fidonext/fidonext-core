@@ -14,14 +14,14 @@ use libp2p::{
     swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
     autonat,
-    kad::{self, QueryResult},
+    kad::{self, store::RecordStore, QueryResult},
     relay,
     multiaddr::Protocol,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, watch};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, watch};
 
 const DISCOVERY_DIAL_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -48,8 +48,27 @@ pub enum PeerCommand {
     ReserveRelay(Multiaddr),
     /// Publish a payload to the gossipsub topic.
     Publish(Vec<u8>),
+    /// Store a binary record in Kademlia.
+    PutDhtRecord {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+        response: oneshot::Sender<std::result::Result<(), DhtQueryError>>,
+    },
+    /// Retrieve a binary record from Kademlia.
+    GetDhtRecord {
+        key: Vec<u8>,
+        response: oneshot::Sender<std::result::Result<Vec<u8>, DhtQueryError>>,
+    },
     /// Shut the manager down gracefully.
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub enum DhtQueryError {
+    NotFound,
+    Timeout,
+    Internal(String),
 }
 
 /// Handle that allows callers to enqueue [`PeerCommand`]s.
@@ -125,6 +144,41 @@ impl PeerManagerHandle {
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
 
+    /// Stores a key/value record in the DHT and waits for the query outcome.
+    pub async fn dht_put_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+    ) -> std::result::Result<(), DhtQueryError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::PutDhtRecord {
+                key,
+                value,
+                ttl_seconds,
+                response: tx,
+            })
+            .await
+            .map_err(|err| DhtQueryError::Internal(format!("peer manager command channel closed: {err}")))?;
+        rx.await
+            .map_err(|_| DhtQueryError::Internal("dht put query response channel closed".to_string()))?
+    }
+
+    /// Resolves a key from the DHT and returns raw record bytes.
+    pub async fn dht_get_record(
+        &self,
+        key: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, DhtQueryError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::GetDhtRecord { key, response: tx })
+            .await
+            .map_err(|err| DhtQueryError::Internal(format!("peer manager command channel closed: {err}")))?;
+        rx.await
+            .map_err(|_| DhtQueryError::Internal("dht get query response channel closed".to_string()))?
+    }
+
     /// Enqueues the shutdown command.
     pub async fn shutdown(&self) -> Result<()> {
         self.command_sender
@@ -147,6 +201,12 @@ enum DiscoveryKind {
     GetClosestPeers,
 }
 
+#[derive(Debug)]
+struct PendingDhtPutQuery {
+    response: oneshot::Sender<std::result::Result<(), DhtQueryError>>,
+    fallback_record: kad::Record,
+}
+
 /// Manages the libp2p swarm (peer orchestrator) and exposes a command-driven control loop.
 pub struct PeerManager {
     swarm: Swarm<NetworkBehaviour>,
@@ -158,6 +218,9 @@ pub struct PeerManager {
     autonat_status: watch::Sender<autonat::NatStatus>,
     discovery_sender: DiscoveryEventSender,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
+    dht_put_queries: HashMap<kad::QueryId, PendingDhtPutQuery>,
+    dht_get_queries:
+        HashMap<kad::QueryId, oneshot::Sender<std::result::Result<Vec<u8>, DhtQueryError>>>,
     discovery_dial_backoff: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     relay_base_address: Option<Multiaddr>,
     relay_peer_id: Option<PeerId>,
@@ -210,6 +273,8 @@ impl PeerManager {
             autonat_status,
             discovery_sender,
             discovery_queries: HashMap::new(),
+            dht_put_queries: HashMap::new(),
+            dht_get_queries: HashMap::new(),
             discovery_dial_backoff: HashMap::new(),
             relay_base_address: None,
             relay_peer_id: None,
@@ -366,6 +431,86 @@ impl PeerManager {
                 }
                 Ok(false)
             }
+            PeerCommand::PutDhtRecord {
+                key,
+                value,
+                ttl_seconds,
+                response,
+            } => {
+                if key.is_empty() || value.is_empty() {
+                    let _ = response.send(Err(DhtQueryError::Internal(
+                        "dht put requires non-empty key and value".to_string(),
+                    )));
+                    return Ok(false);
+                }
+                let expires = if ttl_seconds == 0 {
+                    None
+                } else {
+                    Some(Instant::now() + Duration::from_secs(ttl_seconds))
+                };
+                let record = kad::Record {
+                    key: kad::RecordKey::new(&key),
+                    value,
+                    publisher: Some(self.local_peer_id.clone()),
+                    expires,
+                };
+                let local_fallback_record = record.clone();
+                match self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .put_record(record, kad::Quorum::One)
+                {
+                    Ok(query_id) => {
+                        self.dht_put_queries.insert(
+                            query_id,
+                            PendingDhtPutQuery {
+                                response,
+                                fallback_record: local_fallback_record,
+                            },
+                        );
+                        tracing::info!(target: "peer", ?query_id, "started dht put_record query");
+                    }
+                    Err(err) => match self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .put(local_fallback_record)
+                    {
+                        Ok(_) => {
+                            tracing::warn!(
+                                target: "peer",
+                                %err,
+                                "dht put_record quorum not met, stored record locally as fallback",
+                            );
+                            let _ = response.send(Ok(()));
+                        }
+                        Err(store_err) => {
+                            let _ = response.send(Err(DhtQueryError::Internal(format!(
+                                "failed to start dht put_record query: {err}; local fallback failed: {store_err}"
+                            ))));
+                        }
+                    },
+                }
+                Ok(false)
+            }
+            PeerCommand::GetDhtRecord { key, response } => {
+                if key.is_empty() {
+                    let _ = response.send(Err(DhtQueryError::Internal(
+                        "dht get requires non-empty key".to_string(),
+                    )));
+                    return Ok(false);
+                }
+                let query_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .get_record(kad::RecordKey::new(&key));
+                self.dht_get_queries.insert(query_id, response);
+                tracing::info!(target: "peer", ?query_id, "started dht get_record query");
+                Ok(false)
+            }
             PeerCommand::Shutdown => {
                 tracing::info!(target: "peer", "shutdown requested");
                 Ok(true)
@@ -390,6 +535,14 @@ impl PeerManager {
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 tracing::info!(target: "peer", %peer_id, "connection established");
+                if let Ok(query_id) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+                    tracing::debug!(
+                        target: "peer",
+                        ?query_id,
+                        %peer_id,
+                        "started kademlia bootstrap after connection established",
+                    );
+                }
             }
 
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -576,6 +729,12 @@ impl PeerManager {
                 QueryResult::GetClosestPeers(res) => {
                     self.handle_get_closest_peers_result(id, res, step.last)
                 }
+                QueryResult::PutRecord(res) => {
+                    self.handle_put_record_result(id, res, step.last);
+                }
+                QueryResult::GetRecord(res) => {
+                    self.handle_get_record_result(id, res, step.last);
+                }
                 other => {
                     tracing::debug!(target: "peer", ?id, ?other, "unhandled kademlia query result");
                     if step.last {
@@ -624,6 +783,76 @@ impl PeerManager {
                     self.finish_discovery(query_id, request, DiscoveryStatus::Timeout);
                 }
             }
+        }
+    }
+
+    fn handle_put_record_result(
+        &mut self,
+        query_id: kad::QueryId,
+        result: kad::PutRecordResult,
+        is_last: bool,
+    ) {
+        let Some(pending) = self.dht_put_queries.remove(&query_id) else {
+            return;
+        };
+        let PendingDhtPutQuery {
+            response,
+            fallback_record,
+        } = pending;
+        let outcome = match result {
+            Ok(_) => Ok(()),
+            Err(kad::PutRecordError::Timeout { .. }) => match self
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .put(fallback_record)
+            {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "peer",
+                        ?query_id,
+                        "dht put_record timed out, stored record locally as fallback",
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(DhtQueryError::Internal(format!(
+                    "dht put_record timed out and local fallback failed: {err}"
+                ))),
+            },
+            Err(err) => Err(DhtQueryError::Internal(format!(
+                "dht put_record failed: {err}"
+            ))),
+        };
+        if response.send(outcome).is_err() {
+            tracing::debug!(target: "peer", ?query_id, "dht put response receiver dropped");
+        }
+        if !is_last {
+            tracing::debug!(target: "peer", ?query_id, "dht put query produced non-final step");
+        }
+    }
+
+    fn handle_get_record_result(
+        &mut self,
+        query_id: kad::QueryId,
+        result: kad::GetRecordResult,
+        is_last: bool,
+    ) {
+        let Some(response) = self.dht_get_queries.remove(&query_id) else {
+            return;
+        };
+        let outcome = match result {
+            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => Ok(peer_record.record.value),
+            Ok(_) => Err(DhtQueryError::NotFound),
+            Err(kad::GetRecordError::NotFound { .. }) => Err(DhtQueryError::NotFound),
+            Err(kad::GetRecordError::QuorumFailed { .. }) => Err(DhtQueryError::NotFound),
+            Err(kad::GetRecordError::Timeout { .. }) => Err(DhtQueryError::Timeout),
+        };
+        if response.send(outcome).is_err() {
+            tracing::debug!(target: "peer", ?query_id, "dht get response receiver dropped");
+        }
+        if !is_last {
+            tracing::debug!(target: "peer", ?query_id, "dht get query produced non-final step");
         }
     }
 
