@@ -94,10 +94,14 @@ jobs:
       - name: Run E2EE smoke example
         run: cargo run --example e2ee_local_mesh
 
+      - name: Build debug C-ABI for Python smoke
+        run: cargo build
+
       - name: Run Python libsignal local mesh smoke
         timeout-minutes: 8
         env:
           PYTHON_BIN: python3
+          FIDONEXT_C_ABI: target/debug/libcabi_rust_libp2p.so
           E2EE_MODE: on
           MESSAGE: hello-libsignal-ci
           MESSAGE_DELAY: "2"
