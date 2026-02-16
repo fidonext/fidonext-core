@@ -161,6 +161,12 @@ lib.cabi_e2ee_build_prekey_bundle.argtypes = [
     ctypes.POINTER(ctypes.c_size_t),
 ]
 lib.cabi_e2ee_build_prekey_bundle.restype = ctypes.c_int
+lib.cabi_e2ee_validate_prekey_bundle.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_uint64,
+]
+lib.cabi_e2ee_validate_prekey_bundle.restype = ctypes.c_int
 lib.cabi_e2ee_build_message_auto.argtypes = [
     ctypes.c_char_p,
     ctypes.POINTER(ctypes.c_ubyte),
@@ -296,6 +302,18 @@ def build_prekey_bundle(
     )
     _check(status, f"e2ee_build_prekey_bundle({profile_path})")
     return bytes(output[: written.value])
+
+
+def validate_prekey_bundle(payload: bytes, now_unix: int = 0) -> None:
+    if not payload:
+        raise ValueError("prekey bundle payload cannot be empty")
+    payload_buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    status = lib.cabi_e2ee_validate_prekey_bundle(
+        payload_buf,
+        ctypes.c_size_t(len(payload)),
+        ctypes.c_uint64(max(int(now_unix), 0)),
+    )
+    _check(status, "e2ee_validate_prekey_bundle")
 
 
 def build_message_auto(

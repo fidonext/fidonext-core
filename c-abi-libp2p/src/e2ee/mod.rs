@@ -55,10 +55,10 @@ const LIBSIGNAL_MESSAGE_KIND_SESSION: &str = "session";
 
 pub async fn official_libsignal_roundtrip_smoke() -> Result<()> {
     use libsignal_protocol::{
-        kem, message_decrypt, message_encrypt, process_prekey_bundle, DeviceId, GenericSignedPreKey,
-        IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair, KyberPreKeyRecord,
-        KyberPreKeyStore, PreKeyBundle, PreKeyRecord, PreKeyStore, ProtocolAddress,
-        SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+        kem, message_decrypt, message_encrypt, process_prekey_bundle, DeviceId,
+        GenericSignedPreKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
+        KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyRecord, PreKeyStore,
+        ProtocolAddress, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
     };
     use rand09::{rngs::OsRng, Rng, TryRngCore as _};
 
@@ -428,8 +428,8 @@ pub fn build_key_update(
     let issued_at_unix = current_unix_seconds();
     let expires_at_unix = issued_at_unix.saturating_add(ttl_seconds.max(1));
     let account_keypair = keypair_from_seed(&profile.account_seed)?;
-    let account_public_key_b64 =
-        base64::engine::general_purpose::STANDARD.encode(account_keypair.public().encode_protobuf());
+    let account_public_key_b64 = base64::engine::general_purpose::STANDARD
+        .encode(account_keypair.public().encode_protobuf());
     let signal_identity_key_id = derive_account_id(&profile.signal_identity_seed)?;
 
     let unsigned = UnsignedKeyUpdateRecord {
@@ -444,7 +444,8 @@ pub fn build_key_update(
         expires_at_unix,
     };
 
-    let unsigned_bytes = serde_json::to_vec(&unsigned).context("failed to encode unsigned key update")?;
+    let unsigned_bytes =
+        serde_json::to_vec(&unsigned).context("failed to encode unsigned key update")?;
     let signature = account_keypair
         .sign(&unsigned_bytes)
         .context("failed to sign key update payload")?;
@@ -477,7 +478,9 @@ pub fn validate_key_update(encoded: &[u8], now_unix: u64) -> Result<KeyUpdateRec
         return Err(anyhow!("account_id/device_id cannot be empty"));
     }
     if record.expires_at_unix <= record.issued_at_unix {
-        return Err(anyhow!("key update expires_at_unix must be greater than issued_at_unix"));
+        return Err(anyhow!(
+            "key update expires_at_unix must be greater than issued_at_unix"
+        ));
     }
     if now_unix > record.expires_at_unix {
         return Err(anyhow!("key update has expired"));
@@ -489,8 +492,8 @@ pub fn validate_key_update(encoded: &[u8], now_unix: u64) -> Result<KeyUpdateRec
     let public_key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&record.account_public_key_b64)
         .context("invalid account_public_key_b64")?;
-    let public_key =
-        identity::PublicKey::try_decode_protobuf(&public_key_bytes).context("invalid account public key")?;
+    let public_key = identity::PublicKey::try_decode_protobuf(&public_key_bytes)
+        .context("invalid account public key")?;
     let derived_account_id = PeerId::from(public_key.clone()).to_string();
     if derived_account_id != record.account_id {
         return Err(anyhow!("account_id does not match account_public_key"));
@@ -510,8 +513,8 @@ pub fn validate_key_update(encoded: &[u8], now_unix: u64) -> Result<KeyUpdateRec
         issued_at_unix: record.issued_at_unix,
         expires_at_unix: record.expires_at_unix,
     };
-    let unsigned_bytes =
-        serde_json::to_vec(&unsigned).context("failed to encode unsigned key update for verification")?;
+    let unsigned_bytes = serde_json::to_vec(&unsigned)
+        .context("failed to encode unsigned key update for verification")?;
     if !public_key.verify(&unsigned_bytes, &signature_bytes) {
         return Err(anyhow!("key update signature verification failed"));
     }
@@ -519,17 +522,10 @@ pub fn validate_key_update(encoded: &[u8], now_unix: u64) -> Result<KeyUpdateRec
     Ok(record)
 }
 
-pub fn resolve_key_update_revision(
-    profile_path: &Path,
-    requested_revision: u64,
-) -> Result<u64> {
+pub fn resolve_key_update_revision(profile_path: &Path, requested_revision: u64) -> Result<u64> {
     let profile = load_or_create_profile(profile_path)?;
-    let mut state = load_or_create_signal_state(
-        profile_path,
-        &profile,
-        DEFAULT_ONE_TIME_PREKEY_COUNT,
-        true,
-    )?;
+    let mut state =
+        load_or_create_signal_state(profile_path, &profile, DEFAULT_ONE_TIME_PREKEY_COUNT, true)?;
 
     if requested_revision == 0 {
         return Ok(state.key_update_revision.max(1));
@@ -550,18 +546,18 @@ pub fn resolve_key_update_revision(
 
 pub fn prekey_bundle_dht_key(account_id: &str, device_id: &str) -> Result<Vec<u8>> {
     validate_account_and_device_ids(account_id, device_id)?;
-    Ok(format!(
-        "{DHT_KEY_NAMESPACE}/{DHT_KEY_PREKEY_BUNDLE_PREFIX}/{account_id}/{device_id}"
+    Ok(
+        format!("{DHT_KEY_NAMESPACE}/{DHT_KEY_PREKEY_BUNDLE_PREFIX}/{account_id}/{device_id}")
+            .into_bytes(),
     )
-    .into_bytes())
 }
 
 pub fn key_update_dht_key(account_id: &str, device_id: &str) -> Result<Vec<u8>> {
     validate_account_and_device_ids(account_id, device_id)?;
-    Ok(format!(
-        "{DHT_KEY_NAMESPACE}/{DHT_KEY_KEY_UPDATE_PREFIX}/{account_id}/{device_id}"
+    Ok(
+        format!("{DHT_KEY_NAMESPACE}/{DHT_KEY_KEY_UPDATE_PREFIX}/{account_id}/{device_id}")
+            .into_bytes(),
     )
-    .into_bytes())
 }
 
 fn validate_account_and_device_ids(account_id: &str, device_id: &str) -> Result<()> {
@@ -690,12 +686,13 @@ pub fn build_prekey_message(
     }
 
     let sender_profile = load_or_create_profile(profile_path)?;
-    let recipient_bundle = validate_prekey_bundle(
-        recipient_prekey_bundle_encoded,
-        current_unix_seconds(),
-    )?;
-    if recipient_bundle.account_id.trim().is_empty() || recipient_bundle.device_id.trim().is_empty() {
-        return Err(anyhow!("recipient prekey bundle has empty account/device id"));
+    let recipient_bundle =
+        validate_prekey_bundle(recipient_prekey_bundle_encoded, current_unix_seconds())?;
+    if recipient_bundle.account_id.trim().is_empty() || recipient_bundle.device_id.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "recipient prekey bundle has empty account/device id"
+        ));
     }
 
     let recipient_signed_pre_key_public = decode_base64_fixed_32(
@@ -714,9 +711,12 @@ pub fn build_prekey_message(
     let sender_ephemeral = generate_x25519_keypair(0);
     let shared_secret_signed =
         x25519_shared_secret(&sender_ephemeral.private, &recipient_signed_pre_key_public);
-    let shared_secret_one_time =
-        x25519_shared_secret(&sender_ephemeral.private, &recipient_one_time_pre_key_public);
-    let shared_secret = combine_prekey_shared_secrets(&shared_secret_signed, &shared_secret_one_time);
+    let shared_secret_one_time = x25519_shared_secret(
+        &sender_ephemeral.private,
+        &recipient_one_time_pre_key_public,
+    );
+    let shared_secret =
+        combine_prekey_shared_secrets(&shared_secret_signed, &shared_secret_one_time);
     let session_material = derive_session_material(
         &shared_secret,
         &sender_profile.account_id,
@@ -785,32 +785,33 @@ pub fn build_prekey_message(
 
 pub fn decrypt_prekey_message(profile_path: &Path, encoded_message: &[u8]) -> Result<Vec<u8>> {
     let profile = load_or_create_profile(profile_path)?;
-    let mut state = load_or_create_signal_state(
-        profile_path,
-        &profile,
-        DEFAULT_ONE_TIME_PREKEY_COUNT,
-        false,
-    )?;
+    let mut state =
+        load_or_create_signal_state(profile_path, &profile, DEFAULT_ONE_TIME_PREKEY_COUNT, false)?;
     let message = validate_prekey_message(encoded_message)?;
 
-    if message.recipient_account_id != profile.account_id || message.recipient_device_id != profile.device_id {
-        return Err(anyhow!("prekey message is not addressed to this account/device"));
+    if message.recipient_account_id != profile.account_id
+        || message.recipient_device_id != profile.device_id
+    {
+        return Err(anyhow!(
+            "prekey message is not addressed to this account/device"
+        ));
     }
-    let signed_pre_key_private_b64 = if message.recipient_signed_pre_key_id == state.signed_pre_key.key_id {
-        state.signed_pre_key.private_b64.clone()
-    } else {
-        state
-            .previous_signed_pre_keys
-            .iter()
-            .find(|value| value.key_id == message.recipient_signed_pre_key_id)
-            .map(|value| value.private_b64.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "prekey message targets unknown signed_pre_key_id: {}",
-                    message.recipient_signed_pre_key_id
-                )
-            })?
-    };
+    let signed_pre_key_private_b64 =
+        if message.recipient_signed_pre_key_id == state.signed_pre_key.key_id {
+            state.signed_pre_key.private_b64.clone()
+        } else {
+            state
+                .previous_signed_pre_keys
+                .iter()
+                .find(|value| value.key_id == message.recipient_signed_pre_key_id)
+                .map(|value| value.private_b64.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "prekey message targets unknown signed_pre_key_id: {}",
+                        message.recipient_signed_pre_key_id
+                    )
+                })?
+        };
     let recipient_one_time_pre_key = state
         .one_time_pre_keys
         .iter()
@@ -826,19 +827,20 @@ pub fn decrypt_prekey_message(profile_path: &Path, encoded_message: &[u8]) -> Re
         &message.sender_ephemeral_public_b64,
         "sender_ephemeral_public_b64",
     )?;
-    let recipient_signed_pre_key_private = decode_base64_fixed_32(
-        &signed_pre_key_private_b64,
-        "signed_pre_key.private_b64",
-    )?;
+    let recipient_signed_pre_key_private =
+        decode_base64_fixed_32(&signed_pre_key_private_b64, "signed_pre_key.private_b64")?;
     let recipient_one_time_pre_key_private = decode_base64_fixed_32(
         &recipient_one_time_pre_key.private_b64,
         "one_time_pre_key.private_b64",
     )?;
     let shared_secret_signed =
         x25519_shared_secret(&recipient_signed_pre_key_private, &sender_ephemeral_public);
-    let shared_secret_one_time =
-        x25519_shared_secret(&recipient_one_time_pre_key_private, &sender_ephemeral_public);
-    let shared_secret = combine_prekey_shared_secrets(&shared_secret_signed, &shared_secret_one_time);
+    let shared_secret_one_time = x25519_shared_secret(
+        &recipient_one_time_pre_key_private,
+        &sender_ephemeral_public,
+    );
+    let shared_secret =
+        combine_prekey_shared_secrets(&shared_secret_signed, &shared_secret_one_time);
     let session_material = derive_session_material(
         &shared_secret,
         &message.sender_account_id,
@@ -908,13 +910,19 @@ pub fn validate_prekey_message(encoded_message: &[u8]) -> Result<PreKeyMessageRe
         || message.recipient_account_id.trim().is_empty()
         || message.recipient_device_id.trim().is_empty()
     {
-        return Err(anyhow!("prekey message account/device fields cannot be empty"));
+        return Err(anyhow!(
+            "prekey message account/device fields cannot be empty"
+        ));
     }
     if message.recipient_signed_pre_key_id == 0 {
-        return Err(anyhow!("prekey message recipient_signed_pre_key_id cannot be zero"));
+        return Err(anyhow!(
+            "prekey message recipient_signed_pre_key_id cannot be zero"
+        ));
     }
     if message.recipient_one_time_pre_key_id == 0 {
-        return Err(anyhow!("prekey message recipient_one_time_pre_key_id cannot be zero"));
+        return Err(anyhow!(
+            "prekey message recipient_one_time_pre_key_id cannot be zero"
+        ));
     }
     if message.session_id.len() < 16 {
         return Err(anyhow!("invalid prekey message session_id"));
@@ -925,7 +933,10 @@ pub fn validate_prekey_message(encoded_message: &[u8]) -> Result<PreKeyMessageRe
 
     PeerId::from_str(&message.sender_account_id).context("invalid sender_account_id")?;
     PeerId::from_str(&message.recipient_account_id).context("invalid recipient_account_id")?;
-    decode_base64_fixed_32(&message.sender_ephemeral_public_b64, "sender_ephemeral_public_b64")?;
+    decode_base64_fixed_32(
+        &message.sender_ephemeral_public_b64,
+        "sender_ephemeral_public_b64",
+    )?;
     decode_base64_fixed_12(&message.nonce_b64, "nonce_b64")?;
     let ciphertext = decode_base64(&message.ciphertext_b64, "ciphertext_b64")?;
     if ciphertext.is_empty() {
@@ -979,7 +990,14 @@ pub fn build_session_message(
     }
 
     let mut store = load_or_create_session_store(profile_path)?;
-    let (counter, session_id_value, sender_account_id, sender_device_id, recipient_account_id, recipient_device_id) = {
+    let (
+        counter,
+        session_id_value,
+        sender_account_id,
+        sender_device_id,
+        recipient_account_id,
+        recipient_device_id,
+    ) = {
         let session = find_session_mut(&mut store, session_id)
             .ok_or_else(|| anyhow!("session not found for id: {session_id}"))?;
         (
@@ -1049,12 +1067,16 @@ pub fn decrypt_session_message(profile_path: &Path, encoded_message: &[u8]) -> R
     if session.local_account_id != message.recipient_account_id
         || session.local_device_id != message.recipient_device_id
     {
-        return Err(anyhow!("session message is not addressed to this local session owner"));
+        return Err(anyhow!(
+            "session message is not addressed to this local session owner"
+        ));
     }
     if session.peer_account_id != message.sender_account_id
         || session.peer_device_id != message.sender_device_id
     {
-        return Err(anyhow!("session message sender does not match stored peer identity"));
+        return Err(anyhow!(
+            "session message sender does not match stored peer identity"
+        ));
     }
     if message.counter <= session.recv_counter {
         return Err(anyhow!(
@@ -1152,22 +1174,14 @@ pub fn build_message_auto(
     aad: &[u8],
 ) -> Result<OutboundMessage> {
     let profile = load_or_create_profile(profile_path)?;
-    let recipient_bundle = validate_prekey_bundle(
-        recipient_prekey_bundle_encoded,
-        current_unix_seconds(),
-    )?;
+    let recipient_bundle =
+        validate_prekey_bundle(recipient_prekey_bundle_encoded, current_unix_seconds())?;
     if !has_complete_libsignal_bundle_fields(&recipient_bundle) {
         return Err(anyhow!(
             "recipient prekey bundle is missing libsignal fields; auto mode requires official libsignal bundle"
         ));
     }
-    build_libsignal_message_auto(
-        profile_path,
-        &profile,
-        &recipient_bundle,
-        plaintext,
-        aad,
-    )
+    build_libsignal_message_auto(profile_path, &profile, &recipient_bundle, plaintext, aad)
 }
 
 pub fn decrypt_message_auto(profile_path: &Path, payload: &[u8]) -> Result<DecryptedMessage> {
@@ -1180,8 +1194,8 @@ pub fn decrypt_message_auto(profile_path: &Path, payload: &[u8]) -> Result<Decry
 }
 
 fn keypair_from_seed(seed: &[u8; IDENTITY_SEED_LEN]) -> Result<identity::Keypair> {
-    let secret =
-        identity::ed25519::SecretKey::try_from_bytes(*seed).map_err(|err| anyhow!("invalid key seed: {err}"))?;
+    let secret = identity::ed25519::SecretKey::try_from_bytes(*seed)
+        .map_err(|err| anyhow!("invalid key seed: {err}"))?;
     let keypair = identity::ed25519::Keypair::from(secret);
     Ok(identity::Keypair::from(keypair))
 }
@@ -1376,15 +1390,11 @@ pub fn build_prekey_bundle(
     ttl_seconds: u64,
 ) -> Result<Vec<u8>> {
     let profile = load_or_create_profile(profile_path)?;
-    let state = load_or_create_signal_state(
-        profile_path,
-        &profile,
-        one_time_prekey_count.max(1),
-        true,
-    )?;
+    let state =
+        load_or_create_signal_state(profile_path, &profile, one_time_prekey_count.max(1), true)?;
     let account_keypair = keypair_from_seed(&profile.account_seed)?;
-    let account_public_key_b64 =
-        base64::engine::general_purpose::STANDARD.encode(account_keypair.public().encode_protobuf());
+    let account_public_key_b64 = base64::engine::general_purpose::STANDARD
+        .encode(account_keypair.public().encode_protobuf());
 
     let one_time_pre_keys = state
         .one_time_pre_keys
@@ -1403,7 +1413,11 @@ pub fn build_prekey_bundle(
         load_or_create_libsignal_store(profile_path, target_prekey)?;
 
     let libsignal_fields = {
-        replenish_libsignal_prekeys_if_needed(&mut libsignal_state, &mut libsignal_store, target_prekey)?;
+        replenish_libsignal_prekeys_if_needed(
+            &mut libsignal_state,
+            &mut libsignal_store,
+            target_prekey,
+        )?;
         let pre_key_id = libsignal_store
             .all_pre_key_ids()
             .next()
@@ -1413,7 +1427,12 @@ pub fn build_prekey_bundle(
             .get_pre_key(pre_key_id)
             .await_blocking()
             .map_err(|e| anyhow!("get_pre_key: {}", e))?;
-        let pre_key_public_b64 = encode_bytes(&pre_key_record.public_key().map_err(|e| anyhow!("pre_key public: {}", e))?.serialize());
+        let pre_key_public_b64 = encode_bytes(
+            &pre_key_record
+                .public_key()
+                .map_err(|e| anyhow!("pre_key public: {}", e))?
+                .serialize(),
+        );
         let signed_pre_key_id = libsignal_state.active_signed_pre_key_id;
         let signed_pre_key_record = libsignal_store
             .get_signed_pre_key(signed_pre_key_id.into())
@@ -1425,8 +1444,11 @@ pub fn build_prekey_bundle(
                 .map_err(|e| anyhow!("signed_pre_key public: {}", e))?
                 .serialize(),
         );
-        let signed_pre_key_signature_b64 =
-            encode_bytes(&signed_pre_key_record.signature().map_err(|e| anyhow!("signed_pre_key signature: {}", e))?);
+        let signed_pre_key_signature_b64 = encode_bytes(
+            &signed_pre_key_record
+                .signature()
+                .map_err(|e| anyhow!("signed_pre_key signature: {}", e))?,
+        );
         let kyber_pre_key_id = libsignal_state.active_kyber_pre_key_id;
         let kyber_pre_key_record = libsignal_store
             .get_kyber_pre_key(kyber_pre_key_id.into())
@@ -1438,13 +1460,17 @@ pub fn build_prekey_bundle(
                 .map_err(|e| anyhow!("kyber_pre_key public: {}", e))?
                 .serialize(),
         );
-        let kyber_pre_key_signature_b64 =
-            encode_bytes(&kyber_pre_key_record.signature().map_err(|e| anyhow!("kyber_pre_key signature: {}", e))?);
+        let kyber_pre_key_signature_b64 = encode_bytes(
+            &kyber_pre_key_record
+                .signature()
+                .map_err(|e| anyhow!("kyber_pre_key signature: {}", e))?,
+        );
         let identity_key_pair = libsignal_store
             .get_identity_key_pair()
             .await_blocking()
             .map_err(|e| anyhow!("get_identity_key_pair: {}", e))?;
-        let libsignal_identity_key_b64 = encode_bytes(identity_key_pair.identity_key().serialize().as_ref());
+        let libsignal_identity_key_b64 =
+            encode_bytes(identity_key_pair.identity_key().serialize().as_ref());
         (
             libsignal_identity_key_b64,
             pre_key_id.into(),
@@ -1496,7 +1522,8 @@ pub fn build_prekey_bundle(
         expires_at_unix,
     };
 
-    let unsigned_bytes = serde_json::to_vec(&unsigned).context("failed to encode unsigned prekey bundle")?;
+    let unsigned_bytes =
+        serde_json::to_vec(&unsigned).context("failed to encode unsigned prekey bundle")?;
     let signature = account_keypair
         .sign(&unsigned_bytes)
         .context("failed to sign prekey bundle")?;
@@ -1557,33 +1584,13 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
     }
 
     PeerId::from_str(&record.account_id).context("invalid account_id PeerId")?;
-    let account_public_key_bytes = decode_base64(&record.account_public_key_b64, "account_public_key_b64")?;
+    let account_public_key_bytes =
+        decode_base64(&record.account_public_key_b64, "account_public_key_b64")?;
     let account_public_key = identity::PublicKey::try_decode_protobuf(&account_public_key_bytes)
         .context("invalid account_public_key")?;
     let derived_account_id = PeerId::from(account_public_key.clone()).to_string();
     if derived_account_id != record.account_id {
         return Err(anyhow!("account_id does not match account_public_key"));
-    }
-
-    decode_base64_fixed_32(&record.identity_key_b64, "identity_key_b64")?;
-    let signed_pre_key_public =
-        decode_base64_fixed_32(&record.signed_pre_key_public_b64, "signed_pre_key_public_b64")?;
-    let signed_pre_key_signature =
-        decode_base64(&record.signed_pre_key_signature_b64, "signed_pre_key_signature_b64")?;
-    let signed_pre_key_signed_payload = signed_pre_key_payload(
-        record.signed_pre_key_id,
-        record.registration_id,
-        &signed_pre_key_public,
-    );
-    if !account_public_key.verify(&signed_pre_key_signed_payload, &signed_pre_key_signature) {
-        return Err(anyhow!("signed pre-key signature verification failed"));
-    }
-
-    for pre_key in &record.one_time_pre_keys {
-        if pre_key.key_id == 0 {
-            return Err(anyhow!("one-time pre-key id cannot be zero"));
-        }
-        decode_base64_fixed_32(&pre_key.public_key_b64, "one_time_pre_key.public_key_b64")?;
     }
 
     let libsignal_fields = [
@@ -1604,9 +1611,45 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
             "libsignal fields must be all-or-none: all 9 must be present or all absent"
         ));
     }
+
+    decode_base64_fixed_32(&record.identity_key_b64, "identity_key_b64")?;
+    let signed_pre_key_public = decode_base64_fixed_32(
+        &record.signed_pre_key_public_b64,
+        "signed_pre_key_public_b64",
+    )?;
+    let signed_pre_key_signature = decode_base64(
+        &record.signed_pre_key_signature_b64,
+        "signed_pre_key_signature_b64",
+    )?;
+    let signed_pre_key_signed_payload = signed_pre_key_payload(
+        record.signed_pre_key_id,
+        record.registration_id,
+        &signed_pre_key_public,
+    );
+    if !account_public_key.verify(&signed_pre_key_signed_payload, &signed_pre_key_signature) {
+        if all_libsignal {
+            tracing::warn!(
+                target: "e2ee",
+                account_id = %record.account_id,
+                "legacy signed pre-key signature verification failed; accepting due to complete libsignal fields"
+            );
+        } else {
+            return Err(anyhow!("signed pre-key signature verification failed"));
+        }
+    }
+
+    for pre_key in &record.one_time_pre_keys {
+        if pre_key.key_id == 0 {
+            return Err(anyhow!("one-time pre-key id cannot be zero"));
+        }
+        decode_base64_fixed_32(&pre_key.public_key_b64, "one_time_pre_key.public_key_b64")?;
+    }
+
     if all_libsignal {
         if record.libsignal_pre_key_id.map_or(true, |id| id == 0) {
-            return Err(anyhow!("libsignal_pre_key_id must be > 0 when libsignal fields present"));
+            return Err(anyhow!(
+                "libsignal_pre_key_id must be > 0 when libsignal fields present"
+            ));
         }
         if record
             .libsignal_signed_pre_key_id
@@ -1622,10 +1665,7 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
             ));
         }
         decode_base64(
-            record
-                .libsignal_identity_key_b64
-                .as_ref()
-                .unwrap(),
+            record.libsignal_identity_key_b64.as_ref().unwrap(),
             "libsignal_identity_key_b64",
         )?;
         decode_base64(
@@ -1633,10 +1673,7 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
             "libsignal_pre_key_public_b64",
         )?;
         decode_base64(
-            record
-                .libsignal_signed_pre_key_public_b64
-                .as_ref()
-                .unwrap(),
+            record.libsignal_signed_pre_key_public_b64.as_ref().unwrap(),
             "libsignal_signed_pre_key_public_b64",
         )?;
         decode_base64(
@@ -1647,10 +1684,7 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
             "libsignal_signed_pre_key_signature_b64",
         )?;
         decode_base64(
-            record
-                .libsignal_kyber_pre_key_public_b64
-                .as_ref()
-                .unwrap(),
+            record.libsignal_kyber_pre_key_public_b64.as_ref().unwrap(),
             "libsignal_kyber_pre_key_public_b64",
         )?;
         decode_base64(
@@ -1679,17 +1713,21 @@ pub fn validate_prekey_bundle(encoded: &[u8], now_unix: u64) -> Result<PreKeyBun
         libsignal_pre_key_public_b64: record.libsignal_pre_key_public_b64.clone(),
         libsignal_signed_pre_key_id: record.libsignal_signed_pre_key_id,
         libsignal_signed_pre_key_public_b64: record.libsignal_signed_pre_key_public_b64.clone(),
-        libsignal_signed_pre_key_signature_b64: record.libsignal_signed_pre_key_signature_b64.clone(),
+        libsignal_signed_pre_key_signature_b64: record
+            .libsignal_signed_pre_key_signature_b64
+            .clone(),
         libsignal_kyber_pre_key_id: record.libsignal_kyber_pre_key_id,
         libsignal_kyber_pre_key_public_b64: record.libsignal_kyber_pre_key_public_b64.clone(),
         libsignal_kyber_pre_key_signature_b64: record.libsignal_kyber_pre_key_signature_b64.clone(),
         generated_at_unix: record.generated_at_unix,
         expires_at_unix: record.expires_at_unix,
     };
-    let unsigned_bytes =
-        serde_json::to_vec(&unsigned).context("failed to encode unsigned prekey bundle for verification")?;
+    let unsigned_bytes = serde_json::to_vec(&unsigned)
+        .context("failed to encode unsigned prekey bundle for verification")?;
     if !account_public_key.verify(&unsigned_bytes, &account_signature) {
-        return Err(anyhow!("prekey bundle account signature verification failed"));
+        return Err(anyhow!(
+            "prekey bundle account signature verification failed"
+        ));
     }
 
     Ok(record)
@@ -1704,6 +1742,13 @@ fn load_or_create_signal_state(
     let path = signal_state_path(profile_path);
     if path.exists() {
         let mut state = load_signal_state(&path)?;
+        if !signal_state_matches_profile(&state, profile)? {
+            tracing::warn!(
+                target: "e2ee",
+                "signal state does not match profile identity/account; regenerating state"
+            );
+            return create_signal_state(&path, profile, one_time_prekey_count);
+        }
         let mut changed = false;
         if rotate_signed_pre_key
             && maybe_rotate_signed_pre_key(
@@ -1726,11 +1771,36 @@ fn load_or_create_signal_state(
     create_signal_state(&path, profile, one_time_prekey_count)
 }
 
+fn signal_state_matches_profile(state: &StoredSignalState, profile: &IdentityProfile) -> Result<bool> {
+    let identity_private = decode_base64_fixed_32(&state.identity_private_b64, "identity_private_b64")?;
+    if identity_private != profile.signal_identity_seed {
+        return Ok(false);
+    }
+    let expected_public = x25519_public_from_private(&profile.signal_identity_seed);
+    let identity_public = decode_base64_fixed_32(&state.identity_public_b64, "identity_public_b64")?;
+    if identity_public != expected_public {
+        return Ok(false);
+    }
+
+    let account_keypair = keypair_from_seed(&profile.account_seed)?;
+    let signed_public = decode_base64_fixed_32(&state.signed_pre_key.public_b64, "signed_pre_key.public_b64")?;
+    let signed_signature = decode_base64(
+        &state.signed_pre_key_signature_b64,
+        "signed_pre_key_signature_b64",
+    )?;
+    let payload = signed_pre_key_payload(
+        state.signed_pre_key.key_id,
+        state.registration_id,
+        &signed_public,
+    );
+    Ok(account_keypair.public().verify(&payload, &signed_signature))
+}
+
 fn load_signal_state(path: &Path) -> Result<StoredSignalState> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read signal state: {}", path.display()))?;
-    let mut state: StoredSignalState =
-        serde_json::from_str(&raw).with_context(|| format!("invalid signal state json: {}", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read signal state: {}", path.display()))?;
+    let mut state: StoredSignalState = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid signal state json: {}", path.display()))?;
     let changed = ensure_signal_state_defaults(&mut state)?;
     validate_signal_state(&state)?;
     if changed {
@@ -1860,18 +1930,28 @@ fn validate_signal_state(state: &StoredSignalState) -> Result<()> {
         return Err(anyhow!("signal state registration_id cannot be zero"));
     }
     if state.next_signed_pre_key_id == 0 {
-        return Err(anyhow!("signal state next_signed_pre_key_id cannot be zero"));
+        return Err(anyhow!(
+            "signal state next_signed_pre_key_id cannot be zero"
+        ));
     }
     if state.next_one_time_pre_key_id == 0 {
-        return Err(anyhow!("signal state next_one_time_pre_key_id cannot be zero"));
+        return Err(anyhow!(
+            "signal state next_one_time_pre_key_id cannot be zero"
+        ));
     }
     if state.key_update_revision == 0 {
         return Err(anyhow!("signal state key_update_revision cannot be zero"));
     }
     decode_base64_fixed_32(&state.identity_private_b64, "identity_private_b64")?;
     decode_base64_fixed_32(&state.identity_public_b64, "identity_public_b64")?;
-    decode_base64_fixed_32(&state.signed_pre_key.private_b64, "signed_pre_key.private_b64")?;
-    decode_base64_fixed_32(&state.signed_pre_key.public_b64, "signed_pre_key.public_b64")?;
+    decode_base64_fixed_32(
+        &state.signed_pre_key.private_b64,
+        "signed_pre_key.private_b64",
+    )?;
+    decode_base64_fixed_32(
+        &state.signed_pre_key.public_b64,
+        "signed_pre_key.public_b64",
+    )?;
     decode_base64(
         &state.signed_pre_key_signature_b64,
         "signed_pre_key_signature_b64",
@@ -1909,7 +1989,9 @@ fn validate_signal_state(state: &StoredSignalState) -> Result<()> {
     }
     for previous in &state.previous_signed_pre_keys {
         if previous.key_id == state.signed_pre_key.key_id {
-            return Err(anyhow!("previous signed pre-key duplicates current signed pre-key id"));
+            return Err(anyhow!(
+                "previous signed pre-key duplicates current signed pre-key id"
+            ));
         }
     }
     for (index, key) in state.previous_signed_pre_keys.iter().enumerate() {
@@ -2043,8 +2125,12 @@ fn maybe_replenish_one_time_pre_keys(
 
 fn persist_signal_state(path: &Path, state: &StoredSignalState) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create signal state directory: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create signal state directory: {}",
+                parent.display()
+            )
+        })?;
     }
 
     let json = serde_json::to_string_pretty(state).context("failed to serialize signal state")?;
@@ -2056,12 +2142,16 @@ fn persist_signal_state(path: &Path, state: &StoredSignalState) -> Result<()> {
     {
         options.mode(0o600);
     }
-    let mut file = options
-        .open(&temp_path)
-        .with_context(|| format!("failed to create temp signal state: {}", temp_path.display()))?;
+    let mut file = options.open(&temp_path).with_context(|| {
+        format!(
+            "failed to create temp signal state: {}",
+            temp_path.display()
+        )
+    })?;
     file.write_all(json.as_bytes())
         .context("failed to write signal state data")?;
-    file.sync_all().context("failed to fsync signal state data")?;
+    file.sync_all()
+        .context("failed to fsync signal state data")?;
 
     fs::rename(&temp_path, path).with_context(|| {
         format!(
@@ -2116,8 +2206,8 @@ fn load_or_create_session_store(profile_path: &Path) -> Result<StoredSessionStor
 fn load_session_store(path: &Path) -> Result<StoredSessionStore> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read session store: {}", path.display()))?;
-    let store: StoredSessionStore =
-        serde_json::from_str(&raw).with_context(|| format!("invalid session store json: {}", path.display()))?;
+    let store: StoredSessionStore = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid session store json: {}", path.display()))?;
     validate_session_store(&store)?;
     Ok(store)
 }
@@ -2126,8 +2216,12 @@ fn persist_session_store(profile_path: &Path, store: &StoredSessionStore) -> Res
     validate_session_store(store)?;
     let path = session_store_path(profile_path);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create session store directory: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create session store directory: {}",
+                parent.display()
+            )
+        })?;
     }
 
     let json = serde_json::to_string_pretty(store).context("failed to serialize session store")?;
@@ -2139,12 +2233,16 @@ fn persist_session_store(profile_path: &Path, store: &StoredSessionStore) -> Res
     {
         options.mode(0o600);
     }
-    let mut file = options
-        .open(&temp_path)
-        .with_context(|| format!("failed to create temp session store: {}", temp_path.display()))?;
+    let mut file = options.open(&temp_path).with_context(|| {
+        format!(
+            "failed to create temp session store: {}",
+            temp_path.display()
+        )
+    })?;
     file.write_all(json.as_bytes())
         .context("failed to write session store data")?;
-    file.sync_all().context("failed to fsync session store data")?;
+    file.sync_all()
+        .context("failed to fsync session store data")?;
 
     fs::rename(&temp_path, &path).with_context(|| {
         format!(
@@ -2196,7 +2294,10 @@ fn find_session_mut<'a>(
     store: &'a mut StoredSessionStore,
     session_id: &str,
 ) -> Option<&'a mut StoredSessionRecord> {
-    store.sessions.iter_mut().find(|value| value.session_id == session_id)
+    store
+        .sessions
+        .iter_mut()
+        .find(|value| value.session_id == session_id)
 }
 
 fn upsert_session_from_prekey(
@@ -2484,10 +2585,17 @@ fn build_session_message_aad(
 }
 
 fn aead_encrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).context("failed to initialize AEAD cipher")?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).context("failed to initialize AEAD cipher")?;
     let nonce = Nonce::from_slice(nonce);
     cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("failed to encrypt prekey message"))
 }
 
@@ -2497,23 +2605,28 @@ fn aead_decrypt(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).context("failed to initialize AEAD cipher")?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key).context("failed to initialize AEAD cipher")?;
     let nonce = Nonce::from_slice(nonce);
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("failed to decrypt prekey message"))
 }
 
 // ----- libsignal persistence/runtime helpers -----
 
 use libsignal_protocol::{
-    kem,
-    message_decrypt, message_encrypt, process_prekey_bundle,
-    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKeyPair, IdentityKeyStore,
-    InMemSignalProtocolStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore,
-    PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress,
-    SessionRecord, SignalMessage, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
-    SessionStore, Timestamp,
+    kem, message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, DeviceId,
+    GenericSignedPreKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SessionRecord, SessionStore, SignalMessage,
+    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
 
 fn device_id_from_string(device_id: &str) -> Result<DeviceId> {
@@ -2627,10 +2740,10 @@ pub fn create_libsignal_store(
 }
 
 pub fn load_libsignal_state(path: &Path) -> Result<StoredLibsignalState> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read libsignal state: {}", path.display()))?;
-    let state: StoredLibsignalState =
-        serde_json::from_str(&raw).with_context(|| format!("invalid libsignal state json: {}", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read libsignal state: {}", path.display()))?;
+    let state: StoredLibsignalState = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid libsignal state json: {}", path.display()))?;
     validate_libsignal_state(&state)?;
     Ok(state)
 }
@@ -2663,14 +2776,18 @@ pub fn validate_libsignal_state(state: &StoredLibsignalState) -> Result<()> {
     }
     for rec in &state.trusted_identities {
         if rec.peer_account_id.trim().is_empty() || rec.peer_device_id.trim().is_empty() {
-            return Err(anyhow!("libsignal trusted identity peer fields cannot be empty"));
+            return Err(anyhow!(
+                "libsignal trusted identity peer fields cannot be empty"
+            ));
         }
         decode_base64(&rec.identity_key_b64, "trusted_identity.identity_key_b64")?;
     }
     Ok(())
 }
 
-pub fn restore_libsignal_store_from_state(state: &StoredLibsignalState) -> Result<InMemSignalProtocolStore> {
+pub fn restore_libsignal_store_from_state(
+    state: &StoredLibsignalState,
+) -> Result<InMemSignalProtocolStore> {
     let identity_bytes = decode_base64(&state.identity_key_pair_b64, "identity_key_pair_b64")?;
     let identity = IdentityKeyPair::try_from(identity_bytes.as_slice())
         .map_err(|e| anyhow!("deserialize identity_key_pair: {}", e))?;
@@ -2756,7 +2873,11 @@ pub fn capture_libsignal_store_state(
             .map_err(|e| anyhow!("get_pre_key: {}", e))?;
         state.pre_keys.push(StoredLibsignalKeyRecord {
             key_id: (*id).into(),
-            record_b64: encode_bytes(&record.serialize().map_err(|e| anyhow!("pre_key serialize: {}", e))?),
+            record_b64: encode_bytes(
+                &record
+                    .serialize()
+                    .map_err(|e| anyhow!("pre_key serialize: {}", e))?,
+            ),
         });
     }
 
@@ -2768,7 +2889,11 @@ pub fn capture_libsignal_store_state(
             .map_err(|e| anyhow!("get_signed_pre_key: {}", e))?;
         state.signed_pre_keys.push(StoredLibsignalKeyRecord {
             key_id: (*id).into(),
-            record_b64: encode_bytes(&record.serialize().map_err(|e| anyhow!("signed_pre_key serialize: {}", e))?),
+            record_b64: encode_bytes(
+                &record
+                    .serialize()
+                    .map_err(|e| anyhow!("signed_pre_key serialize: {}", e))?,
+            ),
         });
     }
 
@@ -2780,7 +2905,11 @@ pub fn capture_libsignal_store_state(
             .map_err(|e| anyhow!("get_kyber_pre_key: {}", e))?;
         state.kyber_pre_keys.push(StoredLibsignalKeyRecord {
             key_id: (*id).into(),
-            record_b64: encode_bytes(&record.serialize().map_err(|e| anyhow!("kyber_pre_key serialize: {}", e))?),
+            record_b64: encode_bytes(
+                &record
+                    .serialize()
+                    .map_err(|e| anyhow!("kyber_pre_key serialize: {}", e))?,
+            ),
         });
     }
 
@@ -2791,8 +2920,9 @@ pub fn capture_libsignal_store_state(
             .await_blocking()
             .map_err(|e| anyhow!("load_session: {}", e))?
         {
-            let serialized =
-                session.serialize().map_err(|e| anyhow!("session serialize: {}", e))?;
+            let serialized = session
+                .serialize()
+                .map_err(|e| anyhow!("session serialize: {}", e))?;
             state
                 .sessions
                 .retain(|s| !(s.peer_account_id == account_id && s.peer_device_id == device_id));
@@ -2818,11 +2948,13 @@ pub fn capture_libsignal_store_state(
             state
                 .trusted_identities
                 .retain(|t| !(t.peer_account_id == account_id && t.peer_device_id == device_id));
-            state.trusted_identities.push(StoredLibsignalIdentityRecord {
-                peer_account_id: account_id.to_string(),
-                peer_device_id: device_id.to_string(),
-                identity_key_b64: encode_bytes(identity_key.serialize().as_ref()),
-            });
+            state
+                .trusted_identities
+                .push(StoredLibsignalIdentityRecord {
+                    peer_account_id: account_id.to_string(),
+                    peer_device_id: device_id.to_string(),
+                    identity_key_b64: encode_bytes(identity_key.serialize().as_ref()),
+                });
         }
     }
 
@@ -2861,11 +2993,15 @@ pub fn replenish_libsignal_prekeys_if_needed(
 pub fn persist_libsignal_state(path: &Path, state: &StoredLibsignalState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create libsignal state directory: {}", parent.display())
+            format!(
+                "failed to create libsignal state directory: {}",
+                parent.display()
+            )
         })?;
     }
 
-    let json = serde_json::to_string_pretty(state).context("failed to serialize libsignal state")?;
+    let json =
+        serde_json::to_string_pretty(state).context("failed to serialize libsignal state")?;
     let temp_path = temporary_path(path);
 
     let mut options = OpenOptions::new();
@@ -2898,7 +3034,10 @@ pub fn persist_libsignal_state(path: &Path, state: &StoredLibsignalState) -> Res
     {
         let perms = fs::Permissions::from_mode(0o600);
         fs::set_permissions(path, perms).with_context(|| {
-            format!("failed to set libsignal state permissions to 0600: {}", path.display())
+            format!(
+                "failed to set libsignal state permissions to 0600: {}",
+                path.display()
+            )
         })?;
     }
 
@@ -2943,8 +3082,8 @@ pub fn decode_libsignal_inner_payload(encoded: &[u8]) -> Result<LibsignalInnerPa
 }
 
 pub fn validate_libsignal_message(encoded_message: &[u8]) -> Result<LibsignalMessageRecord> {
-    let record: LibsignalMessageRecord =
-        serde_json::from_slice(encoded_message).context("failed to decode libsignal message json")?;
+    let record: LibsignalMessageRecord = serde_json::from_slice(encoded_message)
+        .context("failed to decode libsignal message json")?;
 
     if record.schema_version != E2EE_SCHEMA_VERSION {
         return Err(anyhow!(
@@ -2968,7 +3107,9 @@ pub fn validate_libsignal_message(encoded_message: &[u8]) -> Result<LibsignalMes
     if record.message_id.len() < 16 {
         return Err(anyhow!("invalid libsignal message_id"));
     }
-    if record.ciphertext_kind != LIBSIGNAL_MESSAGE_KIND_PREKEY && record.ciphertext_kind != LIBSIGNAL_MESSAGE_KIND_SESSION {
+    if record.ciphertext_kind != LIBSIGNAL_MESSAGE_KIND_PREKEY
+        && record.ciphertext_kind != LIBSIGNAL_MESSAGE_KIND_SESSION
+    {
         return Err(anyhow!("invalid libsignal message ciphertext_kind"));
     }
 
@@ -3025,17 +3166,16 @@ fn build_libsignal_message_auto(
 
     let inner = encode_libsignal_inner_payload(plaintext, aad)?;
     let mut csprng = rand09::rngs::OsRng.unwrap_err();
-    let ciphertext =
-        message_encrypt(
-            &inner,
-            &recipient_address,
-            &mut store.session_store,
-            &mut store.identity_store,
-            SystemTime::now(),
-            &mut csprng,
-        )
-        .await_blocking()
-        .map_err(|e| anyhow!("message_encrypt: {}", e))?;
+    let ciphertext = message_encrypt(
+        &inner,
+        &recipient_address,
+        &mut store.session_store,
+        &mut store.identity_store,
+        SystemTime::now(),
+        &mut csprng,
+    )
+    .await_blocking()
+    .map_err(|e| anyhow!("message_encrypt: {}", e))?;
 
     let (ciphertext_kind, ciphertext_bytes, recipient_one_time_pre_key_id) = match &ciphertext {
         CiphertextMessage::PreKeySignalMessage(m) => {
@@ -3100,13 +3240,12 @@ fn build_libsignal_message_auto(
     })
 }
 
-fn decrypt_libsignal_message_auto(
-    profile_path: &Path,
-    payload: &[u8],
-) -> Result<DecryptedMessage> {
+fn decrypt_libsignal_message_auto(profile_path: &Path, payload: &[u8]) -> Result<DecryptedMessage> {
     let record = validate_libsignal_message(payload)?;
     let profile = load_or_create_profile(profile_path)?;
-    if record.recipient_account_id != profile.account_id || record.recipient_device_id != profile.device_id {
+    if record.recipient_account_id != profile.account_id
+        || record.recipient_device_id != profile.device_id
+    {
         return Err(anyhow!(
             "libsignal message is not addressed to this account/device"
         ));
@@ -3119,13 +3258,20 @@ fn decrypt_libsignal_message_auto(
 
     let ciphertext_bytes = decode_base64(&record.ciphertext_b64, "ciphertext_b64")?;
     let ciphertext = match record.ciphertext_kind.as_str() {
-        LIBSIGNAL_MESSAGE_KIND_PREKEY => {
-            CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(ciphertext_bytes.as_slice()).map_err(|e| anyhow!("PreKeySignalMessage::try_from: {}", e))?)
+        LIBSIGNAL_MESSAGE_KIND_PREKEY => CiphertextMessage::PreKeySignalMessage(
+            PreKeySignalMessage::try_from(ciphertext_bytes.as_slice())
+                .map_err(|e| anyhow!("PreKeySignalMessage::try_from: {}", e))?,
+        ),
+        LIBSIGNAL_MESSAGE_KIND_SESSION => CiphertextMessage::SignalMessage(
+            SignalMessage::try_from(ciphertext_bytes.as_slice())
+                .map_err(|e| anyhow!("SignalMessage::try_from: {}", e))?,
+        ),
+        _ => {
+            return Err(anyhow!(
+                "invalid ciphertext_kind: {}",
+                record.ciphertext_kind
+            ))
         }
-        LIBSIGNAL_MESSAGE_KIND_SESSION => {
-            CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext_bytes.as_slice()).map_err(|e| anyhow!("SignalMessage::try_from: {}", e))?)
-        }
-        _ => return Err(anyhow!("invalid ciphertext_kind: {}", record.ciphertext_kind)),
     };
 
     let mut csprng = rand09::rngs::OsRng.unwrap_err();
@@ -3161,16 +3307,22 @@ fn decrypt_libsignal_message_auto(
 
     if kind == DecryptedMessageKind::PreKey {
         if let Some(used_id) = record.recipient_one_time_pre_key_id {
-            if let Ok(mut legacy_state) =
-                load_or_create_signal_state(profile_path, &profile, DEFAULT_ONE_TIME_PREKEY_COUNT, false)
-            {
+            if let Ok(mut legacy_state) = load_or_create_signal_state(
+                profile_path,
+                &profile,
+                DEFAULT_ONE_TIME_PREKEY_COUNT,
+                false,
+            ) {
                 if let Some(idx) = legacy_state
                     .one_time_pre_keys
                     .iter()
                     .position(|k| k.key_id == used_id)
                 {
                     legacy_state.one_time_pre_keys.remove(idx);
-                    let _ = maybe_replenish_one_time_pre_keys(&mut legacy_state, DEFAULT_ONE_TIME_PREKEY_COUNT);
+                    let _ = maybe_replenish_one_time_pre_keys(
+                        &mut legacy_state,
+                        DEFAULT_ONE_TIME_PREKEY_COUNT,
+                    );
                     let _ = persist_signal_state(&signal_state_path(profile_path), &legacy_state);
                 }
             }
@@ -3199,15 +3351,13 @@ pub fn build_libsignal_bundle_from_record(record: &PreKeyBundleRecord) -> Result
         .libsignal_signed_pre_key_id
         .ok_or_else(|| anyhow!("libsignal_signed_pre_key_id"))?
         .into();
-    let signed_pre_key_public = libsignal_protocol::PublicKey::deserialize(
-        &decode_base64(
-            &record
-                .libsignal_signed_pre_key_public_b64
-                .as_ref()
-                .ok_or_else(|| anyhow!("libsignal_signed_pre_key_public_b64"))?,
-            "libsignal_signed_pre_key_public_b64",
-        )?,
-    )
+    let signed_pre_key_public = libsignal_protocol::PublicKey::deserialize(&decode_base64(
+        &record
+            .libsignal_signed_pre_key_public_b64
+            .as_ref()
+            .ok_or_else(|| anyhow!("libsignal_signed_pre_key_public_b64"))?,
+        "libsignal_signed_pre_key_public_b64",
+    )?)
     .map_err(|e| anyhow!("signed pre-key public: {}", e))?;
     let signed_pre_key_signature = decode_base64(
         &record
@@ -3221,15 +3371,13 @@ pub fn build_libsignal_bundle_from_record(record: &PreKeyBundleRecord) -> Result
         .libsignal_kyber_pre_key_id
         .ok_or_else(|| anyhow!("libsignal_kyber_pre_key_id"))?
         .into();
-    let kyber_pre_key_public = kem::PublicKey::deserialize(
-        &decode_base64(
-            &record
-                .libsignal_kyber_pre_key_public_b64
-                .as_ref()
-                .ok_or_else(|| anyhow!("libsignal_kyber_pre_key_public_b64"))?,
-            "libsignal_kyber_pre_key_public_b64",
-        )?,
-    )
+    let kyber_pre_key_public = kem::PublicKey::deserialize(&decode_base64(
+        &record
+            .libsignal_kyber_pre_key_public_b64
+            .as_ref()
+            .ok_or_else(|| anyhow!("libsignal_kyber_pre_key_public_b64"))?,
+        "libsignal_kyber_pre_key_public_b64",
+    )?)
     .map_err(|e| anyhow!("kyber pre-key public: {}", e))?;
     let kyber_pre_key_signature = decode_base64(
         &record
@@ -3244,9 +3392,10 @@ pub fn build_libsignal_bundle_from_record(record: &PreKeyBundleRecord) -> Result
         record.libsignal_pre_key_public_b64.as_ref(),
     ) {
         (Some(id), Some(pub_b64)) => {
-            let pk = libsignal_protocol::PublicKey::deserialize(
-                &decode_base64(pub_b64, "libsignal_pre_key_public_b64")?,
-            )
+            let pk = libsignal_protocol::PublicKey::deserialize(&decode_base64(
+                pub_b64,
+                "libsignal_pre_key_public_b64",
+            )?)
             .map_err(|e| anyhow!("pre_key public deserialize: {}", e))?;
             Some((id.into(), pk))
         }

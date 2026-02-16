@@ -1,19 +1,18 @@
 //! Peer-related primitives and utilities.
 
 pub mod discovery;
+mod mailbox_store;
 pub mod manager;
 pub mod addr_events;
 
 pub use addr_events::{
     AddrEvent, AddrState,
 };
-
 pub use discovery::{
     DiscoveryEvent, DiscoveryEventSender, DiscoveryQueue, DiscoveryStatus,
     DEFAULT_DISCOVERY_QUEUE_CAPACITY,
 };
 pub use manager::{DhtQueryError, PeerCommand, PeerManager, PeerManagerHandle};
-
 
 /// Represents the local peer identity and metadata.
 #[derive(Debug, Default, Clone)]

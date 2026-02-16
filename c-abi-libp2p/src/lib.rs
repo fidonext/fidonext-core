@@ -179,10 +179,7 @@ impl ManagedNode {
     }
 
     /// Resolves a binary record from Kademlia.
-    fn dht_get_record(
-        &self,
-        key: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
+    fn dht_get_record(&self, key: Vec<u8>) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
         self.runtime.block_on(self.handle.dht_get_record(key))
     }
     /// Attempts to dequeue the next discovery event without blocking.
@@ -743,7 +740,8 @@ pub extern "C" fn cabi_e2ee_publish_prekey_bundle(
     } else {
         bundle_ttl_seconds
     };
-    let payload = match e2ee::build_prekey_bundle(&profile_path, prekey_count, effective_bundle_ttl) {
+    let payload = match e2ee::build_prekey_bundle(&profile_path, prekey_count, effective_bundle_ttl)
+    {
         Ok(payload) => payload,
         Err(err) => {
             tracing::error!(target: "ffi", %err, "failed to build prekey bundle for dht publish");
@@ -998,18 +996,14 @@ pub extern "C" fn cabi_e2ee_build_message_auto(
         }
     };
 
-    let outbound = match e2ee::build_message_auto(
-        &profile_path,
-        &recipient_prekey_bundle,
-        &plaintext,
-        &aad,
-    ) {
-        Ok(outbound) => outbound,
-        Err(err) => {
-            tracing::warn!(target: "ffi", %err, "failed to build auto e2ee message");
-            return CABI_STATUS_INVALID_ARGUMENT;
-        }
-    };
+    let outbound =
+        match e2ee::build_message_auto(&profile_path, &recipient_prekey_bundle, &plaintext, &aad) {
+            Ok(outbound) => outbound,
+            Err(err) => {
+                tracing::warn!(target: "ffi", %err, "failed to build auto e2ee message");
+                return CABI_STATUS_INVALID_ARGUMENT;
+            }
+        };
 
     write_bytes(&outbound.payload, out_buffer, out_buffer_len, written_len)
 }
@@ -1750,7 +1744,12 @@ fn write_fixed_seed(
     CABI_STATUS_SUCCESS
 }
 
-fn write_bytes(value: &[u8], out_buffer: *mut u8, buffer_len: usize, written_len: *mut usize) -> c_int {
+fn write_bytes(
+    value: &[u8],
+    out_buffer: *mut u8,
+    buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
     if out_buffer.is_null() || written_len.is_null() {
         return CABI_STATUS_NULL_POINTER;
     }

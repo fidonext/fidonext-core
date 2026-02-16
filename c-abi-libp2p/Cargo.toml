@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]   # gives .dll/.so/.dylib and rust linkage for e
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-libp2p = { version = "0.56", features = ["macros", "kad", "gossipsub", "noise", "yamux", "quic", "identify", "ping", "tcp", "tokio", "autonat", "relay", "rendezvous"] }
+libp2p = { version = "0.56", features = ["macros", "kad", "gossipsub", "noise", "yamux", "quic", "identify", "ping", "tcp", "tokio", "autonat", "relay", "rendezvous", "request-response", "cbor"] }
 futures = "0.3.30"
 tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
@@ -25,6 +25,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 chacha20poly1305 = "0.10"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", package = "libsignal-protocol" }
+sled = "0.34"
 
 [build-dependencies]
 cbindgen = "0.26"   # generate .h
