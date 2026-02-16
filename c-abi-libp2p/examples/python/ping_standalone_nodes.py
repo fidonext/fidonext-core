@@ -55,6 +55,8 @@ CABI_IDENTITY_SEED_LEN = 32
 CABI_E2EE_MESSAGE_KIND_UNKNOWN = 0
 CABI_E2EE_MESSAGE_KIND_PREKEY = 1
 CABI_E2EE_MESSAGE_KIND_SESSION = 2
+CABI_DISCOVERY_EVENT_ADDRESS = 0
+CABI_DISCOVERY_EVENT_FINISHED = 1
 
 # AutoNAT statuses
 CABI_AUTONAT_UNKNOWN = 0
@@ -97,6 +99,43 @@ lib.cabi_node_local_peer_id.argtypes = [
     ctypes.POINTER(ctypes.c_size_t),
 ]
 lib.cabi_node_local_peer_id.restype = ctypes.c_int
+lib.cabi_node_find_peer.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_uint64),
+]
+lib.cabi_node_find_peer.restype = ctypes.c_int
+lib.cabi_node_dht_put_record.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_uint64,
+]
+lib.cabi_node_dht_put_record.restype = ctypes.c_int
+lib.cabi_node_dht_get_record.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_node_dht_get_record.restype = ctypes.c_int
+lib.cabi_node_dequeue_discovery_event.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_uint64),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_node_dequeue_discovery_event.restype = ctypes.c_int
 lib.cabi_node_free.argtypes = [ctypes.c_void_p]
 lib.cabi_node_free.restype = None
 lib.cabi_identity_load_or_create.argtypes = [
@@ -418,6 +457,97 @@ class Node:
                 continue
             _check(status, "local_peer_id")
             return bytes(buffer[: written.value]).decode("utf-8")
+
+    def find_peer(self, peer_id: str) -> int:
+        request_id = ctypes.c_uint64(0)
+        status = lib.cabi_node_find_peer(
+            self._ptr,
+            peer_id.encode("utf-8"),
+            ctypes.byref(request_id),
+        )
+        _check(status, f"find_peer({peer_id})")
+        return int(request_id.value)
+
+    def try_dequeue_discovery_event(
+        self, peer_buffer_size: int = 256, address_buffer_size: int = 1024
+    ) -> Optional[dict]:
+        peer_size = peer_buffer_size
+        addr_size = address_buffer_size
+        while True:
+            kind = ctypes.c_int(0)
+            request_id = ctypes.c_uint64(0)
+            status_code = ctypes.c_int(0)
+            peer_buffer = (ctypes.c_char * peer_size)()
+            peer_written = ctypes.c_size_t(0)
+            address_buffer = (ctypes.c_char * addr_size)()
+            address_written = ctypes.c_size_t(0)
+            status = lib.cabi_node_dequeue_discovery_event(
+                self._ptr,
+                ctypes.byref(kind),
+                ctypes.byref(request_id),
+                ctypes.byref(status_code),
+                peer_buffer,
+                ctypes.c_size_t(peer_size),
+                ctypes.byref(peer_written),
+                address_buffer,
+                ctypes.c_size_t(addr_size),
+                ctypes.byref(address_written),
+            )
+            if status == CABI_STATUS_QUEUE_EMPTY:
+                return None
+            if status == CABI_STATUS_BUFFER_TOO_SMALL:
+                peer_size = max(peer_size * 2, peer_written.value + 1)
+                addr_size = max(addr_size * 2, address_written.value + 1)
+                continue
+            _check(status, "dequeue_discovery_event")
+            peer_id = bytes(peer_buffer[: peer_written.value]).decode("utf-8", "replace")
+            address = bytes(address_buffer[: address_written.value]).decode(
+                "utf-8", "replace"
+            )
+            return {
+                "event_kind": int(kind.value),
+                "request_id": int(request_id.value),
+                "status_code": int(status_code.value),
+                "peer_id": peer_id,
+                "address": address,
+            }
+
+    def dht_put_record(self, key: bytes, value: bytes, ttl_seconds: int = 0) -> None:
+        if not key or not value:
+            raise ValueError("dht_put_record requires non-empty key and value")
+        key_buf = (ctypes.c_ubyte * len(key)).from_buffer_copy(key)
+        value_buf = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+        status = lib.cabi_node_dht_put_record(
+            self._ptr,
+            key_buf,
+            ctypes.c_size_t(len(key)),
+            value_buf,
+            ctypes.c_size_t(len(value)),
+            ctypes.c_uint64(max(ttl_seconds, 0)),
+        )
+        _check(status, "dht_put_record")
+
+    def dht_get_record(self, key: bytes, buffer_size: int = 64 * 1024) -> bytes:
+        if not key:
+            raise ValueError("dht_get_record requires non-empty key")
+        key_buf = (ctypes.c_ubyte * len(key)).from_buffer_copy(key)
+        current_size = buffer_size
+        while True:
+            out_buffer = (ctypes.c_ubyte * current_size)()
+            written = ctypes.c_size_t(0)
+            status = lib.cabi_node_dht_get_record(
+                self._ptr,
+                key_buf,
+                ctypes.c_size_t(len(key)),
+                out_buffer,
+                ctypes.c_size_t(current_size),
+                ctypes.byref(written),
+            )
+            if status == CABI_STATUS_BUFFER_TOO_SMALL:
+                current_size = max(current_size * 2, written.value + 1)
+                continue
+            _check(status, "dht_get_record")
+            return bytes(out_buffer[: written.value])
 
     def autonat_status(self) -> int:
         status = lib.cabi_autonat_status(self._ptr)

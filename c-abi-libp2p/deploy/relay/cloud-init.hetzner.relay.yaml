@@ -1,0 +1,119 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+
+write_files:
+  - path: /root/fidonext-relay/docker-compose.yml
+    permissions: "0644"
+    owner: root:root
+    content: |
+      services:
+        relay:
+          image: ${FIDONEXT_RELAY_IMAGE:-docker.io/geobelsky/fidonext-relay:v0.1.0}
+          container_name: ${CONTAINER_NAME:-fidonext-relay}
+          restart: unless-stopped
+          environment:
+            LISTEN_ADDR: ${LISTEN_ADDR:-/ip4/0.0.0.0/tcp/41000}
+            PROFILE_PATH: ${PROFILE_PATH:-/data/relay.profile.json}
+            BOOTSTRAP_PEERS: ${BOOTSTRAP_PEERS:-}
+            USE_QUIC: ${USE_QUIC:-0}
+            SEED_PHRASE: ${SEED_PHRASE:-}
+            SEED_HEX: ${SEED_HEX:-}
+            EXTRA_ARGS: ${EXTRA_ARGS:-}
+          ports:
+            - "${RELAY_PORT_TCP:-41000}:41000/tcp"
+          volumes:
+            - relay-data:/data
+
+      volumes:
+        relay-data:
+
+  - path: /root/fidonext-relay/.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      # Replace with your image from Docker Hub before creating server.
+      FIDONEXT_RELAY_IMAGE=docker.io/geobelsky/fidonext-relay:v0.1.0
+      CONTAINER_NAME=fidonext-relay
+      LISTEN_ADDR=/ip4/0.0.0.0/tcp/41000
+      RELAY_PORT_TCP=41000
+      PROFILE_PATH=/data/relay.profile.json
+      USE_QUIC=0
+      BOOTSTRAP_PEERS=
+      EXTRA_ARGS=
+
+  - path: /usr/local/bin/fidonext-bootstrap-address
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      WORKDIR="/opt/fidonext-relay"
+      ENV_FILE="${WORKDIR}/.env"
+      if [ ! -f "${ENV_FILE}" ]; then
+        echo "missing ${ENV_FILE}" >&2
+        exit 1
+      fi
+
+      # shellcheck disable=SC1090
+      . "${ENV_FILE}"
+      PORT="${RELAY_PORT_TCP:-41000}"
+      PEER_ID="$(docker logs "${CONTAINER_NAME:-fidonext-relay}" 2>&1 | sed -n 's/^Local PeerId: //p' | tail -n1)"
+      if [ -z "${PEER_ID}" ]; then
+        echo "peer id is not available yet; check: docker logs ${CONTAINER_NAME:-fidonext-relay}" >&2
+        exit 1
+      fi
+
+      PUBLIC_IP="$(curl -4fsS ifconfig.me || true)"
+      if [ -z "${PUBLIC_IP}" ]; then
+        PUBLIC_IP="$(curl -4fsS ifconfig.co || true)"
+      fi
+      if [ -z "${PUBLIC_IP}" ]; then
+        echo "failed to resolve public IPv4" >&2
+        exit 1
+      fi
+
+      echo "/ip4/${PUBLIC_IP}/tcp/${PORT}/p2p/${PEER_ID}"
+
+  - path: /usr/local/bin/fidonext-relay-up
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      WORKDIR="/opt/fidonext-relay"
+      ENV_FILE="${WORKDIR}/.env"
+      if [ ! -f "${ENV_FILE}" ]; then
+        echo "missing ${ENV_FILE}" >&2
+        exit 1
+      fi
+
+      # shellcheck disable=SC1090
+      . "${ENV_FILE}"
+      IMAGE="${FIDONEXT_RELAY_IMAGE:-docker.io/geobelsky/fidonext-relay:v0.1.0}"
+      NAME="${CONTAINER_NAME:-fidonext-relay}"
+      PORT="${RELAY_PORT_TCP:-41000}"
+
+      docker pull "${IMAGE}"
+      docker rm -f "${NAME}" >/dev/null 2>&1 || true
+      docker run -d \
+        --name "${NAME}" \
+        --restart unless-stopped \
+        --env-file "${ENV_FILE}" \
+        -p "${PORT}:41000/tcp" \
+        -v relay-data:/data \
+        "${IMAGE}" >/dev/null
+
+      docker ps --filter "name=${NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+runcmd:
+  - [bash, -lc, "mkdir -p /opt/fidonext-relay"]
+  - [bash, -lc, "cp /root/fidonext-relay/docker-compose.yml /opt/fidonext-relay/docker-compose.yml"]
+  - [bash, -lc, "cp /root/fidonext-relay/.env /opt/fidonext-relay/.env"]
+  - [bash, -lc, "systemctl enable --now docker"]
+  - [bash, -lc, "/usr/local/bin/fidonext-relay-up"]
