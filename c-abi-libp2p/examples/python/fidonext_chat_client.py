@@ -8,8 +8,9 @@ Features:
 - shareable own node address
 - connect to peers by multiaddr
 - chat switch/list/history commands
-- send/receive plain messages
-- optional per-contact libsignal encryption via prekey bundle file
+- send/receive libsignal E2EE messages
+- auto prekey-bundle publish/discovery via DHT
+- per-contact libsignal encryption via prekey bundle file (manual fallback)
 """
 
 from __future__ import annotations
@@ -41,10 +42,12 @@ from ping_standalone_nodes import (  # noqa: E402
     CABI_STATUS_SUCCESS,
     CABI_STATUS_TIMEOUT,
     Node,
+    build_prekey_bundle,
     build_message_auto,
     decrypt_message_auto,
     default_listen,
     load_or_create_identity_profile,
+    validate_prekey_bundle,
 )
 
 
@@ -55,6 +58,11 @@ DIRECTORY_SCHEMA = "fidonext-directory-v1"
 DIRECTORY_KEY_PREFIX = "fidonext/directory/v1"
 DEFAULT_DIRECTORY_TTL_SECONDS = 30 * 60
 DEFAULT_DIRECTORY_REANNOUNCE_SECONDS = 10 * 60
+PREKEY_SCHEMA = "fidonext-prekey-bundle-v1"
+PREKEY_KEY_PREFIX = "fidonext/prekey/v1"
+DEFAULT_PREKEY_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_PREKEY_ONE_TIME_COUNT = 32
+DELIVERY_STATUS_SCHEMA = "fidonext-delivery-status-v1"
 REPL_HISTORY_LIMIT = 1000
 
 
@@ -80,6 +88,14 @@ def directory_key_for_peer(peer_id: str) -> bytes:
 
 def directory_key_for_account(account_id: str) -> bytes:
     return f"{DIRECTORY_KEY_PREFIX}/account/{account_id}".encode("utf-8")
+
+
+def prekey_key_for_peer(peer_id: str) -> bytes:
+    return f"{PREKEY_KEY_PREFIX}/peer/{peer_id}".encode("utf-8")
+
+
+def prekey_key_for_account(account_id: str) -> bytes:
+    return f"{PREKEY_KEY_PREFIX}/account/{account_id}".encode("utf-8")
 
 
 def ensure_parent(path: Path) -> None:
@@ -168,6 +184,39 @@ class ChatState:
             self.unread[peer_id] = 0
             self.save()
 
+    def update_outbound_status(
+        self,
+        message_id: str,
+        status: str,
+        peer_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[str]:
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return None
+
+        peers: List[str]
+        if peer_id and peer_id in self.chats:
+            peers = [peer_id]
+        else:
+            peers = list(self.chats.keys())
+
+        for candidate_peer in peers:
+            entries = list(self.chats.get(candidate_peer) or [])
+            for idx in range(len(entries) - 1, -1, -1):
+                item = entries[idx]
+                if (
+                    str(item.get("direction") or "") == "out"
+                    and str(item.get("message_id") or "") == message_id
+                ):
+                    entries[idx]["delivery_status"] = status
+                    if reason:
+                        entries[idx]["delivery_reason"] = reason
+                    self.chats[candidate_peer] = entries
+                    self.save()
+                    return candidate_peer
+        return None
+
 
 class TerminalChatClient:
     def __init__(
@@ -182,6 +231,8 @@ class TerminalChatClient:
         profile_path: Path,
         directory_ttl_seconds: int,
         directory_reannounce_seconds: int,
+        prekey_ttl_seconds: int,
+        prekey_one_time_count: int,
     ) -> None:
         self.node = node
         self.state = state
@@ -192,9 +243,12 @@ class TerminalChatClient:
         self.profile_path = profile_path
         self.directory_ttl_seconds = max(60, directory_ttl_seconds)
         self.directory_reannounce_seconds = max(30, directory_reannounce_seconds)
+        self.prekey_ttl_seconds = max(300, prekey_ttl_seconds)
+        self.prekey_one_time_count = max(1, prekey_one_time_count)
         self.running = threading.Event()
         self.running.set()
         self.print_lock = threading.Lock()
+        self.announce_lock = threading.Lock()
         self.receiver_thread: Optional[threading.Thread] = None
         self.announce_thread: Optional[threading.Thread] = None
         self.repl_history_path = self.state.path.with_suffix(self.state.path.suffix + ".repl_history")
@@ -259,8 +313,8 @@ class TerminalChatClient:
         while self.running.is_set():
             try:
                 self.announce_self(verbose=False)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._println(f"[announce] background announce failed: {exc}")
             self.running.wait(self.directory_reannounce_seconds)
 
     def _receiver_loop(self) -> None:
@@ -290,7 +344,15 @@ class TerminalChatClient:
                 self._println("[recv] unknown payload ignored")
             return
 
-        if not isinstance(packet, dict) or packet.get("schema") != CHAT_SCHEMA:
+        if not isinstance(packet, dict):
+            self._println("[recv] non-chat packet ignored")
+            return
+
+        if packet.get("schema") == DELIVERY_STATUS_SCHEMA:
+            self._handle_delivery_status_packet(packet)
+            return
+
+        if packet.get("schema") != CHAT_SCHEMA:
             self._println("[recv] non-chat packet ignored")
             return
 
@@ -306,13 +368,7 @@ class TerminalChatClient:
 
         text = ""
         e2ee = False
-        if payload_type == "plain":
-            try:
-                text = base64.b64decode(body_b64).decode("utf-8", "replace")
-            except Exception:
-                self._println("[recv] failed to decode plain payload")
-                return
-        elif payload_type == "libsignal":
+        if payload_type == "libsignal":
             try:
                 encrypted = base64.b64decode(body_b64)
                 _kind, plaintext = decrypt_message_auto(self.profile_path, encrypted)
@@ -322,7 +378,7 @@ class TerminalChatClient:
                 self._println(f"[recv] libsignal decrypt failed: {exc}")
                 return
         else:
-            self._println("[recv] unsupported payload type")
+            self._println("[recv] unsupported payload type (strict E2EE mode expects payload_type=libsignal)")
             return
 
         self.state.append_chat_message(
@@ -344,28 +400,101 @@ class TerminalChatClient:
             self._println(f"{prefix} {self.state.contact_label(from_peer_id)}: {text}")
         self._redraw_prompt_if_needed()
 
+    def _handle_delivery_status_packet(self, packet: Dict[str, Any]) -> None:
+        message_id = str(packet.get("message_id") or "").strip()
+        status = str(packet.get("status") or "").strip()
+        peer_id = str(packet.get("peer_id") or "").strip() or None
+        reason = str(packet.get("reason") or "").strip() or None
+        if not message_id or not status:
+            return
+        updated_peer_id = self.state.update_outbound_status(
+            message_id=message_id,
+            status=status,
+            peer_id=peer_id,
+            reason=reason,
+        )
+        if not updated_peer_id:
+            return
+        reason_suffix = f" ({reason})" if reason else ""
+        self._println(
+            f"[delivery] {status} for {self.state.contact_label(updated_peer_id)} id={message_id[:8]}{reason_suffix}"
+        )
+        self._redraw_prompt_if_needed()
+
+    def _is_libsignal_prekey_bundle(self, bundle: bytes) -> bool:
+        try:
+            payload = json.loads(bundle.decode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        required = [
+            "libsignal_identity_key_b64",
+            "libsignal_signed_pre_key_id",
+            "libsignal_signed_pre_key_public_b64",
+            "libsignal_signed_pre_key_signature_b64",
+            "libsignal_kyber_pre_key_id",
+            "libsignal_kyber_pre_key_public_b64",
+            "libsignal_kyber_pre_key_signature_b64",
+        ]
+        return all(payload.get(key) not in (None, "") for key in required)
+
+    def _validate_recipient_bundle(self, bundle: bytes, source: str) -> bool:
+        try:
+            validate_prekey_bundle(bundle, now_unix=0)
+        except Exception as exc:
+            self._println(f"[prekey] invalid bundle from {source}: {exc}")
+            return False
+        if not self._is_libsignal_prekey_bundle(bundle):
+            self._println(
+                f"[prekey] bundle from {source} is legacy/non-libsignal; skipping for strict E2EE"
+            )
+            return False
+        return True
+
+    def _load_contact_prekey_bundle(self, peer_id: str) -> Optional[bytes]:
+        contact = self.state.contacts.get(peer_id) or {}
+        bundle_path = str(contact.get("prekey_bundle_path") or "").strip()
+        if bundle_path:
+            path = Path(bundle_path).expanduser().resolve()
+            try:
+                bundle = path.read_bytes()
+                if self._validate_recipient_bundle(bundle, f"file:{path}"):
+                    return bundle
+            except Exception:
+                self._println(f"[prekey] failed to read bundle file: {path}")
+        inline_b64 = str(contact.get("prekey_bundle_b64") or "").strip()
+        if inline_b64:
+            try:
+                bundle = base64.b64decode(inline_b64)
+                if self._validate_recipient_bundle(bundle, "contact cache"):
+                    return bundle
+            except Exception:
+                self._println("[prekey] failed to decode cached bundle from contact state")
+        return None
+
     def send_to_active_chat(self, text: str) -> None:
         peer_id = self.state.active_chat_peer_id
         if not peer_id:
             self._println("[send] no active chat. Use /chats then /open <index>")
             return
 
-        contact = self.state.contacts.get(peer_id) or {}
-        bundle_path = contact.get("prekey_bundle_path")
+        bundle = self._load_contact_prekey_bundle(peer_id)
+        if bundle is None:
+            self._println(
+                "[send] strict E2EE mode: no prekey bundle set for contact. "
+                "Use /contact bundle <peer_or_alias> <bundle.json>"
+            )
+            return
 
-        payload_type = "plain"
+        payload_type = "libsignal"
         payload_bytes: bytes
-        if bundle_path:
-            try:
-                bundle = Path(bundle_path).expanduser().resolve().read_bytes()
-                encrypted = build_message_auto(self.profile_path, bundle, text)
-                payload_bytes = encrypted
-                payload_type = "libsignal"
-            except Exception as exc:
-                self._println(f"[send] failed to encrypt with bundle: {exc}")
-                return
-        else:
-            payload_bytes = text.encode("utf-8")
+        try:
+            encrypted = build_message_auto(self.profile_path, bundle, text)
+            payload_bytes = encrypted
+        except Exception as exc:
+            self._println(f"[send] failed to encrypt with bundle: {exc}")
+            return
 
         packet = {
             "schema": CHAT_SCHEMA,
@@ -393,6 +522,7 @@ class TerminalChatClient:
                 "text": text,
                 "e2ee": e2ee,
                 "message_id": packet["message_id"],
+                "delivery_status": "sent",
             },
             incoming=False,
         )
@@ -409,23 +539,51 @@ class TerminalChatClient:
             "addresses": [f"{self.listen_addr}/p2p/{self.local_peer_id}"],
         }
 
+    def _prekey_card_payload(self) -> bytes:
+        bundle = build_prekey_bundle(
+            self.profile_path,
+            one_time_prekey_count=self.prekey_one_time_count,
+            ttl_seconds=self.prekey_ttl_seconds,
+        )
+        card = {
+            "schema": PREKEY_SCHEMA,
+            "updated_at_unix": now_unix(),
+            "peer_id": self.local_peer_id,
+            "account_id": self.account_id,
+            "device_id": self.device_id,
+            "bundle_b64": base64.b64encode(bundle).decode("ascii"),
+        }
+        return json.dumps(card, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+
     def announce_self(self, verbose: bool = True) -> None:
-        card = self._directory_card()
-        payload = json.dumps(card, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-        self.node.dht_put_record(
-            directory_key_for_peer(self.local_peer_id),
-            payload,
-            ttl_seconds=self.directory_ttl_seconds,
-        )
-        self.node.dht_put_record(
-            directory_key_for_account(self.account_id),
-            payload,
-            ttl_seconds=self.directory_ttl_seconds,
-        )
-        if verbose:
-            self._println(
-                f"[announce] published directory card for peer={self.local_peer_id} account={self.account_id}"
+        with self.announce_lock:
+            card = self._directory_card()
+            payload = json.dumps(card, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            prekey_payload = self._prekey_card_payload()
+            self.node.dht_put_record(
+                directory_key_for_peer(self.local_peer_id),
+                payload,
+                ttl_seconds=self.directory_ttl_seconds,
             )
+            self.node.dht_put_record(
+                directory_key_for_account(self.account_id),
+                payload,
+                ttl_seconds=self.directory_ttl_seconds,
+            )
+            self.node.dht_put_record(
+                prekey_key_for_peer(self.local_peer_id),
+                prekey_payload,
+                ttl_seconds=self.prekey_ttl_seconds,
+            )
+            self.node.dht_put_record(
+                prekey_key_for_account(self.account_id),
+                prekey_payload,
+                ttl_seconds=self.prekey_ttl_seconds,
+            )
+            if verbose:
+                self._println(
+                    f"[announce] published directory+prekey cards for peer={self.local_peer_id} account={self.account_id}"
+                )
 
     def lookup_directory(self, identifier: str) -> Optional[Dict[str, Any]]:
         key_candidates = [
@@ -443,6 +601,39 @@ class TerminalChatClient:
                 continue
             if isinstance(card, dict) and card.get("schema") == DIRECTORY_SCHEMA:
                 return card
+        return None
+
+    def _parse_prekey_payload(self, raw: bytes) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+        try:
+            card = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(card, dict) or card.get("schema") != PREKEY_SCHEMA:
+            return None
+        bundle_b64 = str(card.get("bundle_b64") or "")
+        if not bundle_b64:
+            return None
+        try:
+            bundle = base64.b64decode(bundle_b64)
+        except Exception:
+            return None
+        if not self._validate_recipient_bundle(bundle, "DHT prekey record"):
+            return None
+        return bundle, card
+
+    def lookup_prekey_bundle(self, identifier: str) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+        key_candidates = [
+            prekey_key_for_peer(identifier),
+            prekey_key_for_account(identifier),
+        ]
+        for key in key_candidates:
+            try:
+                raw = self.node.dht_get_record(key)
+            except RuntimeError:
+                continue
+            parsed = self._parse_prekey_payload(raw)
+            if parsed is not None:
+                return parsed
         return None
 
     def resolve_peer_addresses(
@@ -517,6 +708,47 @@ class TerminalChatClient:
         )
         return False
 
+    def _ensure_contact_prekey_bundle(self, peer_id: str) -> bool:
+        if self._load_contact_prekey_bundle(peer_id) is not None:
+            return True
+
+        contact = self.state.contacts.get(peer_id) or {}
+        account_id = str(contact.get("account_id") or "").strip()
+        identifiers: List[str] = [peer_id]
+        if account_id:
+            identifiers.append(account_id)
+
+        # Refresh account metadata from directory if unknown.
+        if not account_id:
+            card = self.lookup_directory(peer_id)
+            if card and str(card.get("account_id") or "").strip():
+                account_id = str(card.get("account_id")).strip()
+                self.state.upsert_contact(
+                    peer_id,
+                    account_id=account_id,
+                    device_id=str(card.get("device_id") or "").strip() or None,
+                )
+                identifiers.append(account_id)
+
+        for identifier in list(dict.fromkeys([item for item in identifiers if item])):
+            found = self.lookup_prekey_bundle(identifier)
+            if found is None:
+                continue
+            bundle, card = found
+            updates: Dict[str, Any] = {
+                "prekey_bundle_b64": base64.b64encode(bundle).decode("ascii"),
+            }
+            card_account_id = str(card.get("account_id") or "").strip()
+            card_device_id = str(card.get("device_id") or "").strip()
+            if card_account_id:
+                updates["account_id"] = card_account_id
+            if card_device_id:
+                updates["device_id"] = card_device_id
+            self.state.upsert_contact(peer_id, **updates)
+            self._println(f"[prekey] fetched bundle from DHT for {self.state.contact_label(peer_id)}")
+            return True
+        return False
+
     def show_help(self) -> None:
         self._println(
             "\n".join(
@@ -527,13 +759,16 @@ class TerminalChatClient:
                     "  /announce                            Publish own contact card to DHT directory",
                     "  /contacts                             List contacts",
                     "  /contact add <peer_id> [alias]       Add/update contact",
+                    "  /contact bundle <peer> <bundle.json> Set recipient libsignal prekey bundle",
                     "  /chats                                List chats with indexes",
                     "  /open <index|peer|alias>             Open chat, connect, and show history",
                     "  /chat history [limit]                 Show active chat history",
                     "  /history [peer_or_alias] [limit]      Show chat history",
                     "  /send <text>                          Send to active chat",
                     "  /quit                                 Exit client",
-                    "Tip: plain text (without /command) sends to active chat.",
+                    "Tip: plain text (without /command) sends to active chat (always E2EE).",
+                    "Tip: /open auto-fetches recipient bundle from DHT when available.",
+                    "Tip: /contact bundle stays available as manual fallback.",
                     "Tip: Ctrl+C does not exit; use /quit to close client.",
                 ]
             )
@@ -600,7 +835,15 @@ class TerminalChatClient:
             ts = item.get("ts_unix", 0)
             text = item.get("text", "")
             e2ee = " e2ee" if item.get("e2ee") else ""
-            self._println(f"[{ts}] {direction}{e2ee}: {text}")
+            status_suffix = ""
+            if direction == "out":
+                delivery_status = str(item.get("delivery_status") or "").strip()
+                delivery_reason = str(item.get("delivery_reason") or "").strip()
+                if delivery_status:
+                    status_suffix = f" [{delivery_status}]"
+                if delivery_reason:
+                    status_suffix += f"({delivery_reason})"
+            self._println(f"[{ts}] {direction}{e2ee}{status_suffix}: {text}")
         self._println("--- end ---")
 
     def _ensure_chat_connection(self, peer_id: str) -> bool:
@@ -623,6 +866,7 @@ class TerminalChatClient:
         # Ensure entry exists so empty chats can be opened immediately.
         self.state.upsert_contact(peer_id)
         connected = self._ensure_chat_connection(peer_id)
+        self._ensure_contact_prekey_bundle(peer_id)
         self.state.active_chat_peer_id = peer_id
         self.state.mark_read(peer_id)
         status = "connected" if connected else "offline"
@@ -757,7 +1001,14 @@ class TerminalChatClient:
                 return
             for peer_id, contact in self.state.contacts.items():
                 alias = contact.get("alias") or "-"
-                bundle = contact.get("prekey_bundle_path") or "-"
+                bundle_path = str(contact.get("prekey_bundle_path") or "").strip()
+                bundle_inline = bool(str(contact.get("prekey_bundle_b64") or "").strip())
+                if bundle_path:
+                    bundle = f"file:{bundle_path}"
+                elif bundle_inline:
+                    bundle = "cached:dht"
+                else:
+                    bundle = "-"
                 account_id = contact.get("account_id") or "-"
                 last_address = contact.get("last_address") or "-"
                 self._println(
@@ -785,7 +1036,11 @@ class TerminalChatClient:
                 if not Path(bundle_path).exists():
                     self._println(f"[contact] bundle file not found: {bundle_path}")
                     return
-                self.state.upsert_contact(peer_id, prekey_bundle_path=bundle_path)
+                self.state.upsert_contact(
+                    peer_id,
+                    prekey_bundle_path=bundle_path,
+                    prekey_bundle_b64="",
+                )
                 self._println(f"[contact] set bundle for {self.state.contact_label(peer_id)}")
                 return
             self._println("unknown /contact subcommand")
@@ -901,6 +1156,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DIRECTORY_REANNOUNCE_SECONDS,
         help="How often to re-publish own discovery card in DHT.",
     )
+    parser.add_argument(
+        "--prekey-ttl-seconds",
+        type=int,
+        default=DEFAULT_PREKEY_TTL_SECONDS,
+        help="TTL for published prekey bundle records in DHT.",
+    )
+    parser.add_argument(
+        "--prekey-one-time-count",
+        type=int,
+        default=DEFAULT_PREKEY_ONE_TIME_COUNT,
+        help="Number of one-time prekeys when (re)building bundle for DHT publish.",
+    )
     seed_group = parser.add_mutually_exclusive_group()
     seed_group.add_argument(
         "--seed",
@@ -945,9 +1212,11 @@ def main() -> None:
     local_peer_id = node.local_peer_id()
     node.listen(listen_addr)
 
+    bootstrap_connected = False
     for addr in bootstrap_addresses:
         try:
             node.dial(addr)
+            bootstrap_connected = True
         except RuntimeError:
             pass
     for addr in args.target:
@@ -967,6 +1236,8 @@ def main() -> None:
         profile_path=profile_path,
         directory_ttl_seconds=args.directory_ttl_seconds,
         directory_reannounce_seconds=args.directory_reannounce_seconds,
+        prekey_ttl_seconds=args.prekey_ttl_seconds,
+        prekey_one_time_count=args.prekey_one_time_count,
     )
 
     def _handle_signal(_sig: int, _frame: Any) -> None:
@@ -984,12 +1255,15 @@ def main() -> None:
         print("Bootstrap peers:")
         for item in bootstrap_addresses:
             print(f"  - {item}")
+        if bootstrap_connected:
+            print("[status] online: connected to relay/bootstrap")
+        else:
+            print("[status] offline: failed to connect to relay/bootstrap")
+    else:
+        print("[status] offline: no bootstrap relay configured")
 
     client.start_receiver()
-    try:
-        client.announce_self(verbose=True)
-    except RuntimeError as exc:
-        print(f"[announce] startup announce failed: {exc}")
+    print("[announce] running in background")
     client.repl()
     client.stop()
 

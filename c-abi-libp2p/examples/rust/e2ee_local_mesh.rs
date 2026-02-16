@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use cabi_rust_libp2p::{
-    e2ee, DiscoveryQueue, DhtQueryError, MessageQueue, PeerManager, PeerManagerHandle, TransportConfig,
-    DEFAULT_DISCOVERY_QUEUE_CAPACITY, DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    e2ee, DhtQueryError, DiscoveryQueue, MessageQueue, PeerManager, PeerManagerHandle,
+    TransportConfig, DEFAULT_DISCOVERY_QUEUE_CAPACITY, DEFAULT_MESSAGE_QUEUE_CAPACITY,
 };
 use libp2p::Multiaddr;
 use serde_json::Value;

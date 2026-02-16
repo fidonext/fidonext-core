@@ -3,19 +3,21 @@
 use anyhow::{anyhow, Result};
 use futures::future::Either;
 use libp2p::{
+    autonat,
     core::{
         muxing::StreamMuxerBox,
         transport::{Boxed, Transport},
         upgrade,
     },
-    gossipsub,
-    identify, identity,
+    gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
-    noise, ping, quic,
+    noise, ping, quic, relay,
+    request_response,
+    swarm::behaviour::toggle::Toggle,
     swarm::{Config as SwarmConfig, Swarm},
-    tcp, PeerId, autonat, 
-    relay, swarm::behaviour::toggle::Toggle,
+    tcp, PeerId, StreamProtocol,
 };
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Combined libp2p behaviour used across the node.
@@ -36,6 +38,9 @@ pub struct NetworkBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// Optional relay server (hop) behaviour for acting as a public relay.
     pub relay_server: Toggle<relay::Behaviour>,
+    /// Direct unicast request-response channel for addressed delivery frames.
+    pub delivery_direct:
+        request_response::cbor::Behaviour<DeliveryDirectRequest, DeliveryDirectResponse>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -48,6 +53,17 @@ pub enum BehaviourEvent {
     Gossipsub(gossipsub::Event),
     RelayClient(relay::client::Event),
     RelayServer(relay::Event),
+    DeliveryDirect(request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryDirectRequest {
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryDirectResponse {
+    pub accepted: bool,
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -92,6 +108,12 @@ impl From<relay::Event> for BehaviourEvent {
     }
 }
 
+impl From<request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>) -> Self {
+        Self::DeliveryDirect(event)
+    }
+}
+
 /// Transport configuration builder.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -106,15 +128,15 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            use_quic: false, // Turn on for quic
-            hop_relay: false, // Turn on for node act as relay (at least try)
+            use_quic: false,     // Turn on for quic
+            hop_relay: false,    // Turn on for node act as relay (at least try)
             identity_seed: None, // Pass to use identity seed for generating keypair
         }
     }
 }
 
 impl TransportConfig {
-     /// Creates a new configuration with the provided flags.
+    /// Creates a new configuration with the provided flags.
     pub fn new(use_quic: bool, hop_relay: bool) -> Self {
         Self {
             use_quic,
@@ -191,6 +213,16 @@ impl TransportConfig {
         let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
         kademlia.set_mode(Some(kad::Mode::Server));
 
+        let direct_cfg =
+            request_response::Config::default().with_request_timeout(Duration::from_secs(8));
+        let delivery_direct = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/fidonext/delivery-direct/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            direct_cfg,
+        );
+
         NetworkBehaviour {
             kademlia,
             ping: ping::Behaviour::new(ping_config),
@@ -199,6 +231,7 @@ impl TransportConfig {
             gossipsub,
             relay_client,
             relay_server,
+            delivery_direct,
         }
     }
 
@@ -207,10 +240,7 @@ impl TransportConfig {
         &self,
         keypair: &identity::Keypair,
         local_peer_id: PeerId,
-    ) -> Result<(
-        Boxed<(PeerId, StreamMuxerBox)>,
-        relay::client::Behaviour,
-     )> {
+    ) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
         let noise_config = noise::Config::new(keypair)
             .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
 
@@ -265,10 +295,7 @@ impl TransportConfig {
     fn build_relay_transport(
         noise_config: noise::Config,
         local_peer_id: PeerId,
-    ) -> (
-        Boxed<(PeerId, StreamMuxerBox)>,
-        relay::client::Behaviour,
-    ) {
+    ) -> (Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour) {
         let (relay_transport, relay_client) = relay::client::new(local_peer_id);
 
         let relay_transport = relay_transport
