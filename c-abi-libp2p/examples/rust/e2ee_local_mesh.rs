@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use cabi_rust_libp2p::{
-    e2ee, DhtQueryError, DiscoveryQueue, MessageQueue, PeerManager, PeerManagerHandle,
+    e2ee, AddrState, DhtQueryError, DiscoveryQueue, MessageQueue, PeerManager, PeerManagerHandle,
     TransportConfig, DEFAULT_DISCOVERY_QUEUE_CAPACITY, DEFAULT_MESSAGE_QUEUE_CAPACITY,
 };
 use libp2p::Multiaddr;
@@ -10,6 +10,7 @@ use std::{
     fs,
     path::Path,
     str::FromStr,
+    sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -50,10 +51,12 @@ async fn spawn_node(
 
     let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
     let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+    let addr_state = Arc::new(RwLock::new(AddrState::default()));
     let (manager, handle) = PeerManager::new(
         config,
         message_queue.sender(),
         discovery_queue.sender(),
+        addr_state,
         bootstrap_peers,
     )
     .with_context(|| format!("{name}: failed to initialize peer manager"))?;
