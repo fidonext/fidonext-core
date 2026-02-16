@@ -173,6 +173,85 @@ E2EE_MODE=on ./run_local_mesh.sh                      # strict libsignal auto sm
 > For a realistic deployment run the three `ping_standalone_nodes.py` commands
 > on separate machines using their public IPs/DNS as described above.
 
+## `fidonext_terminal_client.py`
+
+`fidonext_terminal_client.py` is a thin user-facing wrapper over
+`ping_standalone_nodes.py` with explicit subcommands:
+
+```bash
+python3 fidonext_terminal_client.py relay --listen /ip4/0.0.0.0/tcp/41000
+python3 fidonext_terminal_client.py leaf --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<host>/tcp/41000/p2p/<RELAY_ID>
+```
+
+All extra flags are forwarded to the underlying standalone node CLI.
+
+## `fidonext_chat_client.py` (stateful terminal chats)
+
+`fidonext_chat_client.py` is an interactive terminal chat client with local
+identity registration and persistent chat/contact state.
+
+### What it does
+
+- creates/loads local identity from `--profile`
+- prints shareable node address (`<listen>/p2p/<peer_id>`)
+- persists contacts/chats in a local state file
+- publishes/refreshes own DHT directory card (`peer_id + account_id + address`)
+- resolves peer by unique id from DHT (`/lookup`, `/connectid`)
+- supports simple chat commands (`/contacts`, `/chats`, `/chat use`, `/send`)
+- supports optional per-contact libsignal encryption using recipient prekey
+  bundle file (`/contact bundle <peer> <bundle.json>`)
+
+### Run
+
+```bash
+cd c-abi-libp2p/examples/python
+python3 fidonext_chat_client.py \
+  --profile ./alice.profile.json \
+  --listen /ip4/0.0.0.0/tcp/41001
+```
+
+Then in another terminal:
+
+```bash
+python3 fidonext_chat_client.py \
+  --profile ./bob.profile.json \
+  --listen /ip4/0.0.0.0/tcp/41002 \
+  --bootstrap /ip4/127.0.0.1/tcp/41001/p2p/<ALICE_PEER_ID>
+```
+
+In the chat REPL use `/help` to see all commands.
+
+### Global relay-backed topology (different countries / servers)
+
+1. Deploy several relay containers on separate servers/ASNs/countries and note
+   each relay address:
+   `/ip4/<relay-ip>/tcp/41000/p2p/<RELAY_PEER_ID>`.
+2. Create a bootstrap file on each client (same list on all nodes), for example:
+
+```text
+# bootstrap_global.txt
+/ip4/203.0.113.10/tcp/41000/p2p/12D3KooW...
+/ip4/198.51.100.23/tcp/41000/p2p/12D3KooX...
+/ip4/192.0.2.45/tcp/41000/p2p/12D3KooY...
+```
+
+3. Start each terminal client with this bootstrap set:
+
+```bash
+python3 fidonext_chat_client.py \
+  --profile ./alice.profile.json \
+  --listen /ip4/0.0.0.0/tcp/41001 \
+  --bootstrap-file ./bootstrap_global.txt
+```
+
+4. In REPL:
+   - `/id` -> share current `PeerId` (current unique network identifier)
+   - `/connectid <peer_id>` -> lookup + connect by identifier
+   - `/chat use <peer_id>` and `/send <text>` -> chat in terminal
+
+If direct path is unavailable (NAT/firewall), connectivity still works when
+both peers maintain connectivity to common relay/bootstrap nodes.
+
 ### Native Rust E2EE smoke test
 
 If you want a non-Python smoke test that uses the Rust code path directly, run:

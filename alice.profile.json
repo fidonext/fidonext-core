@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "account_seed_b64": "bqTlV2PaiVJnjSjFo1uq7SOmNkVqaVjJgABYM/8lt7g=",
+  "device_id": "dev-0eb0739e445b4887ecc498038e63315e",
+  "libp2p_seed_b64": "IqHo/K3XAGIBryxYmzURU4i60AM/1d9DovZCVav9hmg=",
+  "signal_identity_seed_b64": "J1qHG9V5Tx1gbtBYwMPgEFa91JmAj+xfzHKC2y1H7ZE=",
+  "created_at_unix": 1771160908
+}

@@ -1,0 +1,21 @@
+services:
+  relay:
+    build:
+      context: ../../..
+      dockerfile: c-abi-libp2p/deploy/relay/Dockerfile
+    image: fidonext-relay:latest
+    container_name: fidonext-relay
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: /ip4/0.0.0.0/tcp/41000
+      # BOOTSTRAP_PEERS: "/ip4/x.x.x.x/tcp/41000/p2p/12D3...,/ip4/y.y.y.y/tcp/41000/p2p/12D3..."
+      # USE_QUIC: "1"
+      # EXTRA_ARGS: "--bootstrap /ip4/..."
+    ports:
+      - "41000:41000/tcp"
+    volumes:
+      - relay-data:/data
+
+volumes:
+  relay-data:
+

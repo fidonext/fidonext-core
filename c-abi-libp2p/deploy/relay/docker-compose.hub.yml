@@ -1,0 +1,20 @@
+services:
+  relay:
+    image: ${FIDONEXT_RELAY_IMAGE:-docker.io/replace-me/fidonext-relay:latest}
+    container_name: ${CONTAINER_NAME:-fidonext-relay}
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: ${LISTEN_ADDR:-/ip4/0.0.0.0/tcp/41000}
+      PROFILE_PATH: ${PROFILE_PATH:-/data/relay.profile.json}
+      BOOTSTRAP_PEERS: ${BOOTSTRAP_PEERS:-}
+      USE_QUIC: ${USE_QUIC:-0}
+      SEED_PHRASE: ${SEED_PHRASE:-}
+      SEED_HEX: ${SEED_HEX:-}
+      EXTRA_ARGS: ${EXTRA_ARGS:-}
+    ports:
+      - "${RELAY_PORT_TCP:-41000}:41000/tcp"
+    volumes:
+      - relay-data:/data
+
+volumes:
+  relay-data:
