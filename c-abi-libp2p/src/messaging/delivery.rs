@@ -10,6 +10,7 @@ pub const DEFAULT_DELIVERY_TTL_SECONDS: u64 = 300;
 pub const MIN_DELIVERY_TTL_SECONDS: u64 = 10;
 pub const MAX_DELIVERY_TTL_SECONDS: u64 = 86_400;
 pub const DEFAULT_MAILBOX_FETCH_LIMIT: u32 = 64;
+const FRAME_PADDING_BUCKETS: [usize; 4] = [512, 1024, 2048, 4096];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -42,6 +43,8 @@ pub struct DeliveryEnvelope {
     pub attempt: u32,
     pub ack_required: bool,
     pub payload_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_padding_b64: Option<String>,
 }
 
 impl DeliveryEnvelope {
@@ -67,6 +70,8 @@ pub struct DeliveryAck {
     #[serde(default = "default_ack_kind")]
     pub ack_kind: DeliveryAckKind,
     pub acked_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_padding_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +94,8 @@ pub struct DeliveryNack {
     pub reason: DeliveryNackReason,
     pub retry_after_seconds: Option<u64>,
     pub nacked_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_padding_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +113,8 @@ pub struct DeliveryMailboxFetch {
     pub recipient_peer_id: String,
     pub request_unix: u64,
     pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_padding_b64: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,7 +138,44 @@ pub fn now_unix_seconds() -> u64 {
 }
 
 pub fn encode_frame(frame: &DeliveryFrame) -> Option<Vec<u8>> {
-    serde_json::to_vec(frame).ok()
+    let mut padded = frame.clone();
+    padded.clear_cover_padding();
+    let base_encoded = serde_json::to_vec(&padded).ok()?;
+    let Some(target_len) = frame_padding_target(base_encoded.len()) else {
+        return Some(base_encoded);
+    };
+    if base_encoded.len() >= target_len {
+        return Some(base_encoded);
+    }
+
+    padded.set_cover_padding(Some(String::new()));
+    let empty_padding_len = serde_json::to_vec(&padded).ok()?.len();
+    if empty_padding_len > target_len {
+        padded.clear_cover_padding();
+        return serde_json::to_vec(&padded).ok();
+    }
+
+    let budget_for_b64 = target_len.saturating_sub(empty_padding_len);
+    let mut raw_padding_len = (budget_for_b64 / 4) * 3;
+    while base64_encoded_len(raw_padding_len.saturating_add(1)) <= budget_for_b64 {
+        raw_padding_len = raw_padding_len.saturating_add(1);
+    }
+    while raw_padding_len > 0 && base64_encoded_len(raw_padding_len) > budget_for_b64 {
+        raw_padding_len = raw_padding_len.saturating_sub(1);
+    }
+
+    if raw_padding_len == 0 {
+        padded.clear_cover_padding();
+        return Some(base_encoded);
+    }
+    let padding_bytes = vec![0u8; raw_padding_len];
+    padded.set_cover_padding(Some(BASE64_STANDARD.encode(padding_bytes)));
+    let encoded = serde_json::to_vec(&padded).ok()?;
+    if encoded.len() <= target_len {
+        Some(encoded)
+    } else {
+        Some(base_encoded)
+    }
 }
 
 pub fn parse_frame(payload: &[u8]) -> Option<DeliveryFrame> {
@@ -183,6 +229,7 @@ pub fn build_envelope_from_payload(
         attempt: 1,
         ack_required: true,
         payload_b64: BASE64_STANDARD.encode(payload),
+        cover_padding_b64: None,
     })
 }
 
@@ -199,6 +246,7 @@ pub fn build_ack(
         recipient_peer_id: envelope.sender_peer_id.clone(),
         ack_kind,
         acked_at_unix: now_unix,
+        cover_padding_b64: None,
     }
 }
 
@@ -217,6 +265,7 @@ pub fn build_nack(
         reason,
         retry_after_seconds,
         nacked_at_unix: now_unix,
+        cover_padding_b64: None,
     }
 }
 
@@ -227,9 +276,36 @@ pub fn build_mailbox_fetch(local_peer_id: &PeerId, now_unix: u64) -> DeliveryMai
         recipient_peer_id: local_peer_id.to_string(),
         request_unix: now_unix,
         limit: DEFAULT_MAILBOX_FETCH_LIMIT,
+        cover_padding_b64: None,
     }
 }
 
 fn sanitize_ttl(ttl_seconds: u64) -> u64 {
     ttl_seconds.clamp(MIN_DELIVERY_TTL_SECONDS, MAX_DELIVERY_TTL_SECONDS)
+}
+
+fn frame_padding_target(current_len: usize) -> Option<usize> {
+    FRAME_PADDING_BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| current_len < *bucket)
+}
+
+fn base64_encoded_len(raw_len: usize) -> usize {
+    ((raw_len + 2) / 3) * 4
+}
+
+impl DeliveryFrame {
+    fn clear_cover_padding(&mut self) {
+        self.set_cover_padding(None);
+    }
+
+    fn set_cover_padding(&mut self, value: Option<String>) {
+        match self {
+            Self::Envelope(frame) => frame.cover_padding_b64 = value,
+            Self::Ack(frame) => frame.cover_padding_b64 = value,
+            Self::Nack(frame) => frame.cover_padding_b64 = value,
+            Self::MailboxFetch(frame) => frame.cover_padding_b64 = value,
+        }
+    }
 }

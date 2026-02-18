@@ -8,6 +8,7 @@ services:
       PROFILE_PATH: ${PROFILE_PATH:-/data/relay.profile.json}
       BOOTSTRAP_PEERS: ${BOOTSTRAP_PEERS:-}
       USE_QUIC: ${USE_QUIC:-0}
+      USE_WS: ${USE_WS:-0}
       SEED_PHRASE: ${SEED_PHRASE:-}
       SEED_HEX: ${SEED_HEX:-}
       EXTRA_ARGS: ${EXTRA_ARGS:-}

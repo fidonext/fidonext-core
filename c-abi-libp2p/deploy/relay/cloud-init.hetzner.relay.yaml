@@ -20,6 +20,7 @@ write_files:
             PROFILE_PATH: ${PROFILE_PATH:-/data/relay.profile.json}
             BOOTSTRAP_PEERS: ${BOOTSTRAP_PEERS:-}
             USE_QUIC: ${USE_QUIC:-0}
+            USE_WS: ${USE_WS:-0}
             SEED_PHRASE: ${SEED_PHRASE:-}
             SEED_HEX: ${SEED_HEX:-}
             EXTRA_ARGS: ${EXTRA_ARGS:-}
@@ -42,6 +43,7 @@ write_files:
       RELAY_PORT_TCP=41000
       PROFILE_PATH=/data/relay.profile.json
       USE_QUIC=0
+      USE_WS=0
       BOOTSTRAP_PEERS=
       EXTRA_ARGS=
 
@@ -62,6 +64,7 @@ write_files:
       # shellcheck disable=SC1090
       . "${ENV_FILE}"
       PORT="${RELAY_PORT_TCP:-41000}"
+      USE_WS="${USE_WS:-0}"
       PEER_ID="$(docker logs "${CONTAINER_NAME:-fidonext-relay}" 2>&1 | sed -n 's/^Local PeerId: //p' | tail -n1)"
       if [ -z "${PEER_ID}" ]; then
         echo "peer id is not available yet; check: docker logs ${CONTAINER_NAME:-fidonext-relay}" >&2
@@ -77,7 +80,12 @@ write_files:
         exit 1
       fi
 
-      echo "/ip4/${PUBLIC_IP}/tcp/${PORT}/p2p/${PEER_ID}"
+      WS_SUFFIX=""
+      if [ "${USE_WS}" = "1" ]; then
+        WS_SUFFIX="/ws"
+      fi
+
+      echo "/ip4/${PUBLIC_IP}/tcp/${PORT}${WS_SUFFIX}/p2p/${PEER_ID}"
 
   - path: /usr/local/bin/fidonext-relay-up
     permissions: "0755"
