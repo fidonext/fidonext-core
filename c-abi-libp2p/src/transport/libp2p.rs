@@ -16,6 +16,7 @@ use libp2p::{
     swarm::behaviour::toggle::Toggle,
     swarm::{Config as SwarmConfig, Swarm},
     tcp, PeerId, StreamProtocol,
+    websocket,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -138,6 +139,8 @@ impl From<request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>
 pub struct TransportConfig {
     /// When set, enable QUIC support alongside TCP.
     pub use_quic: bool,
+    /// When set, enable WebSocket transport (/ws multiaddrs) alongside TCP.
+    pub use_websocket: bool,
     /// Controls whether the node should also act as a hop relay.
     pub hop_relay: bool,
     /// Controls whether rendezvous behaviours are enabled.
@@ -150,6 +153,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             use_quic: false,     // Turn on for quic
+            use_websocket: false, // Turn on for ws transport (wss via reverse-proxy)
             hop_relay: false,    // Turn on for node act as relay (at least try)
             enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
             identity_seed: None, // Pass to use identity seed for generating keypair
@@ -301,7 +305,7 @@ impl TransportConfig {
 
         let tcp_transport = Self::build_tcp_transport(noise_config.clone())?;
 
-        let base_transport = if self.use_quic {
+        let mut base_transport: Boxed<(PeerId, StreamMuxerBox)> = if self.use_quic {
             let quic_transport = Self::build_quic_transport(keypair);
             quic_transport
                 .or_transport(tcp_transport)
@@ -312,6 +316,16 @@ impl TransportConfig {
         } else {
             tcp_transport
         };
+
+        if self.use_websocket {
+            let ws_transport = Self::build_ws_transport(noise_config.clone())?;
+            base_transport = ws_transport
+                .or_transport(base_transport)
+                .map(|either, _| match either {
+                    Either::Left(output) | Either::Right(output) => output,
+                })
+                .boxed();
+        }
 
         let (relay_transport, relay_client) =
             Self::build_relay_transport(noise_config.clone(), local_peer_id);
@@ -344,6 +358,17 @@ impl TransportConfig {
         quic::tokio::Transport::new(quic_config)
             .map(|(peer_id, connection), _| (peer_id, StreamMuxerBox::new(connection)))
             .boxed()
+    }
+
+    /// Configures WebSocket transport (/ws multiaddrs) over TCP, then Noise + Yamux.
+    fn build_ws_transport(noise_config: noise::Config) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default());
+        let ws_transport = websocket::Config::new(tcp_transport);
+        Ok(ws_transport
+            .upgrade(upgrade::Version::V1Lazy)
+            .authenticate(noise_config)
+            .multiplex(libp2p::yamux::Config::default())
+            .boxed())
     }
 
     /// Configures Relay transport

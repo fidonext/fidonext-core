@@ -18,6 +18,7 @@ use libp2p::{
     swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
 };
+use rand::Rng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -29,8 +30,22 @@ const DELIVERY_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const DELIVERY_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DELIVERY_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAILBOX_FETCH_INTERVAL: Duration = Duration::from_secs(8);
+const MAILBOX_FETCH_JITTER_SECONDS: u64 = 3;
+const RELAY_PLACEMENT_N: usize = 5;
+const RELAY_PLACEMENT_W: usize = 3;
+const RELAY_READ_N: usize = 5;
+const RELAY_READ_R: usize = 2;
 const MAILBOX_MAX_PER_RECIPIENT: usize = 256;
 const MAILBOX_MAX_BYTES_PER_RECIPIENT: usize = 512 * 1024;
+
+fn mailbox_fetch_next_interval() -> Duration {
+    let base = MAILBOX_FETCH_INTERVAL.as_secs();
+    let jitter = MAILBOX_FETCH_JITTER_SECONDS;
+    let min = base.saturating_sub(jitter).max(1);
+    let max = base.saturating_add(jitter).max(min);
+    let next = rand::thread_rng().gen_range(min..=max);
+    Duration::from_secs(next)
+}
 
 use crate::{
     peer::addr_events::{AddrEvent, AddrState},
@@ -354,7 +369,7 @@ impl PeerManager {
             pending_direct_requests: HashMap::new(),
             delivered_envelopes: HashMap::new(),
             mailbox_queues: HashMap::new(),
-            next_mailbox_fetch_at: Instant::now() + MAILBOX_FETCH_INTERVAL,
+            next_mailbox_fetch_at: Instant::now() + mailbox_fetch_next_interval(),
             delivery_sequence: 0,
         };
 
@@ -601,14 +616,31 @@ impl PeerManager {
 
         if now_instant >= self.next_mailbox_fetch_at && !self.mailbox_enabled {
             let fetch = build_mailbox_fetch(&self.local_peer_id, now_unix);
-            for relay_peer_id in self.relay_targets() {
-                self.send_direct_frame(
+            let relay_targets: Vec<PeerId> = self
+                .relay_targets()
+                .into_iter()
+                .take(RELAY_READ_N.max(1))
+                .collect();
+            let required_r = RELAY_READ_R.min(relay_targets.len()).max(1);
+            let mut sent = 0usize;
+            for relay_peer_id in relay_targets {
+                if self.send_direct_frame(
                     &relay_peer_id,
                     DeliveryFrame::MailboxFetch(fetch.clone()),
                     "sent mailbox fetch request via direct unicast",
+                ) {
+                    sent = sent.saturating_add(1);
+                }
+            }
+            if sent < required_r {
+                tracing::debug!(
+                    target: "peer",
+                    sent,
+                    required_r,
+                    "mailbox read quorum not reached for this fetch round",
                 );
             }
-            self.next_mailbox_fetch_at = now_instant + MAILBOX_FETCH_INTERVAL;
+            self.next_mailbox_fetch_at = now_instant + mailbox_fetch_next_interval();
         }
     }
 
@@ -676,24 +708,73 @@ impl PeerManager {
             return true;
         }
 
-        for relay_peer_id in self.relay_targets() {
-            if relay_peer_id == *target_peer_id {
-                continue;
+        let relay_targets: Vec<PeerId> = self
+            .relay_targets()
+            .into_iter()
+            .filter(|relay_peer_id| relay_peer_id != target_peer_id)
+            .collect();
+
+        if !matches!(frame, DeliveryFrame::Envelope(_)) {
+            for relay_peer_id in relay_targets {
+                if self.send_direct_frame(
+                    &relay_peer_id,
+                    frame.clone(),
+                    "sent addressed frame to relay mailbox hop",
+                ) {
+                    return true;
+                }
             }
+            tracing::warn!(
+                target: "peer",
+                %target_peer_id,
+                kind = ?frame,
+                "failed to route addressed frame: no direct or relay path",
+            );
+            return false;
+        }
+
+        if relay_targets.is_empty() {
+            tracing::warn!(
+                target: "peer",
+                %target_peer_id,
+                kind = ?frame,
+                "failed to route addressed envelope: no relay candidates",
+            );
+            return false;
+        }
+
+        let placement_n = RELAY_PLACEMENT_N.max(1);
+        let selected_relays: Vec<PeerId> = relay_targets.into_iter().take(placement_n).collect();
+        let required_w = RELAY_PLACEMENT_W.min(selected_relays.len()).max(1);
+        let mut successes = 0usize;
+        for relay_peer_id in selected_relays.iter() {
             if self.send_direct_frame(
-                &relay_peer_id,
+                relay_peer_id,
                 frame.clone(),
-                "sent addressed frame to relay mailbox hop",
+                "sent addressed envelope to relay mailbox hop",
             ) {
-                return true;
+                successes = successes.saturating_add(1);
             }
+        }
+
+        if successes >= required_w {
+            tracing::debug!(
+                target: "peer",
+                %target_peer_id,
+                successes,
+                required_w,
+                "relay placement accepted envelope"
+            );
+            return true;
         }
 
         tracing::warn!(
             target: "peer",
             %target_peer_id,
             kind = ?frame,
-            "failed to route addressed frame: no direct or relay path",
+            successes,
+            required_w,
+            "relay placement failed to satisfy write quorum",
         );
         false
     }

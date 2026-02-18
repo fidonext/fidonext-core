@@ -8,7 +8,10 @@ forwards stdin payloads over the gossipsub bridge.
 """
 
 import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
+import hashlib
 import json
 import os
 import signal
@@ -16,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Setup similar to ping_two_nodes.py
 try:
@@ -63,6 +66,20 @@ CABI_AUTONAT_UNKNOWN = 0
 CABI_AUTONAT_PRIVATE = 1
 CABI_AUTONAT_PUBLIC = 2
 
+BOOTSTRAP_MANIFEST_SCHEMA = "fidonext-bootstrap-manifest-v1"
+BOOTSTRAP_MANIFEST_STATE_SCHEMA = "fidonext-bootstrap-manifest-state-v1"
+KNOWN_PEERS_SCHEMA = "fidonext-known-peers-v1"
+RELAY_DESCRIPTOR_SCHEMA = "fidonext-relay-descriptor-v1"
+RELAY_DESCRIPTOR_DHT_PREFIX = "fidonext-relay-v1/descriptor"
+MAX_MANIFEST_CLOCK_SKEW_SECONDS = 5 * 60
+MAX_MANIFEST_ADDR_COUNT = 2048
+DEFAULT_KNOWN_PEERS_MAX = 1500
+DEFAULT_STARTUP_DIAL_K = 8
+DEFAULT_STARTUP_DIAL_WORKERS = 8
+MAX_STARTUP_DIAL_WORKERS = 32
+DEFAULT_RELAY_DESCRIPTOR_TTL_SECONDS = 30 * 60
+DEFAULT_RELAY_DESCRIPTOR_QUERY_MAX = 24
+
 lib.cabi_init_tracing.restype = ctypes.c_int
 lib.cabi_node_new.argtypes = [
     ctypes.c_bool,
@@ -73,6 +90,16 @@ lib.cabi_node_new.argtypes = [
     ctypes.c_size_t,
 ]
 lib.cabi_node_new.restype = ctypes.c_void_p
+lib.cabi_node_new_v2.argtypes = [
+    ctypes.c_bool,
+    ctypes.c_bool,
+    ctypes.c_bool,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_node_new_v2.restype = ctypes.c_void_p
 lib.cabi_node_listen.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 lib.cabi_node_listen.restype = ctypes.c_int
 lib.cabi_node_dial.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -192,6 +219,41 @@ lib.cabi_e2ee_decrypt_message_auto.argtypes = [
 lib.cabi_e2ee_decrypt_message_auto.restype = ctypes.c_int
 lib.cabi_e2ee_libsignal_probe.argtypes = []
 lib.cabi_e2ee_libsignal_probe.restype = ctypes.c_int
+lib.cabi_identity_verify_signature.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_identity_verify_signature.restype = ctypes.c_int
+lib.cabi_identity_public_key_from_seed.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_identity_public_key_from_seed.restype = ctypes.c_int
+lib.cabi_identity_sign_with_seed.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_identity_sign_with_seed.restype = ctypes.c_int
+lib.cabi_identity_peer_id_from_public_key.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_identity_peer_id_from_public_key.restype = ctypes.c_int
 
 
 def _check(status: int, context: str) -> None:
@@ -216,6 +278,732 @@ def default_listen(use_quic: bool) -> str:
     if use_quic:
         return "/ip4/127.0.0.1/udp/41000/quic-v1"
     return "/ip4/127.0.0.1/tcp/41000"
+
+
+def load_text_list_file(path: Path) -> List[str]:
+    values: List[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        values.append(line)
+    return values
+
+
+def _normalize_multiaddrs(values: Sequence[str], limit: int = MAX_MANIFEST_ADDR_COUNT) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _canonical_manifest_unsigned_payload(manifest: Dict[str, Any]) -> bytes:
+    payload = {
+        "schema": BOOTSTRAP_MANIFEST_SCHEMA,
+        "manifest_version": int(manifest["manifest_version"]),
+        "issued_at_unix": int(manifest["issued_at_unix"]),
+        "expires_at_unix": int(manifest["expires_at_unix"]),
+        "signing_public_key_b64": str(manifest["signing_public_key_b64"]),
+        "bootstrap_multiaddrs": _normalize_multiaddrs(manifest["bootstrap_multiaddrs"]),
+        "bridge_multiaddrs": _normalize_multiaddrs(manifest.get("bridge_multiaddrs") or []),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "utf-8"
+    )
+
+
+def _verify_manifest_signature(
+    signing_public_key_b64: str, unsigned_payload: bytes, signature_b64: str
+) -> None:
+    try:
+        public_key = base64.b64decode(signing_public_key_b64, validate=True)
+        signature = base64.b64decode(signature_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("manifest contains invalid base64 in signing key or signature") from exc
+    if not public_key or not signature:
+        raise ValueError("manifest signing key/signature must be non-empty")
+
+    public_key_buf = (ctypes.c_ubyte * len(public_key))(*public_key)
+    payload_buf = (ctypes.c_ubyte * len(unsigned_payload))(*unsigned_payload)
+    signature_buf = (ctypes.c_ubyte * len(signature))(*signature)
+    status = lib.cabi_identity_verify_signature(
+        ctypes.cast(public_key_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.c_size_t(len(public_key)),
+        ctypes.cast(payload_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.c_size_t(len(unsigned_payload)),
+        ctypes.cast(signature_buf, ctypes.POINTER(ctypes.c_ubyte)),
+        ctypes.c_size_t(len(signature)),
+    )
+    if status != CABI_STATUS_SUCCESS:
+        raise ValueError("manifest signature verification failed")
+
+
+def _parse_manifest_file(path: Path) -> Dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("manifest root must be a JSON object")
+    if raw.get("schema") != BOOTSTRAP_MANIFEST_SCHEMA:
+        raise ValueError(f"manifest schema must be {BOOTSTRAP_MANIFEST_SCHEMA!r}")
+
+    required = (
+        "manifest_version",
+        "issued_at_unix",
+        "expires_at_unix",
+        "signing_public_key_b64",
+        "bootstrap_multiaddrs",
+        "signature_b64",
+    )
+    for key in required:
+        if key not in raw:
+            raise ValueError(f"manifest is missing required field: {key}")
+
+    manifest_version = int(raw["manifest_version"])
+    issued_at_unix = int(raw["issued_at_unix"])
+    expires_at_unix = int(raw["expires_at_unix"])
+    if manifest_version < 1:
+        raise ValueError("manifest_version must be >= 1")
+    if expires_at_unix <= issued_at_unix:
+        raise ValueError("manifest expires_at_unix must be greater than issued_at_unix")
+
+    bootstrap_multiaddrs = raw["bootstrap_multiaddrs"]
+    bridge_multiaddrs = raw.get("bridge_multiaddrs") or []
+    if not isinstance(bootstrap_multiaddrs, list):
+        raise ValueError("bootstrap_multiaddrs must be a JSON array")
+    if not isinstance(bridge_multiaddrs, list):
+        raise ValueError("bridge_multiaddrs must be a JSON array when present")
+
+    normalized_bootstrap = _normalize_multiaddrs(bootstrap_multiaddrs)
+    normalized_bridges = _normalize_multiaddrs(bridge_multiaddrs)
+    if not normalized_bootstrap:
+        raise ValueError("manifest bootstrap_multiaddrs is empty after normalization")
+
+    return {
+        "schema": BOOTSTRAP_MANIFEST_SCHEMA,
+        "manifest_version": manifest_version,
+        "issued_at_unix": issued_at_unix,
+        "expires_at_unix": expires_at_unix,
+        "signing_public_key_b64": str(raw["signing_public_key_b64"]).strip(),
+        "bootstrap_multiaddrs": normalized_bootstrap,
+        "bridge_multiaddrs": normalized_bridges,
+        "signature_b64": str(raw["signature_b64"]).strip(),
+    }
+
+
+def _default_manifest_state_path(manifest_paths: Sequence[Path]) -> Path:
+    first = manifest_paths[0]
+    return first.with_suffix(first.suffix + ".state.json")
+
+
+def _load_manifest_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"schema": BOOTSTRAP_MANIFEST_STATE_SCHEMA, "last_applied_version": 0}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid manifest state file: {path}") from exc
+    if not isinstance(raw, dict) or raw.get("schema") != BOOTSTRAP_MANIFEST_STATE_SCHEMA:
+        raise ValueError(f"unexpected manifest state schema in {path}")
+    version = int(raw.get("last_applied_version", 0))
+    return {"schema": BOOTSTRAP_MANIFEST_STATE_SCHEMA, "last_applied_version": max(version, 0)}
+
+
+def _write_manifest_state(path: Path, *, manifest_version: int, manifest_hash_hex: str) -> None:
+    payload = {
+        "schema": BOOTSTRAP_MANIFEST_STATE_SCHEMA,
+        "last_applied_version": int(manifest_version),
+        "last_manifest_hash_hex": manifest_hash_hex,
+        "updated_at_unix": int(time.time()),
+    }
+    if path.parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_bootstrap_from_manifests(
+    manifest_paths: Sequence[Path],
+    *,
+    allowed_signing_keys_b64: Sequence[str],
+    state_path: Optional[Path] = None,
+    allow_rollback: bool = False,
+) -> List[str]:
+    if not manifest_paths:
+        return []
+
+    allowed_signers = {item.strip() for item in allowed_signing_keys_b64 if str(item).strip()}
+    if not allowed_signers:
+        raise ValueError(
+            "bootstrap-manifest requires at least one trusted signing key "
+            "(--manifest-allowed-signing-key or --manifest-allowed-signing-key-file)"
+        )
+
+    state_file = state_path or _default_manifest_state_path(manifest_paths)
+    state = _load_manifest_state(state_file)
+    last_applied_version = int(state.get("last_applied_version", 0))
+    now = int(time.time())
+    candidates: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for path in manifest_paths:
+        try:
+            manifest = _parse_manifest_file(path)
+            signer = manifest["signing_public_key_b64"]
+            if signer not in allowed_signers:
+                raise ValueError("manifest signing key is not in trusted signer set")
+
+            unsigned_payload = _canonical_manifest_unsigned_payload(manifest)
+            _verify_manifest_signature(
+                manifest["signing_public_key_b64"],
+                unsigned_payload,
+                manifest["signature_b64"],
+            )
+
+            if manifest["issued_at_unix"] > now + MAX_MANIFEST_CLOCK_SKEW_SECONDS:
+                raise ValueError("manifest issued_at_unix is too far in the future")
+            if manifest["expires_at_unix"] <= now - MAX_MANIFEST_CLOCK_SKEW_SECONDS:
+                raise ValueError("manifest is expired")
+
+            if not allow_rollback and manifest["manifest_version"] <= last_applied_version:
+                continue
+
+            manifest_hash_hex = hashlib.sha256(unsigned_payload).hexdigest()
+            manifest["_hash_hex"] = manifest_hash_hex
+            manifest["_source_path"] = str(path)
+            candidates.append(manifest)
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+
+    if not candidates:
+        if errors and last_applied_version == 0:
+            joined = "\n  - ".join(errors)
+            raise ValueError(f"no valid bootstrap manifests found:\n  - {joined}")
+        if errors:
+            print(
+                "[manifest] no newer valid manifest found; continuing with existing state. "
+                "errors:\n  - "
+                + "\n  - ".join(errors),
+                file=sys.stderr,
+            )
+        return []
+
+    best = sorted(
+        candidates,
+        key=lambda item: (int(item["manifest_version"]), int(item["issued_at_unix"])),
+        reverse=True,
+    )[0]
+    _write_manifest_state(
+        state_file,
+        manifest_version=int(best["manifest_version"]),
+        manifest_hash_hex=str(best["_hash_hex"]),
+    )
+    print(
+        "[manifest] applied"
+        f" version={best['manifest_version']}"
+        f" source={best['_source_path']}"
+        f" addrs={len(best['bootstrap_multiaddrs']) + len(best['bridge_multiaddrs'])}",
+        flush=True,
+    )
+    return _normalize_multiaddrs(
+        list(best["bootstrap_multiaddrs"]) + list(best["bridge_multiaddrs"])
+    )
+
+
+def extract_peer_id_from_multiaddr(addr: str) -> Optional[str]:
+    marker = "/p2p/"
+    if marker not in addr:
+        return None
+    value = addr.rsplit(marker, 1)[-1].strip()
+    return value if value else None
+
+
+def ensure_multiaddr_has_peer_id(addr: str, peer_id: str) -> str:
+    value = str(addr).strip()
+    if not value:
+        return value
+    current = extract_peer_id_from_multiaddr(value)
+    if current:
+        return value
+    if value.endswith("/"):
+        value = value[:-1]
+    return f"{value}/p2p/{peer_id}"
+
+
+def identity_public_key_from_seed(seed: bytes) -> bytes:
+    if len(seed) != 32:
+        raise ValueError("identity seed must be exactly 32 bytes")
+    seed_buf = (ctypes.c_ubyte * len(seed)).from_buffer_copy(seed)
+    out_size = 256
+    while True:
+        out_buf = (ctypes.c_ubyte * out_size)()
+        written = ctypes.c_size_t(0)
+        status = lib.cabi_identity_public_key_from_seed(
+            seed_buf,
+            ctypes.c_size_t(len(seed)),
+            out_buf,
+            ctypes.c_size_t(out_size),
+            ctypes.byref(written),
+        )
+        if status == CABI_STATUS_BUFFER_TOO_SMALL:
+            out_size = max(out_size * 2, written.value + 1)
+            continue
+        _check(status, "identity_public_key_from_seed")
+        return bytes(out_buf[: written.value])
+
+
+def identity_sign_with_seed(seed: bytes, payload: bytes) -> bytes:
+    if len(seed) != 32:
+        raise ValueError("identity seed must be exactly 32 bytes")
+    if not payload:
+        raise ValueError("identity_sign_with_seed requires non-empty payload")
+    seed_buf = (ctypes.c_ubyte * len(seed)).from_buffer_copy(seed)
+    payload_buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    out_size = 256
+    while True:
+        out_buf = (ctypes.c_ubyte * out_size)()
+        written = ctypes.c_size_t(0)
+        status = lib.cabi_identity_sign_with_seed(
+            seed_buf,
+            ctypes.c_size_t(len(seed)),
+            payload_buf,
+            ctypes.c_size_t(len(payload)),
+            out_buf,
+            ctypes.c_size_t(out_size),
+            ctypes.byref(written),
+        )
+        if status == CABI_STATUS_BUFFER_TOO_SMALL:
+            out_size = max(out_size * 2, written.value + 1)
+            continue
+        _check(status, "identity_sign_with_seed")
+        return bytes(out_buf[: written.value])
+
+
+def identity_peer_id_from_public_key(public_key: bytes) -> str:
+    if not public_key:
+        raise ValueError("public key cannot be empty")
+    key_buf = (ctypes.c_ubyte * len(public_key)).from_buffer_copy(public_key)
+    out_size = 128
+    while True:
+        out_buf = (ctypes.c_char * out_size)()
+        written = ctypes.c_size_t(0)
+        status = lib.cabi_identity_peer_id_from_public_key(
+            key_buf,
+            ctypes.c_size_t(len(public_key)),
+            ctypes.cast(out_buf, ctypes.c_void_p),
+            ctypes.c_size_t(out_size),
+            ctypes.byref(written),
+        )
+        if status == CABI_STATUS_BUFFER_TOO_SMALL:
+            out_size = max(out_size * 2, written.value + 1)
+            continue
+        _check(status, "identity_peer_id_from_public_key")
+        return bytes(out_buf[: written.value]).decode("utf-8")
+
+
+def relay_descriptor_dht_key(peer_id: str) -> bytes:
+    return f"{RELAY_DESCRIPTOR_DHT_PREFIX}/{peer_id}".encode("utf-8")
+
+
+def _canonical_relay_descriptor_unsigned_payload(descriptor: Dict[str, Any]) -> bytes:
+    payload = {
+        "schema": RELAY_DESCRIPTOR_SCHEMA,
+        "peer_id": str(descriptor["peer_id"]),
+        "issued_at_unix": int(descriptor["issued_at_unix"]),
+        "expires_at_unix": int(descriptor["expires_at_unix"]),
+        "signing_public_key_b64": str(descriptor["signing_public_key_b64"]),
+        "listen_addrs": _normalize_multiaddrs(descriptor["listen_addrs"], limit=256),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "utf-8"
+    )
+
+
+def build_relay_descriptor(
+    *,
+    local_peer_id: str,
+    listen_addrs: Sequence[str],
+    identity_seed: bytes,
+    ttl_seconds: int,
+) -> Dict[str, Any]:
+    if len(identity_seed) != 32:
+        raise ValueError("relay descriptor requires 32-byte identity seed")
+    normalized_addrs = _normalize_multiaddrs(
+        [ensure_multiaddr_has_peer_id(addr, local_peer_id) for addr in listen_addrs],
+        limit=256,
+    )
+    if not normalized_addrs:
+        raise ValueError("relay descriptor requires at least one listen address")
+
+    public_key = identity_public_key_from_seed(identity_seed)
+    derived_peer_id = identity_peer_id_from_public_key(public_key)
+    if derived_peer_id != local_peer_id:
+        raise ValueError(
+            "relay descriptor signer mismatch: seed-derived peer_id does not match local peer_id"
+        )
+
+    now_unix = int(time.time())
+    ttl = max(60, min(int(ttl_seconds), 24 * 60 * 60))
+    descriptor = {
+        "schema": RELAY_DESCRIPTOR_SCHEMA,
+        "peer_id": local_peer_id,
+        "issued_at_unix": now_unix,
+        "expires_at_unix": now_unix + ttl,
+        "signing_public_key_b64": base64.b64encode(public_key).decode("ascii"),
+        "listen_addrs": normalized_addrs,
+    }
+    unsigned_payload = _canonical_relay_descriptor_unsigned_payload(descriptor)
+    signature = identity_sign_with_seed(identity_seed, unsigned_payload)
+    descriptor["signature_b64"] = base64.b64encode(signature).decode("ascii")
+    return descriptor
+
+
+def publish_relay_descriptor(
+    node: "Node",
+    *,
+    local_peer_id: str,
+    listen_addrs: Sequence[str],
+    identity_seed: Optional[bytes],
+    ttl_seconds: int = DEFAULT_RELAY_DESCRIPTOR_TTL_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    if identity_seed is None:
+        return None
+    descriptor = build_relay_descriptor(
+        local_peer_id=local_peer_id,
+        listen_addrs=listen_addrs,
+        identity_seed=identity_seed,
+        ttl_seconds=ttl_seconds,
+    )
+    key = relay_descriptor_dht_key(local_peer_id)
+    payload = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "utf-8"
+    )
+    node.dht_put_record(key, payload, ttl_seconds=max(60, min(int(ttl_seconds), 24 * 60 * 60)))
+    return descriptor
+
+
+def validate_relay_descriptor(
+    payload: bytes,
+    *,
+    now_unix: Optional[int] = None,
+) -> Dict[str, Any]:
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("relay descriptor payload is not valid JSON") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("relay descriptor root must be JSON object")
+    if raw.get("schema") != RELAY_DESCRIPTOR_SCHEMA:
+        raise ValueError(f"relay descriptor schema must be {RELAY_DESCRIPTOR_SCHEMA!r}")
+    required = (
+        "peer_id",
+        "issued_at_unix",
+        "expires_at_unix",
+        "signing_public_key_b64",
+        "listen_addrs",
+        "signature_b64",
+    )
+    for key in required:
+        if key not in raw:
+            raise ValueError(f"relay descriptor missing field: {key}")
+    peer_id = str(raw["peer_id"]).strip()
+    if not peer_id:
+        raise ValueError("relay descriptor peer_id is empty")
+    issued = int(raw["issued_at_unix"])
+    expires = int(raw["expires_at_unix"])
+    if expires <= issued:
+        raise ValueError("relay descriptor expires_at_unix must be greater than issued_at_unix")
+    current = now_unix if now_unix is not None else int(time.time())
+    if issued > current + MAX_MANIFEST_CLOCK_SKEW_SECONDS:
+        raise ValueError("relay descriptor issued_at_unix is too far in future")
+    if expires <= current - MAX_MANIFEST_CLOCK_SKEW_SECONDS:
+        raise ValueError("relay descriptor is expired")
+
+    listen_addrs = _normalize_multiaddrs(raw["listen_addrs"], limit=256)
+    if not listen_addrs:
+        raise ValueError("relay descriptor listen_addrs is empty")
+    listen_addrs = [ensure_multiaddr_has_peer_id(item, peer_id) for item in listen_addrs]
+
+    unsigned_payload = _canonical_relay_descriptor_unsigned_payload(
+        {
+            "peer_id": peer_id,
+            "issued_at_unix": issued,
+            "expires_at_unix": expires,
+            "signing_public_key_b64": str(raw["signing_public_key_b64"]).strip(),
+            "listen_addrs": listen_addrs,
+        }
+    )
+    _verify_manifest_signature(
+        str(raw["signing_public_key_b64"]).strip(),
+        unsigned_payload,
+        str(raw["signature_b64"]).strip(),
+    )
+    public_key = base64.b64decode(str(raw["signing_public_key_b64"]).strip(), validate=True)
+    derived_peer_id = identity_peer_id_from_public_key(public_key)
+    if derived_peer_id != peer_id:
+        raise ValueError("relay descriptor signer does not match peer_id")
+
+    return {
+        "schema": RELAY_DESCRIPTOR_SCHEMA,
+        "peer_id": peer_id,
+        "issued_at_unix": issued,
+        "expires_at_unix": expires,
+        "signing_public_key_b64": str(raw["signing_public_key_b64"]).strip(),
+        "listen_addrs": listen_addrs,
+        "signature_b64": str(raw["signature_b64"]).strip(),
+    }
+
+
+def discover_relay_descriptors(
+    node: "Node",
+    peer_ids: Sequence[str],
+    *,
+    max_queries: int = DEFAULT_RELAY_DESCRIPTOR_QUERY_MAX,
+) -> List[Dict[str, Any]]:
+    unique_peer_ids: List[str] = []
+    seen = set()
+    for value in peer_ids:
+        peer_id = str(value).strip()
+        if not peer_id or peer_id in seen:
+            continue
+        seen.add(peer_id)
+        unique_peer_ids.append(peer_id)
+        if len(unique_peer_ids) >= max(1, int(max_queries)):
+            break
+
+    descriptors: List[Dict[str, Any]] = []
+    for peer_id in unique_peer_ids:
+        try:
+            payload = node.dht_get_record(relay_descriptor_dht_key(peer_id))
+        except RuntimeError:
+            continue
+        try:
+            descriptor = validate_relay_descriptor(payload)
+        except Exception:
+            continue
+        descriptors.append(descriptor)
+    return descriptors
+
+
+def merge_peer_source(existing: str, new: str) -> str:
+    priority = {
+        "manifest": 5,
+        "static_file": 4,
+        "cli": 3,
+        "descriptor": 3,
+        "cache": 2,
+        "discovery": 1,
+    }
+    left = str(existing or "").strip() or "cache"
+    right = str(new or "").strip() or "cache"
+    return right if priority.get(right, 0) >= priority.get(left, 0) else left
+
+
+def resolve_known_peers_path(
+    explicit_path: Optional[Path], profile_path: Optional[Path]
+) -> Path:
+    if explicit_path is not None:
+        return explicit_path
+    if profile_path is not None:
+        return profile_path.with_suffix(profile_path.suffix + ".known_peers.json")
+    return (Path.cwd() / ".fidonext_known_peers.json").resolve()
+
+
+def _empty_known_peer_entry(address: str, source: str = "cache") -> Dict[str, Any]:
+    return {
+        "address": str(address).strip(),
+        "source": str(source).strip() or "cache",
+        "last_success_unix": 0,
+        "last_failure_unix": 0,
+        "last_attempt_unix": 0,
+        "success_count": 0,
+        "fail_count": 0,
+        "backoff_until_unix": 0,
+    }
+
+
+def load_known_peers_file(path: Path, *, max_entries: int = DEFAULT_KNOWN_PEERS_MAX) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict) or raw.get("schema") != KNOWN_PEERS_SCHEMA:
+        return {}
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    max_allowed = max(1, int(max_entries))
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        address = str(item.get("address") or "").strip()
+        if not address or address in result:
+            continue
+        entry = _empty_known_peer_entry(address, str(item.get("source") or "cache"))
+        entry["last_success_unix"] = max(0, int(item.get("last_success_unix", 0)))
+        entry["last_failure_unix"] = max(0, int(item.get("last_failure_unix", 0)))
+        entry["last_attempt_unix"] = max(0, int(item.get("last_attempt_unix", 0)))
+        entry["success_count"] = max(0, int(item.get("success_count", 0)))
+        entry["fail_count"] = max(0, int(item.get("fail_count", 0)))
+        entry["backoff_until_unix"] = max(0, int(item.get("backoff_until_unix", 0)))
+        result[address] = entry
+        if len(result) >= max_allowed:
+            break
+    return result
+
+
+def _known_peer_score(entry: Dict[str, Any], now_unix: int) -> float:
+    source_weight = {
+        "manifest": 100.0,
+        "static_file": 80.0,
+        "cli": 70.0,
+        "descriptor": 75.0,
+        "cache": 55.0,
+        "discovery": 60.0,
+    }.get(str(entry.get("source") or "cache"), 50.0)
+    success_count = float(max(0, int(entry.get("success_count", 0))))
+    fail_count = float(max(0, int(entry.get("fail_count", 0))))
+    last_success = int(entry.get("last_success_unix", 0))
+    last_failure = int(entry.get("last_failure_unix", 0))
+    backoff_until = int(entry.get("backoff_until_unix", 0))
+
+    score = source_weight + min(success_count, 100.0) * 2.0 - min(fail_count, 100.0) * 5.0
+    if last_success > 0:
+        age_hours = max(0.0, float(now_unix - last_success) / 3600.0)
+        score += max(0.0, 48.0 - age_hours)
+    if last_failure > 0 and now_unix - last_failure < 600:
+        score -= 20.0
+    if backoff_until > now_unix:
+        score -= 1000.0
+    return score
+
+
+def save_known_peers_file(
+    path: Path,
+    entries: Dict[str, Dict[str, Any]],
+    *,
+    max_entries: int = DEFAULT_KNOWN_PEERS_MAX,
+) -> None:
+    now_unix = int(time.time())
+    ranked = sorted(
+        entries.values(),
+        key=lambda item: _known_peer_score(item, now_unix),
+        reverse=True,
+    )
+    limit = max(1, int(max_entries))
+    payload = {
+        "schema": KNOWN_PEERS_SCHEMA,
+        "updated_at_unix": now_unix,
+        "entries": ranked[:limit],
+    }
+    if path.parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def build_bootstrap_candidates(
+    seed_sources: Dict[str, str],
+    known_peers: Dict[str, Dict[str, Any]],
+    *,
+    max_candidates: int = DEFAULT_KNOWN_PEERS_MAX,
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for address, entry in known_peers.items():
+        merged[address] = dict(entry)
+    for address, source in seed_sources.items():
+        existing = merged.get(address)
+        if existing is None:
+            merged[address] = _empty_known_peer_entry(address, source)
+            continue
+        existing["source"] = merge_peer_source(str(existing.get("source") or "cache"), source)
+        merged[address] = existing
+
+    now_unix = int(time.time())
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: _known_peer_score(item, now_unix),
+        reverse=True,
+    )
+    return ranked[: max(1, int(max_candidates))]
+
+
+def dial_bootstrap_top_k(
+    node: "Node",
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    startup_dial_k: int = DEFAULT_STARTUP_DIAL_K,
+    startup_dial_workers: int = DEFAULT_STARTUP_DIAL_WORKERS,
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+    top_k = max(1, int(startup_dial_k))
+    selected = list(candidates[:top_k])
+    workers = max(1, min(int(startup_dial_workers), MAX_STARTUP_DIAL_WORKERS, len(selected)))
+    results: List[Dict[str, Any]] = []
+
+    def _dial(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        address = str(candidate.get("address") or "").strip()
+        source = str(candidate.get("source") or "cache")
+        if not address:
+            return {"address": address, "source": source, "success": False, "error": "empty address"}
+        try:
+            node.dial(address)
+            return {"address": address, "source": source, "success": True, "error": None}
+        except RuntimeError as exc:
+            return {"address": address, "source": source, "success": False, "error": str(exc)}
+
+    if workers == 1:
+        for candidate in selected:
+            results.append(_dial(candidate))
+        return results
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_dial, candidate) for candidate in selected]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+
+def update_known_peers_after_dial(
+    known_peers: Dict[str, Dict[str, Any]],
+    dial_results: Sequence[Dict[str, Any]],
+) -> None:
+    now_unix = int(time.time())
+    for item in dial_results:
+        address = str(item.get("address") or "").strip()
+        if not address:
+            continue
+        source = str(item.get("source") or "cache")
+        success = bool(item.get("success"))
+        entry = dict(known_peers.get(address) or _empty_known_peer_entry(address, source))
+        entry["source"] = merge_peer_source(str(entry.get("source") or "cache"), source)
+        entry["last_attempt_unix"] = now_unix
+        if success:
+            entry["last_success_unix"] = now_unix
+            entry["success_count"] = max(0, int(entry.get("success_count", 0))) + 1
+            entry["fail_count"] = 0
+            entry["backoff_until_unix"] = 0
+        else:
+            fail_count = max(0, int(entry.get("fail_count", 0))) + 1
+            backoff = min(1800, 2 ** min(fail_count, 10))
+            entry["last_failure_unix"] = now_unix
+            entry["fail_count"] = fail_count
+            entry["backoff_until_unix"] = now_unix + backoff
+        known_peers[address] = entry
 
 
 def parse_seed(seed_hex: str) -> bytes:
@@ -405,6 +1193,7 @@ class Node:
         self,
         *,
         use_quic: bool = False,
+        use_websocket: bool = False,
         enable_relay_hop: bool = False,
         bootstrap_peers: Optional[Sequence[str]] = None,
         identity_seed: Optional[bytes] = None,
@@ -431,14 +1220,25 @@ class Node:
             seed_ptr = None
             seed_len = 0
 
-        pointer = lib.cabi_node_new(
-            ctypes.c_bool(use_quic),
-            ctypes.c_bool(enable_relay_hop),
-            bootstrap_ptr,
-            ctypes.c_size_t(len(bootstrap_peers)),
-            seed_ptr,
-            ctypes.c_size_t(seed_len),
-        )
+        if use_websocket:
+            pointer = lib.cabi_node_new_v2(
+                ctypes.c_bool(use_quic),
+                ctypes.c_bool(use_websocket),
+                ctypes.c_bool(enable_relay_hop),
+                bootstrap_ptr,
+                ctypes.c_size_t(len(bootstrap_peers)),
+                seed_ptr,
+                ctypes.c_size_t(seed_len),
+            )
+        else:
+            pointer = lib.cabi_node_new(
+                ctypes.c_bool(use_quic),
+                ctypes.c_bool(enable_relay_hop),
+                bootstrap_ptr,
+                ctypes.c_size_t(len(bootstrap_peers)),
+                seed_ptr,
+                ctypes.c_size_t(seed_len),
+            )
         if not pointer:
             raise RuntimeError("cabi_node_new returned NULL, check Rust logs")
         self._ptr = ctypes.c_void_p(pointer)
@@ -730,6 +1530,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable the QUIC transport (otherwise TCP).",
     )
     parser.add_argument(
+        "--use-ws",
+        action="store_true",
+        help="Enable the WebSocket transport (allows /ws multiaddrs).",
+    )
+    parser.add_argument(
         "--force-hop",
         action="store_true",
         help="Relay only: enable hop without waiting for AutoNAT PUBLIC.",
@@ -743,6 +1548,83 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Bootstrap peer multiaddr (repeatable).",
+    )
+    parser.add_argument(
+        "--bootstrap-file",
+        action="append",
+        default=[],
+        help="Path to text file with bootstrap multiaddrs (one per line, repeatable).",
+    )
+    parser.add_argument(
+        "--bootstrap-manifest",
+        action="append",
+        default=[],
+        help="Signed bootstrap-manifest JSON path (repeatable; newest valid version wins).",
+    )
+    parser.add_argument(
+        "--manifest-allowed-signing-key",
+        action="append",
+        default=[],
+        help="Trusted manifest signer key (base64 protobuf-encoded libp2p public key).",
+    )
+    parser.add_argument(
+        "--manifest-allowed-signing-key-file",
+        action="append",
+        default=[],
+        help="File with trusted manifest signer keys, one base64 key per line (repeatable).",
+    )
+    parser.add_argument(
+        "--manifest-state-file",
+        help="Path to anti-rollback state for bootstrap manifests.",
+    )
+    parser.add_argument(
+        "--allow-manifest-rollback",
+        action="store_true",
+        help="Allow applying manifest versions <= stored anti-rollback version (debug only).",
+    )
+    parser.add_argument(
+        "--known-peers-file",
+        help="Path to known_peers.json cache (defaults near profile or cwd).",
+    )
+    parser.add_argument(
+        "--known-peers-max",
+        type=int,
+        default=DEFAULT_KNOWN_PEERS_MAX,
+        help="Maximum number of known peers kept in cache.",
+    )
+    parser.add_argument(
+        "--startup-dial-k",
+        type=int,
+        default=DEFAULT_STARTUP_DIAL_K,
+        help="How many top-ranked bootstrap candidates to dial on startup.",
+    )
+    parser.add_argument(
+        "--startup-dial-workers",
+        type=int,
+        default=DEFAULT_STARTUP_DIAL_WORKERS,
+        help="Parallel workers used to dial startup bootstrap candidates.",
+    )
+    parser.add_argument(
+        "--relay-descriptor-ttl-seconds",
+        type=int,
+        default=DEFAULT_RELAY_DESCRIPTOR_TTL_SECONDS,
+        help="TTL for published relay descriptor record in DHT.",
+    )
+    parser.add_argument(
+        "--relay-descriptor-query-max",
+        type=int,
+        default=DEFAULT_RELAY_DESCRIPTOR_QUERY_MAX,
+        help="Maximum relay descriptor DHT lookups during startup.",
+    )
+    parser.add_argument(
+        "--disable-relay-descriptor-discovery",
+        action="store_true",
+        help="Skip fetching relay descriptors from DHT during startup.",
+    )
+    parser.add_argument(
+        "--disable-relay-descriptor-publish",
+        action="store_true",
+        help="Relay mode: do not publish signed relay descriptor to DHT.",
     )
     parser.add_argument(
         "--target",
@@ -852,7 +1734,12 @@ def main() -> None:
         profile_path_obj is not None
     )
 
-    listen_addr = args.listen or default_listen(args.use_quic)
+    if args.listen:
+        listen_addr = args.listen
+    elif args.use_ws:
+        listen_addr = "/ip4/127.0.0.1/tcp/41000/ws"
+    else:
+        listen_addr = default_listen(args.use_quic)
     identity_seed: Optional[bytes] = None
     if args.profile and (args.seed or args.seed_phrase):
         raise ValueError("--profile cannot be combined with --seed or --seed-phrase")
@@ -869,11 +1756,68 @@ def main() -> None:
     elif args.seed_phrase:
         identity_seed = derive_seed_from_phrase(args.seed_phrase)
 
+    bootstrap_seed_sources: Dict[str, str] = {}
+    for addr in args.bootstrap:
+        normalized = _normalize_multiaddrs([addr])
+        if not normalized:
+            continue
+        current = bootstrap_seed_sources.get(normalized[0], "cli")
+        bootstrap_seed_sources[normalized[0]] = merge_peer_source(current, "cli")
+    for file_path in args.bootstrap_file:
+        path = Path(file_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"bootstrap file not found: {path}")
+        for addr in load_text_list_file(path):
+            normalized = _normalize_multiaddrs([addr])
+            if not normalized:
+                continue
+            current = bootstrap_seed_sources.get(normalized[0], "static_file")
+            bootstrap_seed_sources[normalized[0]] = merge_peer_source(current, "static_file")
+
+    manifest_paths: List[Path] = [
+        Path(item).expanduser().resolve() for item in args.bootstrap_manifest
+    ]
+    trusted_manifest_signers: List[str] = list(args.manifest_allowed_signing_key)
+    for file_path in args.manifest_allowed_signing_key_file:
+        path = Path(file_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"manifest signer key file not found: {path}")
+        trusted_manifest_signers.extend(load_text_list_file(path))
+
+    manifest_state_path: Optional[Path] = (
+        Path(args.manifest_state_file).expanduser().resolve()
+        if args.manifest_state_file
+        else None
+    )
+    manifest_bootstrap_addresses = load_bootstrap_from_manifests(
+        manifest_paths,
+        allowed_signing_keys_b64=trusted_manifest_signers,
+        state_path=manifest_state_path,
+        allow_rollback=args.allow_manifest_rollback,
+    )
+    for addr in manifest_bootstrap_addresses:
+        normalized = _normalize_multiaddrs([addr])
+        if not normalized:
+            continue
+        current = bootstrap_seed_sources.get(normalized[0], "manifest")
+        bootstrap_seed_sources[normalized[0]] = merge_peer_source(current, "manifest")
+
+    bootstrap_seed_addresses = list(bootstrap_seed_sources.keys())
+    known_peers_path = resolve_known_peers_path(
+        Path(args.known_peers_file).expanduser().resolve() if args.known_peers_file else None,
+        profile_path_obj,
+    )
+    known_peers = load_known_peers_file(
+        known_peers_path,
+        max_entries=max(1, int(args.known_peers_max)),
+    )
+
     def build_node(enable_hop: bool) -> Node:
         return Node(
             use_quic=args.use_quic,
+            use_websocket=args.use_ws,
             enable_relay_hop=enable_hop,
-            bootstrap_peers=args.bootstrap,
+            bootstrap_peers=bootstrap_seed_addresses,
             identity_seed=identity_seed,
         )
 
@@ -894,7 +1838,8 @@ def main() -> None:
     try:
         enable_initial_hop = args.role == "relay" and args.force_hop
         node = build_node(enable_initial_hop)
-        print(f"Local PeerId: {node.local_peer_id()}")
+        local_peer_id = node.local_peer_id()
+        print(f"Local PeerId: {local_peer_id}")
 
         node.listen(listen_addr)
 
@@ -909,12 +1854,93 @@ def main() -> None:
                     print("AutoNAT PUBLIC detected. Restarting relay with hop enabled.")
                     node.close()
                     node = build_node(True)
-                    print(f"Local PeerId: {node.local_peer_id()}")
+                    local_peer_id = node.local_peer_id()
+                    print(f"Local PeerId: {local_peer_id}")
                     node.listen(listen_addr)
                 else:
                     print("AutoNAT did not report PUBLIC; continuing without hop.")
 
-        dial_peers(node, args.bootstrap, "bootstrap")
+        if args.role == "relay" and not args.disable_relay_descriptor_publish:
+            descriptor = publish_relay_descriptor(
+                node,
+                local_peer_id=local_peer_id,
+                listen_addrs=[listen_addr],
+                identity_seed=identity_seed,
+                ttl_seconds=max(60, int(args.relay_descriptor_ttl_seconds)),
+            )
+            if descriptor is None:
+                print(
+                    "[relay-descriptor] skipped: identity seed is required for signing",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[relay-descriptor] published"
+                    f" key={relay_descriptor_dht_key(local_peer_id).decode('utf-8')}"
+                    f" addrs={len(descriptor.get('listen_addrs') or [])}"
+                    f" ttl={int(args.relay_descriptor_ttl_seconds)}",
+                    flush=True,
+                )
+
+        if not args.disable_relay_descriptor_discovery:
+            candidate_peer_ids: List[str] = []
+            for addr in bootstrap_seed_addresses:
+                peer_id = extract_peer_id_from_multiaddr(addr)
+                if peer_id:
+                    candidate_peer_ids.append(peer_id)
+            for addr in known_peers.keys():
+                peer_id = extract_peer_id_from_multiaddr(addr)
+                if peer_id:
+                    candidate_peer_ids.append(peer_id)
+            descriptors = discover_relay_descriptors(
+                node,
+                candidate_peer_ids,
+                max_queries=max(1, int(args.relay_descriptor_query_max)),
+            )
+            for descriptor in descriptors:
+                for addr in descriptor.get("listen_addrs") or []:
+                    normalized = _normalize_multiaddrs([str(addr)], limit=1)
+                    if not normalized:
+                        continue
+                    current = bootstrap_seed_sources.get(normalized[0], "descriptor")
+                    bootstrap_seed_sources[normalized[0]] = merge_peer_source(
+                        current, "descriptor"
+                    )
+            if descriptors:
+                print(
+                    "[relay-descriptor] discovered"
+                    f" descriptors={len(descriptors)}"
+                    f" new_addrs={len(bootstrap_seed_sources) - len(bootstrap_seed_addresses)}",
+                    flush=True,
+                )
+
+        bootstrap_candidates = build_bootstrap_candidates(
+            bootstrap_seed_sources,
+            known_peers,
+            max_candidates=max(1, int(args.known_peers_max)),
+        )
+
+        dial_results = dial_bootstrap_top_k(
+            node,
+            bootstrap_candidates,
+            startup_dial_k=max(1, int(args.startup_dial_k)),
+            startup_dial_workers=max(1, int(args.startup_dial_workers)),
+        )
+        for item in dial_results:
+            addr = item["address"]
+            if item["success"]:
+                print(f"Dialed bootstrap peer: {addr}")
+            else:
+                print(
+                    f"Failed to dial bootstrap peer {addr}: {item.get('error')}",
+                    file=sys.stderr,
+                )
+        update_known_peers_after_dial(known_peers, dial_results)
+        save_known_peers_file(
+            known_peers_path,
+            known_peers,
+            max_entries=max(1, int(args.known_peers_max)),
+        )
         dial_peers(node, args.target, "target")
 
         recv_thread = threading.Thread(

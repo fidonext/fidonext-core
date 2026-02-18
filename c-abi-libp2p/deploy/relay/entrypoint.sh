@@ -12,6 +12,10 @@ if [ "${USE_QUIC:-0}" = "1" ]; then
   CMD="$CMD --use-quic"
 fi
 
+if [ "${USE_WS:-0}" = "1" ]; then
+  CMD="$CMD --use-ws"
+fi
+
 if [ -n "${SEED_PHRASE:-}" ]; then
   CMD="$CMD --seed-phrase \"${SEED_PHRASE}\""
 elif [ -n "${SEED_HEX:-}" ]; then

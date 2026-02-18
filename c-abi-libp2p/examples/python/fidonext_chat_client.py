@@ -42,11 +42,22 @@ from ping_standalone_nodes import (  # noqa: E402
     CABI_STATUS_SUCCESS,
     CABI_STATUS_TIMEOUT,
     Node,
+    build_bootstrap_candidates,
+    discover_relay_descriptors,
     build_prekey_bundle,
     build_message_auto,
+    dial_bootstrap_top_k,
+    extract_peer_id_from_multiaddr,
     decrypt_message_auto,
     default_listen,
+    load_known_peers_file,
+    load_bootstrap_from_manifests,
+    load_text_list_file,
     load_or_create_identity_profile,
+    merge_peer_source,
+    resolve_known_peers_path,
+    save_known_peers_file,
+    update_known_peers_after_dial,
     validate_prekey_bundle,
 )
 
@@ -104,13 +115,7 @@ def ensure_parent(path: Path) -> None:
 
 
 def load_bootstrap_file(path: Path) -> List[str]:
-    entries: List[str] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        entries.append(line)
-    return entries
+    return load_text_list_file(path)
 
 
 class ChatState:
@@ -1125,6 +1130,66 @@ def parse_args() -> argparse.Namespace:
         help="Path to text file with bootstrap multiaddrs (one per line, repeatable).",
     )
     parser.add_argument(
+        "--bootstrap-manifest",
+        action="append",
+        default=[],
+        help="Signed bootstrap-manifest JSON path (repeatable; newest valid version wins).",
+    )
+    parser.add_argument(
+        "--manifest-allowed-signing-key",
+        action="append",
+        default=[],
+        help="Trusted manifest signer key (base64 protobuf-encoded libp2p public key).",
+    )
+    parser.add_argument(
+        "--manifest-allowed-signing-key-file",
+        action="append",
+        default=[],
+        help="File with trusted manifest signer keys, one base64 key per line (repeatable).",
+    )
+    parser.add_argument(
+        "--manifest-state-file",
+        help="Path to anti-rollback state for bootstrap manifests (defaults near profile).",
+    )
+    parser.add_argument(
+        "--allow-manifest-rollback",
+        action="store_true",
+        help="Allow applying manifest versions <= stored anti-rollback version (debug only).",
+    )
+    parser.add_argument(
+        "--known-peers-file",
+        help="Path to known_peers.json cache (defaults near profile).",
+    )
+    parser.add_argument(
+        "--known-peers-max",
+        type=int,
+        default=1500,
+        help="Maximum number of known peers kept in cache.",
+    )
+    parser.add_argument(
+        "--startup-dial-k",
+        type=int,
+        default=8,
+        help="How many top-ranked bootstrap candidates to dial on startup.",
+    )
+    parser.add_argument(
+        "--startup-dial-workers",
+        type=int,
+        default=8,
+        help="Parallel workers used to dial startup bootstrap candidates.",
+    )
+    parser.add_argument(
+        "--relay-descriptor-query-max",
+        type=int,
+        default=24,
+        help="Maximum relay descriptor DHT lookups during startup.",
+    )
+    parser.add_argument(
+        "--disable-relay-descriptor-discovery",
+        action="store_true",
+        help="Skip fetching relay descriptors from DHT during startup.",
+    )
+    parser.add_argument(
         "--target",
         action="append",
         default=[],
@@ -1134,6 +1199,11 @@ def parse_args() -> argparse.Namespace:
         "--use-quic",
         action="store_true",
         help="Enable QUIC transport (otherwise TCP).",
+    )
+    parser.add_argument(
+        "--use-ws",
+        action="store_true",
+        help="Enable WebSocket transport (use /ws multiaddr).",
     )
     parser.add_argument(
         "--profile",
@@ -1182,7 +1252,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    listen_addr = args.listen or default_listen(args.use_quic)
+    if args.listen:
+        listen_addr = args.listen
+    elif args.use_ws:
+        listen_addr = "/ip4/127.0.0.1/tcp/41000/ws"
+    else:
+        listen_addr = default_listen(args.use_quic)
     profile_path = Path(args.profile).expanduser().resolve()
     state_path = (
         Path(args.state_file).expanduser().resolve()
@@ -1194,31 +1269,119 @@ def main() -> None:
         raise ValueError("seed options are not supported with --profile in this client")
 
     account_id, device_id, libp2p_seed, _signal_seed = load_or_create_identity_profile(profile_path)
-    bootstrap_addresses: List[str] = list(args.bootstrap)
+    bootstrap_seed_sources: Dict[str, str] = {}
+    for addr in args.bootstrap:
+        text = str(addr).strip()
+        if not text:
+            continue
+        current = bootstrap_seed_sources.get(text, "cli")
+        bootstrap_seed_sources[text] = merge_peer_source(current, "cli")
     for file_path in args.bootstrap_file:
         path = Path(file_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(f"bootstrap file not found: {path}")
-        bootstrap_addresses.extend(load_bootstrap_file(path))
-    # Preserve order while removing duplicates.
-    bootstrap_addresses = list(dict.fromkeys(bootstrap_addresses))
+        for addr in load_bootstrap_file(path):
+            text = str(addr).strip()
+            if not text:
+                continue
+            current = bootstrap_seed_sources.get(text, "static_file")
+            bootstrap_seed_sources[text] = merge_peer_source(current, "static_file")
+    manifest_paths: List[Path] = [
+        Path(item).expanduser().resolve() for item in args.bootstrap_manifest
+    ]
+    trusted_manifest_signers: List[str] = list(args.manifest_allowed_signing_key)
+    for file_path in args.manifest_allowed_signing_key_file:
+        path = Path(file_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"manifest signer key file not found: {path}")
+        trusted_manifest_signers.extend(load_text_list_file(path))
+    manifest_state_path = (
+        Path(args.manifest_state_file).expanduser().resolve()
+        if args.manifest_state_file
+        else profile_path.with_suffix(profile_path.suffix + ".manifest_state.json")
+    )
+    manifest_bootstrap_addresses = load_bootstrap_from_manifests(
+        manifest_paths,
+        allowed_signing_keys_b64=trusted_manifest_signers,
+        state_path=manifest_state_path,
+        allow_rollback=args.allow_manifest_rollback,
+    )
+    for addr in manifest_bootstrap_addresses:
+        text = str(addr).strip()
+        if not text:
+            continue
+        current = bootstrap_seed_sources.get(text, "manifest")
+        bootstrap_seed_sources[text] = merge_peer_source(current, "manifest")
+    bootstrap_seed_addresses = list(dict.fromkeys(bootstrap_seed_sources.keys()))
+
+    known_peers_path = resolve_known_peers_path(
+        Path(args.known_peers_file).expanduser().resolve() if args.known_peers_file else None,
+        profile_path,
+    )
+    known_peers = load_known_peers_file(
+        known_peers_path,
+        max_entries=max(1, int(args.known_peers_max)),
+    )
 
     node = Node(
         use_quic=args.use_quic,
+        use_websocket=args.use_ws,
         enable_relay_hop=False,
-        bootstrap_peers=bootstrap_addresses,
+        bootstrap_peers=bootstrap_seed_addresses,
         identity_seed=libp2p_seed,
     )
     local_peer_id = node.local_peer_id()
     node.listen(listen_addr)
 
-    bootstrap_connected = False
-    for addr in bootstrap_addresses:
-        try:
-            node.dial(addr)
-            bootstrap_connected = True
-        except RuntimeError:
-            pass
+    if not args.disable_relay_descriptor_discovery:
+        candidate_peer_ids: List[str] = []
+        for addr in bootstrap_seed_addresses:
+            peer_id = extract_peer_id_from_multiaddr(addr)
+            if peer_id:
+                candidate_peer_ids.append(peer_id)
+        for addr in known_peers.keys():
+            peer_id = extract_peer_id_from_multiaddr(addr)
+            if peer_id:
+                candidate_peer_ids.append(peer_id)
+        descriptors = discover_relay_descriptors(
+            node,
+            candidate_peer_ids,
+            max_queries=max(1, int(args.relay_descriptor_query_max)),
+        )
+        for descriptor in descriptors:
+            for addr in descriptor.get("listen_addrs") or []:
+                text = str(addr).strip()
+                if not text:
+                    continue
+                current = bootstrap_seed_sources.get(text, "descriptor")
+                bootstrap_seed_sources[text] = merge_peer_source(current, "descriptor")
+        if descriptors:
+            print(
+                "[relay-descriptor] discovered"
+                f" descriptors={len(descriptors)}"
+                f" total_seed_addrs={len(bootstrap_seed_sources)}"
+            )
+
+    bootstrap_candidates = build_bootstrap_candidates(
+        bootstrap_seed_sources,
+        known_peers,
+        max_candidates=max(1, int(args.known_peers_max)),
+    )
+
+    dial_results = dial_bootstrap_top_k(
+        node,
+        bootstrap_candidates,
+        startup_dial_k=max(1, int(args.startup_dial_k)),
+        startup_dial_workers=max(1, int(args.startup_dial_workers)),
+    )
+    bootstrap_connected = any(item.get("success") for item in dial_results)
+    update_known_peers_after_dial(known_peers, dial_results)
+    save_known_peers_file(
+        known_peers_path,
+        known_peers,
+        max_entries=max(1, int(args.known_peers_max)),
+    )
+    bootstrap_addresses = list(dict.fromkeys(bootstrap_seed_sources.keys()))
     for addr in args.target:
         try:
             node.dial(addr)

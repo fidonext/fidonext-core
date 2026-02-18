@@ -12,6 +12,12 @@ docker compose logs -f relay
 ```
 
 The relay listens on `/ip4/0.0.0.0/tcp/41000` by default.
+To run relay over WebSocket, set:
+
+```env
+USE_WS=1
+LISTEN_ADDR=/ip4/0.0.0.0/tcp/41000/ws
+```
 
 For global deployments run multiple copies of this stack on separate servers
 (preferably different countries/providers). Use the resulting relay multiaddrs
@@ -55,6 +61,7 @@ LISTEN_ADDR=/ip4/0.0.0.0/tcp/41000
 RELAY_PORT_TCP=41000
 PROFILE_PATH=/data/relay.profile.json
 USE_QUIC=0
+USE_WS=0
 BOOTSTRAP_PEERS=
 EXTRA_ARGS=
 ```
@@ -106,6 +113,9 @@ fidonext-bootstrap-address
 The command prints:
 `/ip4/<PUBLIC_IP>/tcp/41000/p2p/<RELAY_PEER_ID>`
 
+If `USE_WS=1`, the printed address includes `/ws`:
+`/ip4/<PUBLIC_IP>/tcp/41000/ws/p2p/<RELAY_PEER_ID>`
+
 Use this exact line in clients' `bootstrap_global.txt`.
 
 Notes for cloud-init mode:
@@ -144,6 +154,7 @@ LISTEN_ADDR=/ip4/0.0.0.0/tcp/41000
 RELAY_PORT_TCP=41000
 PROFILE_PATH=/data/relay.profile.json
 USE_QUIC=0
+USE_WS=0
 BOOTSTRAP_PEERS=
 EXTRA_ARGS=
 ```
@@ -176,6 +187,8 @@ Copy the printed value to `bootstrap_global.txt`.
   (default: `/data/relay.profile.json`)
 - `BOOTSTRAP_PEERS` - comma-separated bootstrap multiaddrs
 - `USE_QUIC` - set to `1` to enable QUIC
+- `USE_WS` - set to `1` to enable WebSocket transport (`--use-ws`)
+- `LISTEN_ADDR` with WebSocket - use `/ip4/0.0.0.0/tcp/41000/ws` when `USE_WS=1`
 - `SEED_PHRASE` - optional deterministic seed phrase (mutually exclusive with profile)
 - `SEED_HEX` - optional deterministic 32-byte hex seed (mutually exclusive with profile)
 - `EXTRA_ARGS` - additional args forwarded to relay CLI command
@@ -186,4 +199,21 @@ Copy the printed value to `bootstrap_global.txt`.
   immediately.
 - Identity/profile data is persisted in the `relay-data` volume.
 - If both `SEED_*` and `PROFILE_PATH` are provided, `SEED_*` takes precedence.
+
+## Optional: publish relay as WSS on 443
+
+For censorship resistance, a practical setup is:
+
+- internal relay listener: `/ip4/0.0.0.0/tcp/41000/ws`
+- public endpoint: `443/tcp` with TLS via reverse proxy (for example Caddy)
+
+Client bootstrap line then uses a domain-based multiaddr, for example:
+
+`/dns4/relay.example.org/tcp/443/wss/p2p/<RELAY_PEER_ID>`
+
+The reverse proxy should terminate TLS and forward WebSocket traffic to relay's
+internal port `41000`.
+
+Minimal Caddy config is provided in:
+`c-abi-libp2p/deploy/relay/Caddyfile.example`
 

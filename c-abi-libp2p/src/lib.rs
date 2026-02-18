@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ::libp2p::{autonat, Multiaddr, PeerId};
+use ::libp2p::{autonat, identity, Multiaddr, PeerId};
 use anyhow::{Context, Result};
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 
@@ -237,6 +237,140 @@ pub extern "C" fn cabi_init_tracing() -> c_int {
             CABI_STATUS_INTERNAL_ERROR
         }
     }
+}
+
+#[no_mangle]
+/// C-ABI. Verifies detached signature using a libp2p protobuf-encoded public key.
+///
+/// Inputs:
+/// - `public_key_ptr/public_key_len`: protobuf-encoded public key bytes.
+/// - `message_ptr/message_len`: signed payload bytes.
+/// - `signature_ptr/signature_len`: detached signature bytes.
+///
+/// Returns:
+/// - `CABI_STATUS_SUCCESS` when signature is valid.
+/// - `CABI_STATUS_INVALID_ARGUMENT` when verification fails or input is malformed.
+pub extern "C" fn cabi_identity_verify_signature(
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+    signature_ptr: *const u8,
+    signature_len: usize,
+) -> c_int {
+    let public_key_bytes = match parse_payload(public_key_ptr, public_key_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let message = match parse_payload(message_ptr, message_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let signature = match parse_payload(signature_ptr, signature_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let public_key = match identity::PublicKey::try_decode_protobuf(&public_key_bytes) {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+
+    if public_key.verify(&message, &signature) {
+        CABI_STATUS_SUCCESS
+    } else {
+        CABI_STATUS_INVALID_ARGUMENT
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Derives protobuf-encoded public key bytes from a 32-byte Ed25519 seed.
+pub extern "C" fn cabi_identity_public_key_from_seed(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    out_written_len: *mut usize,
+) -> c_int {
+    if seed_ptr.is_null() || out_buffer.is_null() || out_written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if seed_len != 32 || out_buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    let seed_bytes = unsafe { slice::from_raw_parts(seed_ptr, seed_len) };
+    let seed: [u8; 32] = match seed_bytes.try_into() {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let secret = match identity::ed25519::SecretKey::try_from_bytes(seed) {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let keypair = identity::ed25519::Keypair::from(secret);
+    let public_key = identity::Keypair::from(keypair).public();
+    let encoded = public_key.encode_protobuf();
+    write_bytes(&encoded, out_buffer, out_buffer_len, out_written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Signs payload with Ed25519 key derived from 32-byte seed.
+pub extern "C" fn cabi_identity_sign_with_seed(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    out_signature: *mut u8,
+    out_signature_len: usize,
+    out_written_len: *mut usize,
+) -> c_int {
+    if seed_ptr.is_null() || payload_ptr.is_null() || out_signature.is_null() || out_written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if seed_len != 32 || payload_len == 0 || out_signature_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    let seed_bytes = unsafe { slice::from_raw_parts(seed_ptr, seed_len) };
+    let seed: [u8; 32] = match seed_bytes.try_into() {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let secret = match identity::ed25519::SecretKey::try_from_bytes(seed) {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let keypair = identity::ed25519::Keypair::from(secret);
+    let keypair = identity::Keypair::from(keypair);
+    let payload = unsafe { slice::from_raw_parts(payload_ptr, payload_len) };
+    let signature = match keypair.sign(payload) {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INTERNAL_ERROR,
+    };
+    write_bytes(&signature, out_signature, out_signature_len, out_written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Derives PeerId string from protobuf-encoded public key bytes.
+pub extern "C" fn cabi_identity_peer_id_from_public_key(
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+    out_buffer: *mut c_char,
+    out_buffer_len: usize,
+    out_written_len: *mut usize,
+) -> c_int {
+    if public_key_ptr.is_null() || out_buffer.is_null() || out_written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if public_key_len == 0 || out_buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    let public_key_bytes = unsafe { slice::from_raw_parts(public_key_ptr, public_key_len) };
+    let public_key = match identity::PublicKey::try_decode_protobuf(public_key_bytes) {
+        Ok(value) => value,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let peer_id = PeerId::from(public_key).to_string();
+    write_c_string(peer_id.as_str(), out_buffer, out_buffer_len, out_written_len)
 }
 
 #[no_mangle]
@@ -1114,6 +1248,65 @@ pub extern "C" fn cabi_node_new(
 
     let config = transport::TransportConfig {
         use_quic,
+        hop_relay: enable_relay_hop,
+        identity_seed,
+        ..Default::default()
+    };
+
+    match ManagedNode::new(config, bootstrap_peers) {
+        Ok(node) => {
+            let boxed = Box::new(node);
+            Box::into_raw(boxed) as *mut CabiNodeHandle
+        }
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to create node");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Creates a new node instance (v2) with optional WebSocket transport enabled.
+///
+/// - When `use_websocket=true`, the node can listen/dial `/.../tcp/.../ws` multiaddrs.
+/// - WSS (`/wss`) is typically achieved by running a TLS reverse-proxy (Caddy/Nginx)
+///   in front of the node and forwarding to its `/ws` listener.
+pub extern "C" fn cabi_node_new_v2(
+    use_quic: bool,
+    use_websocket: bool,
+    enable_relay_hop: bool,
+    bootstrap_peers: *const *const c_char,
+    bootstrap_peers_len: usize,
+    identity_seed_ptr: *const u8,
+    identity_seed_len: usize,
+) -> *mut CabiNodeHandle {
+    let bootstrap_peers = match parse_bootstrap_peers(bootstrap_peers, bootstrap_peers_len) {
+        Ok(peers) => peers,
+        Err(status) => {
+            tracing::error!(
+                target: "ffi",
+                status,
+                "failed to parse bootstrap peers; node creation aborted"
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let identity_seed = match parse_identity_seed(identity_seed_ptr, identity_seed_len) {
+        Ok(seed) => seed,
+        Err(status) => {
+            tracing::error!(
+                target: "ffi",
+                status,
+                "invalid identity seed provided; node creation aborted"
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let config = transport::TransportConfig {
+        use_quic,
+        use_websocket,
         hop_relay: enable_relay_hop,
         identity_seed,
         ..Default::default()
