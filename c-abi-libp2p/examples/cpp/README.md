@@ -1,83 +1,127 @@
-# ping (C++ ↔ Rust libp2p C-ABI)
+# ping (C++ standalone ↔ Rust libp2p C-ABI)
 
-Small C++ CLI that loads a node via Rust `cabi_rust_libp2p` lib through a C-ABI and lets you:
-- run a node as **relay** or **leaf**
-- `listen` on a multiaddr
-- `dial` bootstrap/target peers
-- send/receive payloads via an internal message queue
-- (relay) optionally enable **hop relay** when AutoNAT reports PUBLIC (or force it)
+`examples/cpp/ping` now mirrors the core standalone scenario of
+`examples/python/ping_standalone_nodes.py`: same primary role/transport/identity
+switches, same relay hop decision flow (force-hop vs AutoNAT wait), and a
+matching interactive/receive-only console lifecycle.
 
-## Requirements
+## Supported CLI options (parity scope)
 
-- C++17 compiler (MSVC / clang / g++)
-- CMake
-- Rust shared library built:
-  - Linux: `libcabi_rust_libp2p.so`
-  - Windows: `cabi_rust_libp2p.dll`
+- `--role relay|leaf` (default: `leaf`)
+  - `relay`: can enable hop relay support.
+  - `leaf`: regular peer behavior.
+- `--use-quic`
+  - Uses QUIC transport and defaults listen address to
+    `/ip4/127.0.0.1/udp/41000/quic-v1`.
+- `--use-ws`
+  - Uses WebSocket transport via `cabi_node_new_v2` and defaults listen address
+    to `/ip4/127.0.0.1/tcp/41000/ws`.
+  - Mutually exclusive with `--use-quic`.
+- `--force-hop`
+  - Relay-only: start with hop enabled immediately (no AutoNAT wait).
+- `--listen <multiaddr>`
+  - Explicit listen multiaddr (overrides transport-based defaults).
+- `--bootstrap <multiaddr>` (repeatable)
+  - Peers used for startup dial and relay reservation fallback.
+- `--target <multiaddr>` (repeatable)
+  - Additional peers dialed after bootstrap peers.
+- `--seed <64-hex>`
+  - Deterministic 32-byte identity seed.
+- `--seed-phrase <text>`
+  - Deterministic 32-byte identity seed derived from text.
+  - Mutually exclusive with `--seed`.
+
+> Note: Python standalone has many extra flags (manifest/known-peers/libsignal/scripted message).
+> The C++ example intentionally keeps parity for the standalone ping workflow
+> available through this ABI demo.
+
+## Runtime flow (Python-aligned order)
+
+1. Parse/normalize CLI arguments.
+2. Create node with initial hop policy:
+   - relay + `--force-hop` => hop enabled at creation;
+   - otherwise hop disabled initially.
+3. Print `Local PeerId`.
+4. Listen on selected multiaddr (`Attempting to listen...` then `Listening on ...`).
+5. Relay role:
+   - `--force-hop`: print force-hop confirmation;
+   - otherwise wait up to 10s for PUBLIC AutoNAT:
+     - on `PUBLIC`: print `AutoNAT: PUBLIC`, restart node with hop enabled,
+       print `Local PeerId`, listen again;
+     - on timeout/non-public: print continuation message and attempt relay
+       reservations on bootstrap peers.
+6. Dial bootstrap peers, then target peers.
+7. Start receive loop and then:
+   - interactive stdin: prompt/send loop;
+   - non-interactive stdin: receive-only mode until Ctrl+C.
+
+## Console UX expectations
+
+- Core status lines are aligned with Python semantics and ordering:
+  - `Local PeerId: ...`
+  - `Attempting to listen on ...`
+  - `Listening on ...`
+  - `Waiting up to 10s for PUBLIC AutoNAT status before enabling relay hop...`
+  - `AutoNAT: PUBLIC|PRIVATE|UNKNOWN`
+  - `AutoNAT PUBLIC detected. Restarting relay with hop enabled.`
+  - `AutoNAT did not report PUBLIC; continuing without hop.`
+  - `Dialed bootstrap peer: ...`, `Dialed target peer: ...`
+  - `Received payload: '...'`
+  - `Enter payload (empty line or /quit to exit):`
+  - `STDIN is non-interactive; running receive-only mode. Press Ctrl+C to exit.`
 
 ## Build
-### Builiding with MSVC
-```
+
+### MSVC / Visual Studio
+
+```bash
 cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
 
-### Building with GCC/clang
-```
-mkdir build-release
-cd build-release
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build .
+### GCC / Clang
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
 ```
 
-### Building with Docker
-```
+### Docker example build
+
+```bash
 docker compose up --build cpp-build
 ```
 
-## Use
-### Quick Start
-1. Copy .dll or .so of the cabi-rust-libp2p into folder near executable
-2. Run through cmd/terminal
-3. `./ping --role relay --force-hop --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one`
-4. `./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<RELAY_IP>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a --target /ip4/<PEERB_IP>/tcp/41000/p2p/<PEERB_ID>`
-5. `./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<RELAY_IP>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a --target /ip4/<PEERA_IP>/tcp/41000/p2p/<PEERA_ID>`
+## Run scenarios
 
-### Running a relay + two peers (deterministic IDs)
+1. Relay (forced hop):
 
-You can pin the `PeerId` of each node by supplying either a 32-byte hex seed
-(`--seed <64 hex chars>`) **or** a human-friendly seed phrase that is
-deterministically expanded to 32 bytes (`--seed-phrase <string>`). This allows
-you to pre-compute relay/peer multiaddrs and wire them together reproducibly:
+```bash
+./ping --role relay --force-hop --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one
+```
 
-1. Start the public relay (waits for PUBLIC AutoNAT and restarts with hop):
-   ```
-   ./ping --role relay --force-hop --listen /ip4/0.0.0.0/tcp/41000 --seed-phrase relay-one
-   ```
-   Note the `Local PeerId` printed to the console; call it `<RELAY_ID>`.
+2. Leaf A bootstrapping via relay:
 
-2. Start peer A with a fixed seed, dialing the relay as a bootstrap peer:
-   ```
-   ./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a
-   ```
-   The logged `Local PeerId` for this node is `<PEER_A_ID>`.
+```bash
+./ping --listen /ip4/0.0.0.0/tcp/41001 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-a
+```
 
-3. Start peer B the same way (different seed) and bootstrap through the relay:
-   ```
-   ./ping --listen /ip4/0.0.0.0/tcp/41002 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-b
-   ```
-   Its `Local PeerId` is `<PEER_B_ID>`.
+3. Leaf B bootstrapping via relay and dialing A:
 
-Once the relay reports PUBLIC reachability and the peers have dialed the relay
-bootstrap address, they will exchange gossipsub messages via the relay. Enter
-text in either peer terminal to broadcast payloads.
+```bash
+./ping --listen /ip4/0.0.0.0/tcp/41002 --bootstrap /ip4/<relay-ip>/tcp/41000/p2p/<RELAY_ID> --seed-phrase peer-b --target /ip4/<peer-a-ip>/tcp/41001/p2p/<PEER_A_ID>
+```
 
-### Bootstrap peers (manual)
-Optional bootstrapping is also supported via `--bootstrap <multiaddr>`, which
-can be specified multiple times. The example feeds these peers directly into
-node creation so they are registered with Kademlia and bootstrapped immediately.
+4. WebSocket transport variant:
 
-### Relay hop restart
-The example polls AutoNAT for up to 10 seconds. If the node reports **public**
-reachability, it automatically restarts with relay hop enabled and continues
-with the ping dial using the same bootstrap list.
+```bash
+./ping --role relay --use-ws --listen /ip4/0.0.0.0/tcp/41000/ws --force-hop
+```
+
+## Platform notes
+
+- Dynamic loading abstraction (`dyn_lib.*`) is preserved; no Linux-only runtime
+  dependency was introduced.
+- Default library name remains platform-specific:
+  - Windows: `cabi_rust_libp2p.dll`
+  - non-Windows: `./libcabi_rust_libp2p.so`

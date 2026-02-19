@@ -17,6 +17,10 @@ std::string statusMessage(const int status)
       return "Queue empty";
     case CABI_STATUS_BUFFER_TOO_SMALL:
       return "Provided buffer too small";
+    case CABI_STATUS_TIMEOUT:
+      return "Operation timed out";
+    case CABI_STATUS_NOT_FOUND:
+      return "Requested value was not found";
     default:
       return "Internal error - inspect Rust logs for details";
   }
