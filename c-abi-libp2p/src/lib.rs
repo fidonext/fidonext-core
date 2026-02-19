@@ -58,6 +58,8 @@ pub const CABI_STATUS_NOT_FOUND: c_int = 7;
 
 /// Fixed seed length used by E2EE identity profile APIs.
 pub const CABI_IDENTITY_SEED_LEN: c_int = e2ee::IDENTITY_SEED_LEN as c_int;
+/// Fixed key length used by per-chunk file encryption APIs.
+pub const CABI_E2EE_FILE_KEY_LEN: c_int = e2ee::FILE_KEY_LEN as c_int;
 /// Unknown decrypted E2EE message kind.
 pub const CABI_E2EE_MESSAGE_KIND_UNKNOWN: c_int = 0;
 /// Decrypted E2EE message was a prekey message.
@@ -1244,6 +1246,225 @@ pub extern "C" fn cabi_e2ee_decrypt_message_auto(
         written_len,
     )
 }
+
+#[no_mangle]
+/// C-ABI. Encrypts a single file chunk with AAD bound to file_id/chunk_index/sequence.
+pub extern "C" fn cabi_e2ee_encrypt_file_chunk(
+    file_key_ptr: *const u8,
+    file_key_len: usize,
+    file_id: *const c_char,
+    chunk_index: u64,
+    sequence: u64,
+    plaintext_ptr: *const u8,
+    plaintext_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let file_key_bytes = match parse_payload(file_key_ptr, file_key_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let file_key: [u8; e2ee::FILE_KEY_LEN] = match file_key_bytes.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let file_id = match parse_required_c_string(file_id) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let plaintext = match parse_payload(plaintext_ptr, plaintext_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+
+    let encoded =
+        match e2ee::encrypt_file_chunk(&file_key, &file_id, chunk_index, sequence, &plaintext) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(target: "ffi", %err, "failed to encrypt file chunk");
+                return CABI_STATUS_INVALID_ARGUMENT;
+            }
+        };
+    write_bytes(&encoded, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Decrypts and authenticates a single file chunk.
+pub extern "C" fn cabi_e2ee_decrypt_file_chunk(
+    file_key_ptr: *const u8,
+    file_key_len: usize,
+    file_id: *const c_char,
+    chunk_index: u64,
+    sequence: u64,
+    encoded_chunk_ptr: *const u8,
+    encoded_chunk_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let file_key_bytes = match parse_payload(file_key_ptr, file_key_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let file_key: [u8; e2ee::FILE_KEY_LEN] = match file_key_bytes.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let file_id = match parse_required_c_string(file_id) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let encoded_chunk = match parse_payload(encoded_chunk_ptr, encoded_chunk_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+
+    let plaintext = match e2ee::decrypt_file_chunk(
+        &file_key,
+        &file_id,
+        chunk_index,
+        sequence,
+        &encoded_chunk,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to decrypt file chunk");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    write_bytes(&plaintext, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Computes SHA-256 for a file without loading it entirely into memory.
+pub extern "C" fn cabi_e2ee_file_sha256(
+    file_path: *const c_char,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+) -> c_int {
+    let path = match parse_path(file_path) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let digest = match e2ee::file_integrity_sha256(&path) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to hash file");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    if out_buffer.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if out_buffer_len < digest.len() {
+        return CABI_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe { ptr::copy_nonoverlapping(digest.as_ptr(), out_buffer, digest.len()) };
+    CABI_STATUS_SUCCESS
+}
+
+#[no_mangle]
+/// C-ABI. Builds file integrity manifest (optional signature supported).
+pub extern "C" fn cabi_e2ee_build_file_manifest(
+    file_id: *const c_char,
+    total_chunks: u64,
+    file_sha256_ptr: *const u8,
+    file_sha256_len: usize,
+    signature_ptr: *const u8,
+    signature_len: usize,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let file_id = match parse_required_c_string(file_id) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let sha = match parse_payload(file_sha256_ptr, file_sha256_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let sha: [u8; 32] = match sha.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let signature = if signature_len == 0 {
+        None
+    } else {
+        match parse_payload(signature_ptr, signature_len) {
+            Ok(v) => Some(v),
+            Err(status) => return status,
+        }
+    };
+
+    let encoded = match e2ee::build_file_integrity_manifest(
+        &file_id,
+        total_chunks,
+        &sha,
+        signature.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build file manifest");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+    write_bytes(&encoded, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Verifies file integrity manifest and optional signature.
+pub extern "C" fn cabi_e2ee_verify_file_manifest(
+    manifest_ptr: *const u8,
+    manifest_len: usize,
+    file_id: *const c_char,
+    total_chunks: u64,
+    file_sha256_ptr: *const u8,
+    file_sha256_len: usize,
+    signer_public_key_ptr: *const u8,
+    signer_public_key_len: usize,
+) -> c_int {
+    let manifest = match parse_payload(manifest_ptr, manifest_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let file_id = match parse_required_c_string(file_id) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let sha = match parse_payload(file_sha256_ptr, file_sha256_len) {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let sha: [u8; 32] = match sha.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
+    };
+    let signer_public_key = if signer_public_key_len == 0 {
+        None
+    } else {
+        match parse_payload(signer_public_key_ptr, signer_public_key_len) {
+            Ok(v) => Some(v),
+            Err(status) => return status,
+        }
+    };
+
+    match e2ee::verify_file_integrity_manifest(
+        &manifest,
+        &file_id,
+        total_chunks,
+        &sha,
+        signer_public_key.as_deref(),
+    ) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to verify file manifest");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
 
 #[no_mangle]
 /// C-ABI. Returns the latest AutoNAT status observed for the node.

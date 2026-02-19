@@ -217,6 +217,61 @@ lib.cabi_e2ee_decrypt_message_auto.argtypes = [
     ctypes.POINTER(ctypes.c_int),
 ]
 lib.cabi_e2ee_decrypt_message_auto.restype = ctypes.c_int
+lib.cabi_e2ee_encrypt_file_chunk.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_e2ee_encrypt_file_chunk.restype = ctypes.c_int
+lib.cabi_e2ee_decrypt_file_chunk.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_e2ee_decrypt_file_chunk.restype = ctypes.c_int
+lib.cabi_e2ee_file_sha256.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_e2ee_file_sha256.restype = ctypes.c_int
+lib.cabi_e2ee_build_file_manifest.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+lib.cabi_e2ee_build_file_manifest.restype = ctypes.c_int
+lib.cabi_e2ee_verify_file_manifest.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_size_t,
+]
+lib.cabi_e2ee_verify_file_manifest.restype = ctypes.c_int
 lib.cabi_e2ee_libsignal_probe.argtypes = []
 lib.cabi_e2ee_libsignal_probe.restype = ctypes.c_int
 lib.cabi_identity_verify_signature.argtypes = [
@@ -1171,6 +1226,132 @@ def message_kind_name(kind: int) -> str:
         return "session"
     return "unknown"
 
+# Encrypts a single file chunk via C ABI with chunk-bound AAD context.
+def encrypt_file_chunk(
+    file_key: bytes,
+    file_id: str,
+    chunk_index: int,
+    sequence: int,
+    plaintext: Union[bytes, bytearray, str],
+) -> bytes:
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode("utf-8")
+    key_buf = (ctypes.c_ubyte * len(file_key)).from_buffer_copy(file_key)
+    plain_buf = (ctypes.c_ubyte * len(plaintext)).from_buffer_copy(plaintext)
+    output_len = max(4096, len(plaintext) * 2)
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    status = lib.cabi_e2ee_encrypt_file_chunk(
+        key_buf,
+        ctypes.c_size_t(len(file_key)),
+        file_id.encode("utf-8"),
+        ctypes.c_uint64(chunk_index),
+        ctypes.c_uint64(sequence),
+        plain_buf,
+        ctypes.c_size_t(len(plaintext)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+    )
+    _check(status, "e2ee_encrypt_file_chunk")
+    return bytes(output[: written.value])
+
+
+# Decrypts and authenticates a single file chunk via C ABI.
+def decrypt_file_chunk(
+    file_key: bytes,
+    file_id: str,
+    chunk_index: int,
+    sequence: int,
+    encoded_chunk: bytes,
+) -> bytes:
+    key_buf = (ctypes.c_ubyte * len(file_key)).from_buffer_copy(file_key)
+    chunk_buf = (ctypes.c_ubyte * len(encoded_chunk)).from_buffer_copy(encoded_chunk)
+    output_len = max(4096, len(encoded_chunk))
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    status = lib.cabi_e2ee_decrypt_file_chunk(
+        key_buf,
+        ctypes.c_size_t(len(file_key)),
+        file_id.encode("utf-8"),
+        ctypes.c_uint64(chunk_index),
+        ctypes.c_uint64(sequence),
+        chunk_buf,
+        ctypes.c_size_t(len(encoded_chunk)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+    )
+    _check(status, "e2ee_decrypt_file_chunk")
+    return bytes(output[: written.value])
+
+
+# Computes SHA-256 digest of a file via streaming C ABI helper.
+def file_sha256(file_path: Union[str, Path]) -> bytes:
+    path = Path(file_path).expanduser().resolve()
+    out = (ctypes.c_ubyte * 32)()
+    status = lib.cabi_e2ee_file_sha256(str(path).encode("utf-8"), out, ctypes.c_size_t(32))
+    _check(status, f"e2ee_file_sha256({path})")
+    return bytes(out)
+
+
+# Builds a file integrity manifest payload with optional signature bytes.
+def build_file_manifest(
+    file_id: str,
+    total_chunks: int,
+    file_sha256_digest: bytes,
+    signature: bytes = b"",
+) -> bytes:
+    sha_buf = (ctypes.c_ubyte * len(file_sha256_digest)).from_buffer_copy(file_sha256_digest)
+    sig_buf = (
+        (ctypes.c_ubyte * len(signature)).from_buffer_copy(signature)
+        if signature
+        else None
+    )
+    output_len = 4096
+    output = (ctypes.c_ubyte * output_len)()
+    written = ctypes.c_size_t(0)
+    status = lib.cabi_e2ee_build_file_manifest(
+        file_id.encode("utf-8"),
+        ctypes.c_uint64(total_chunks),
+        sha_buf,
+        ctypes.c_size_t(len(file_sha256_digest)),
+        sig_buf,
+        ctypes.c_size_t(len(signature)),
+        output,
+        ctypes.c_size_t(output_len),
+        ctypes.byref(written),
+    )
+    _check(status, "e2ee_build_file_manifest")
+    return bytes(output[: written.value])
+
+
+# Verifies manifest fields and optional signer public key via C ABI.
+def verify_file_manifest(
+    manifest: bytes,
+    file_id: str,
+    total_chunks: int,
+    file_sha256_digest: bytes,
+    signer_public_key: bytes = b"",
+) -> None:
+    manifest_buf = (ctypes.c_ubyte * len(manifest)).from_buffer_copy(manifest)
+    sha_buf = (ctypes.c_ubyte * len(file_sha256_digest)).from_buffer_copy(file_sha256_digest)
+    key_buf = (
+        (ctypes.c_ubyte * len(signer_public_key)).from_buffer_copy(signer_public_key)
+        if signer_public_key
+        else None
+    )
+    status = lib.cabi_e2ee_verify_file_manifest(
+        manifest_buf,
+        ctypes.c_size_t(len(manifest)),
+        file_id.encode("utf-8"),
+        ctypes.c_uint64(total_chunks),
+        sha_buf,
+        ctypes.c_size_t(len(file_sha256_digest)),
+        key_buf,
+        ctypes.c_size_t(len(signer_public_key)),
+    )
+    _check(status, "e2ee_verify_file_manifest")
 
 def run_libsignal_probe() -> None:
     status = lib.cabi_e2ee_libsignal_probe()
