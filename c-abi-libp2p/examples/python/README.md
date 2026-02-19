@@ -286,6 +286,7 @@ identity registration and persistent chat/contact state.
 - publishes/refreshes own DHT directory card (`peer_id + account_id + address`)
 - resolves peer by unique id from DHT (`/lookup`, `/connectid`)
 - supports simple chat commands (`/contacts`, `/chats`, `/chat use`, `/send`)
+- supports E2EE file transfer commands (`/file send|accept|reject|status|resume|cancel`)
 - supports optional per-contact libsignal encryption using recipient prekey
   bundle file (`/contact bundle <peer> <bundle.json>`)
 
@@ -310,6 +311,36 @@ python3 fidonext_chat_client.py \
 ```
 
 In the chat REPL use `/help` to see all commands.
+
+### File transfer examples (photo / large files)
+
+After opening a chat (`/open <peer>`), sender and receiver can use:
+
+```text
+# Sender side
+/file send ~/Pictures/vacation_photo.jpg
+/file status
+
+# Receiver side
+/file accept <file_id>
+/file status <file_id>
+```
+
+For large files (for example backups/video):
+
+```text
+# Sender side
+/file send /data/archive-2026-01.tar.zst
+# If interrupted
+/file resume <file_id>
+# To stop manually
+/file cancel <file_id>
+
+# Receiver side
+/file reject <file_id>   # optional explicit reject
+```
+
+Chat history now stores transfer events (`offered`, `in_progress`, `completed`, `failed`) with `file_id` instead of raw chunk blobs, and REPL prints live progress (percent, speed, ETA).
 
 ### Global relay-backed topology (different countries / servers)
 

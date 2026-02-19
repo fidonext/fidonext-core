@@ -75,6 +75,9 @@ DEFAULT_PREKEY_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_PREKEY_ONE_TIME_COUNT = 32
 DELIVERY_STATUS_SCHEMA = "fidonext-delivery-status-v1"
 REPL_HISTORY_LIMIT = 1000
+FILE_CONTROL_PREFIX = "__fidonext_file_transfer_v1__"
+FILE_CHUNK_SIZE = 48 * 1024
+FILE_PROGRESS_PRINT_INTERVAL_SECONDS = 1.0
 
 
 def now_unix() -> int:
@@ -259,6 +262,8 @@ class TerminalChatClient:
         self.repl_history_path = self.state.path.with_suffix(self.state.path.suffix + ".repl_history")
         self._current_prompt: str = ""
         self._waiting_for_input = False
+        self.file_transfers: Dict[str, Dict[str, Any]] = {}
+        self._transfer_lock = threading.Lock()
 
     def _println(self, text: str) -> None:
         with self.print_lock:
@@ -386,6 +391,13 @@ class TerminalChatClient:
             self._println("[recv] unsupported payload type (strict E2EE mode expects payload_type=libsignal)")
             return
 
+        file_control = self._decode_file_control(text)
+        if file_control is not None:
+            if not self._handle_file_control(from_peer_id, file_control):
+                self._println("[file] malformed control message ignored")
+            self._redraw_prompt_if_needed()
+            return
+
         self.state.append_chat_message(
             from_peer_id,
             {
@@ -478,61 +490,409 @@ class TerminalChatClient:
                 self._println("[prekey] failed to decode cached bundle from contact state")
         return None
 
-    def send_to_active_chat(self, text: str) -> None:
-        peer_id = self.state.active_chat_peer_id
-        if not peer_id:
-            self._println("[send] no active chat. Use /chats then /open <index>")
-            return
+    def _encode_file_control(self, payload: Dict[str, Any]) -> str:
+        envelope = dict(payload)
+        envelope.setdefault("ts_unix", now_unix())
+        return f"{FILE_CONTROL_PREFIX}{json.dumps(envelope, ensure_ascii=True, separators=(',', ':'))}"
 
+    def _decode_file_control(self, text: str) -> Optional[Dict[str, Any]]:
+        if not text.startswith(FILE_CONTROL_PREFIX):
+            return None
+        try:
+            payload = json.loads(text[len(FILE_CONTROL_PREFIX) :])
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _record_transfer_event(
+        self,
+        peer_id: str,
+        *,
+        file_id: str,
+        event: str,
+        direction: str,
+        details: str,
+    ) -> None:
+        self.state.append_chat_message(
+            peer_id,
+            {
+                "ts_unix": now_unix(),
+                "direction": direction,
+                "event_type": "file_transfer",
+                "file_event": event,
+                "file_id": file_id,
+                "text": details,
+            },
+            incoming=direction == "in",
+        )
+
+    def _upsert_transfer(self, file_id: str, **updates: Any) -> Dict[str, Any]:
+        with self._transfer_lock:
+            item = dict(self.file_transfers.get(file_id) or {})
+            item.update({k: v for k, v in updates.items() if v is not None})
+            self.file_transfers[file_id] = item
+            return dict(item)
+
+    def _format_transfer_status(self, file_id: str, item: Dict[str, Any]) -> str:
+        status = str(item.get("status") or "unknown")
+        direction = str(item.get("direction") or "?")
+        sent = int(item.get("bytes_done") or 0)
+        total = int(item.get("bytes_total") or 0)
+        pct = (sent / total * 100.0) if total > 0 else 0.0
+        speed = float(item.get("speed_bps") or 0.0)
+        eta = float(item.get("eta_seconds") or 0.0)
+        peer = str(item.get("peer_id") or "-")
+        return (
+            f"id={file_id} | {direction} | {status} | peer={self.state.contact_label(peer) if peer != '-' else '-'} | "
+            f"progress={pct:.1f}% ({sent}/{total} bytes) | speed={speed/1024.0:.1f} KiB/s | eta={eta:.1f}s"
+        )
+
+    def _print_transfer_progress(self, file_id: str) -> None:
+        item = self.file_transfers.get(file_id) or {}
+        if not item:
+            return
+        self._println(f"[file] {self._format_transfer_status(file_id, item)}")
+        self._redraw_prompt_if_needed()
+
+    def _send_encrypted_text(self, peer_id: str, text: str, *, save_history: bool = True) -> Optional[str]:
         bundle = self._load_contact_prekey_bundle(peer_id)
         if bundle is None:
             self._println(
                 "[send] strict E2EE mode: no prekey bundle set for contact. "
                 "Use /contact bundle <peer_or_alias> <bundle.json>"
             )
-            return
+            return None
 
-        payload_type = "libsignal"
-        payload_bytes: bytes
         try:
-            encrypted = build_message_auto(self.profile_path, bundle, text)
-            payload_bytes = encrypted
+            payload_bytes = build_message_auto(self.profile_path, bundle, text)
         except Exception as exc:
             self._println(f"[send] failed to encrypt with bundle: {exc}")
-            return
+            return None
 
+        message_id = uuid.uuid4().hex
         packet = {
             "schema": CHAT_SCHEMA,
-            "message_id": uuid.uuid4().hex,
+            "message_id": message_id,
             "created_at_unix": now_unix(),
             "from_peer_id": self.local_peer_id,
             "to_peer_id": peer_id,
-            "payload_type": payload_type,
+            "payload_type": "libsignal",
             "payload_b64": base64.b64encode(payload_bytes).decode("ascii"),
         }
-        encoded = json.dumps(packet, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(packet, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
 
         try:
             self.node.send_message(encoded)
         except RuntimeError as exc:
             self._println(f"[send] publish failed: {exc}")
+            return None
+
+        if save_history:
+            self.state.append_chat_message(
+                peer_id,
+                {
+                    "ts_unix": now_unix(),
+                    "direction": "out",
+                    "text": text,
+                    "e2ee": True,
+                    "message_id": message_id,
+                    "delivery_status": "sent",
+                },
+                incoming=False,
+            )
+        return message_id
+
+    def send_to_active_chat(self, text: str) -> None:
+        peer_id = self.state.active_chat_peer_id
+        if not peer_id:
+            self._println("[send] no active chat. Use /chats then /open <index>")
+            return
+        message_id = self._send_encrypted_text(peer_id, text, save_history=True)
+        if message_id:
+            self._println(f"[sent:e2ee] to {self.state.contact_label(peer_id)}: {text}")
+
+    def _send_file_offer(self, file_path_raw: str) -> None:
+        peer_id = self.state.active_chat_peer_id
+        if not peer_id:
+            self._println("[file] no active chat. Use /open first")
+            return
+        path = Path(file_path_raw).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            self._println(f"[file] file not found: {path}")
+            return
+        file_size = int(path.stat().st_size)
+        file_id = uuid.uuid4().hex
+        self._upsert_transfer(
+            file_id,
+            file_id=file_id,
+            peer_id=peer_id,
+            direction="out",
+            status="offered",
+            path=str(path),
+            name=path.name,
+            bytes_total=file_size,
+            bytes_done=0,
+            chunk_size=FILE_CHUNK_SIZE,
+            speed_bps=0.0,
+            eta_seconds=0.0,
+            offered_at=now_unix(),
+            last_progress_print=0.0,
+        )
+        control = self._encode_file_control(
+            {
+                "type": "offer",
+                "file_id": file_id,
+                "name": path.name,
+                "size": file_size,
+            }
+        )
+        if self._send_encrypted_text(peer_id, control, save_history=False) is None:
+            self._upsert_transfer(file_id, status="failed")
+            return
+        self._record_transfer_event(
+            peer_id,
+            file_id=file_id,
+            event="offered",
+            direction="out",
+            details=f"offered file '{path.name}' ({file_size} bytes)",
+        )
+        self._println(f"[file] offered id={file_id} name={path.name} size={file_size} bytes")
+
+    def _send_file_data(self, file_id: str) -> None:
+        item = self.file_transfers.get(file_id) or {}
+        if not item:
+            self._println(f"[file] unknown transfer: {file_id}")
+            return
+        if item.get("direction") != "out":
+            self._println("[file] /file resume supports only outbound transfers")
+            return
+        if str(item.get("status")) in {"completed", "cancelled"}:
+            self._println(f"[file] transfer is already {item.get('status')}")
             return
 
-        e2ee = payload_type == "libsignal"
-        self.state.append_chat_message(
-            peer_id,
-            {
-                "ts_unix": now_unix(),
-                "direction": "out",
-                "text": text,
-                "e2ee": e2ee,
-                "message_id": packet["message_id"],
-                "delivery_status": "sent",
-            },
-            incoming=False,
-        )
-        tag = "[sent:e2ee]" if e2ee else "[sent]"
-        self._println(f"{tag} to {self.state.contact_label(peer_id)}: {text}")
+        path = Path(str(item.get("path") or ""))
+        if not path.exists():
+            self._upsert_transfer(file_id, status="failed")
+            self._record_transfer_event(str(item.get("peer_id") or ""), file_id=file_id, event="failed", direction="out", details="source file is missing")
+            self._println(f"[file] source file is missing: {path}")
+            return
+
+        peer_id = str(item.get("peer_id") or "")
+        total = int(item.get("bytes_total") or path.stat().st_size)
+        offset = int(item.get("bytes_done") or 0)
+        started = time.time()
+        last_report = float(item.get("last_progress_print") or 0.0)
+        self._upsert_transfer(file_id, status="in_progress", started_at=now_unix())
+        self._record_transfer_event(peer_id, file_id=file_id, event="in_progress", direction="out", details="transfer resumed")
+
+        with path.open("rb") as fd:
+            if offset > 0:
+                fd.seek(offset)
+            while True:
+                latest = self.file_transfers.get(file_id) or {}
+                if str(latest.get("status") or "") == "cancelled":
+                    self._println(f"[file] transfer cancelled id={file_id}")
+                    return
+                chunk = fd.read(FILE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                data_control = self._encode_file_control(
+                    {
+                        "type": "chunk",
+                        "file_id": file_id,
+                        "offset": offset,
+                        "data_b64": base64.b64encode(chunk).decode("ascii"),
+                    }
+                )
+                if self._send_encrypted_text(peer_id, data_control, save_history=False) is None:
+                    self._upsert_transfer(file_id, status="failed")
+                    self._record_transfer_event(peer_id, file_id=file_id, event="failed", direction="out", details="failed to send file chunk")
+                    return
+                offset += len(chunk)
+                elapsed = max(0.001, time.time() - started)
+                speed = offset / elapsed
+                remaining = max(0, total - offset)
+                eta = remaining / speed if speed > 0 else 0.0
+                self._upsert_transfer(
+                    file_id,
+                    status="in_progress",
+                    bytes_total=total,
+                    bytes_done=offset,
+                    speed_bps=speed,
+                    eta_seconds=eta,
+                )
+                now_ts = time.time()
+                if now_ts - last_report >= FILE_PROGRESS_PRINT_INTERVAL_SECONDS:
+                    last_report = now_ts
+                    self._upsert_transfer(file_id, last_progress_print=last_report)
+                    self._print_transfer_progress(file_id)
+
+        complete_control = self._encode_file_control({"type": "complete", "file_id": file_id})
+        if self._send_encrypted_text(peer_id, complete_control, save_history=False) is None:
+            self._upsert_transfer(file_id, status="failed")
+            self._record_transfer_event(peer_id, file_id=file_id, event="failed", direction="out", details="failed to send completion marker")
+            return
+        self._upsert_transfer(file_id, status="completed", bytes_done=total, eta_seconds=0.0)
+        self._record_transfer_event(peer_id, file_id=file_id, event="completed", direction="out", details="transfer completed")
+        self._print_transfer_progress(file_id)
+
+    def _handle_file_control(self, from_peer_id: str, payload: Dict[str, Any]) -> bool:
+        event_type = str(payload.get("type") or "").strip().lower()
+        file_id = str(payload.get("file_id") or "").strip()
+        if not event_type or not file_id:
+            return False
+
+        if event_type == "offer":
+            name = str(payload.get("name") or "file.bin")
+            size = int(payload.get("size") or 0)
+            save_path = self.state.path.parent / f"recv_{file_id}_{name}"
+            self._upsert_transfer(
+                file_id,
+                file_id=file_id,
+                peer_id=from_peer_id,
+                direction="in",
+                status="offered",
+                name=name,
+                bytes_total=size,
+                bytes_done=0,
+                save_path=str(save_path),
+                speed_bps=0.0,
+                eta_seconds=0.0,
+            )
+            self._record_transfer_event(from_peer_id, file_id=file_id, event="offered", direction="in", details=f"received offer '{name}' ({size} bytes)")
+            self._println(f"[file] incoming offer from {self.state.contact_label(from_peer_id)}: id={file_id} name={name} size={size}. Use /file accept {file_id} or /file reject {file_id}")
+            return True
+
+        if event_type == "accept":
+            transfer = self.file_transfers.get(file_id) or {}
+            if transfer.get("direction") != "out":
+                return True
+            self._upsert_transfer(file_id, status="in_progress")
+            self._record_transfer_event(from_peer_id, file_id=file_id, event="in_progress", direction="out", details="recipient accepted transfer")
+            self._println(f"[file] recipient accepted transfer id={file_id}")
+            self._send_file_data(file_id)
+            return True
+
+        if event_type == "reject":
+            reason = str(payload.get("reason") or "rejected")
+            self._upsert_transfer(file_id, status="failed", fail_reason=reason)
+            self._record_transfer_event(from_peer_id, file_id=file_id, event="failed", direction="out", details=f"recipient rejected transfer ({reason})")
+            self._println(f"[file] recipient rejected transfer id={file_id}: {reason}")
+            return True
+
+        if event_type == "chunk":
+            transfer = self.file_transfers.get(file_id) or {}
+            if transfer.get("direction") != "in":
+                return True
+            if str(transfer.get("status") or "") not in {"in_progress", "offered"}:
+                return True
+            data_b64 = str(payload.get("data_b64") or "")
+            chunk = base64.b64decode(data_b64) if data_b64 else b""
+            if not chunk:
+                return True
+            save_path = Path(str(transfer.get("save_path") or ""))
+            ensure_parent(save_path)
+            with save_path.open("ab") as fd:
+                fd.write(chunk)
+            done = int(transfer.get("bytes_done") or 0) + len(chunk)
+            total = int(transfer.get("bytes_total") or 0)
+            elapsed = max(0.001, time.time() - float(transfer.get("started_at_wall") or time.time()))
+            speed = done / elapsed
+            eta = (max(0, total - done) / speed) if speed > 0 and total > 0 else 0.0
+            self._upsert_transfer(
+                file_id,
+                status="in_progress",
+                bytes_done=done,
+                bytes_total=total,
+                started_at_wall=float(transfer.get("started_at_wall") or time.time()),
+                speed_bps=speed,
+                eta_seconds=eta,
+            )
+            self._print_transfer_progress(file_id)
+            return True
+
+        if event_type == "complete":
+            transfer = self.file_transfers.get(file_id) or {}
+            if transfer.get("direction") == "in":
+                self._upsert_transfer(file_id, status="completed", eta_seconds=0.0)
+                self._record_transfer_event(from_peer_id, file_id=file_id, event="completed", direction="in", details=f"saved to {transfer.get('save_path')}")
+                self._println(f"[file] completed id={file_id} -> {transfer.get('save_path')}")
+            return True
+
+        if event_type == "cancel":
+            self._upsert_transfer(file_id, status="failed", fail_reason="cancelled by peer")
+            self._record_transfer_event(from_peer_id, file_id=file_id, event="failed", direction="in", details="cancelled by peer")
+            self._println(f"[file] cancelled by peer id={file_id}")
+            return True
+
+        return False
+
+    def _file_command(self, parts: List[str]) -> None:
+        if len(parts) < 2:
+            self._println("usage: /file send|accept|reject|status|resume|cancel ...")
+            return
+        sub = parts[1].lower()
+        if sub == "send":
+            if len(parts) < 3:
+                self._println("usage: /file send <path>")
+                return
+            path = " ".join(parts[2:]).strip()
+            self._send_file_offer(path)
+            return
+        if sub in {"accept", "reject", "resume", "cancel"}:
+            if len(parts) < 3:
+                self._println(f"usage: /file {sub} <file_id>")
+                return
+            file_id = parts[2].strip()
+            transfer = self.file_transfers.get(file_id) or {}
+            if not transfer:
+                self._println(f"[file] unknown file_id: {file_id}")
+                return
+            peer_id = str(transfer.get("peer_id") or "")
+            if sub == "accept":
+                self._upsert_transfer(file_id, status="in_progress", started_at_wall=time.time())
+                control = self._encode_file_control({"type": "accept", "file_id": file_id})
+                self._send_encrypted_text(peer_id, control, save_history=False)
+                self._record_transfer_event(peer_id, file_id=file_id, event="in_progress", direction="in", details="accepted transfer")
+                self._println(f"[file] accepted id={file_id}")
+                return
+            if sub == "reject":
+                self._upsert_transfer(file_id, status="failed", fail_reason="rejected")
+                control = self._encode_file_control({"type": "reject", "file_id": file_id, "reason": "rejected by user"})
+                self._send_encrypted_text(peer_id, control, save_history=False)
+                self._record_transfer_event(peer_id, file_id=file_id, event="failed", direction="in", details="rejected transfer")
+                self._println(f"[file] rejected id={file_id}")
+                return
+            if sub == "resume":
+                if transfer.get("direction") == "out":
+                    self._send_file_data(file_id)
+                    return
+                self._println("[file] inbound transfer resumes automatically when sender retries")
+                return
+            if sub == "cancel":
+                self._upsert_transfer(file_id, status="cancelled")
+                control = self._encode_file_control({"type": "cancel", "file_id": file_id})
+                self._send_encrypted_text(peer_id, control, save_history=False)
+                self._record_transfer_event(peer_id, file_id=file_id, event="failed", direction=str(transfer.get("direction") or "out"), details="cancelled by local user")
+                self._println(f"[file] cancelled id={file_id}")
+                return
+        if sub == "status":
+            if len(parts) >= 3:
+                file_id = parts[2].strip()
+                transfer = self.file_transfers.get(file_id)
+                if not transfer:
+                    self._println(f"[file] unknown file_id: {file_id}")
+                    return
+                self._println(f"[file] {self._format_transfer_status(file_id, transfer)}")
+                return
+            if not self.file_transfers:
+                self._println("[file] no tracked transfers")
+                return
+            for file_id, transfer in sorted(self.file_transfers.items()):
+                self._println(f"[file] {self._format_transfer_status(file_id, transfer)}")
+            return
+
+        self._println("usage: /file send <path> | /file accept <file_id> | /file reject <file_id> | /file status [file_id] | /file resume <file_id> | /file cancel <file_id>")
 
     def _directory_card(self) -> Dict[str, Any]:
         return {
@@ -558,12 +918,12 @@ class TerminalChatClient:
             "device_id": self.device_id,
             "bundle_b64": base64.b64encode(bundle).decode("ascii"),
         }
-        return json.dumps(card, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        return json.dumps(card, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
 
     def announce_self(self, verbose: bool = True) -> None:
         with self.announce_lock:
             card = self._directory_card()
-            payload = json.dumps(card, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            payload = json.dumps(card, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
             prekey_payload = self._prekey_card_payload()
             self.node.dht_put_record(
                 directory_key_for_peer(self.local_peer_id),
@@ -770,6 +1130,12 @@ class TerminalChatClient:
                     "  /chat history [limit]                 Show active chat history",
                     "  /history [peer_or_alias] [limit]      Show chat history",
                     "  /send <text>                          Send to active chat",
+                    "  /file send <path>                     Offer a file to active chat",
+                    "  /file accept <file_id>                Accept inbound file offer",
+                    "  /file reject <file_id>                Reject inbound file offer",
+                    "  /file status [file_id]                Show transfer status",
+                    "  /file resume <file_id>                Resume outbound transfer",
+                    "  /file cancel <file_id>                Cancel transfer",
                     "  /quit                                 Exit client",
                     "Tip: plain text (without /command) sends to active chat (always E2EE).",
                     "Tip: /open auto-fetches recipient bundle from DHT when available.",
@@ -838,6 +1204,12 @@ class TerminalChatClient:
         for item in history:
             direction = item.get("direction", "?")
             ts = item.get("ts_unix", 0)
+            if str(item.get("event_type") or "") == "file_transfer":
+                file_event = str(item.get("file_event") or "unknown")
+                file_id = str(item.get("file_id") or "-")
+                details = str(item.get("text") or "")
+                self._println(f"[{ts}] {direction} file_transfer[{file_event}] id={file_id}: {details}")
+                continue
             text = item.get("text", "")
             e2ee = " e2ee" if item.get("e2ee") else ""
             status_suffix = ""
@@ -925,6 +1297,7 @@ class TerminalChatClient:
             "chat",
             "history",
             "send",
+            "file",
         }
         if first in known:
             return "/" + line
@@ -1106,6 +1479,9 @@ class TerminalChatClient:
                 self._println("usage: /send <text>")
                 return
             self.send_to_active_chat(text)
+            return
+        if cmd == "/file":
+            self._file_command(parts)
             return
 
         self._println("Unknown command. Use /help")
@@ -1433,4 +1809,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
