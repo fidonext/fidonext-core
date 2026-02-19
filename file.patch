@@ -1,0 +1,575 @@
+diff --git a/c-abi-libp2p/src/messaging/file_transfer.rs b/c-abi-libp2p/src/messaging/file_transfer.rs
+index 34fca8fdd294b630da432d31bf7171c7b752d156..af7e84bf6ea62230dcbf6685e201a11f92f84c14 100644
+--- a/c-abi-libp2p/src/messaging/file_transfer.rs
++++ b/c-abi-libp2p/src/messaging/file_transfer.rs
+@@ -1,40 +1,73 @@
+ use anyhow::{anyhow, Result};
+ use libp2p::PeerId;
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+ use std::collections::{BTreeMap, HashMap, HashSet};
+ use std::fs::{self, File, OpenOptions};
+ use std::io::{Read, Seek, SeekFrom, Write};
+ use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
+ use tokio::sync::mpsc;
+ 
+ pub const DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY: usize = 256;
+ pub const DEFAULT_FILE_TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
+ pub const MAX_FILE_TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
+ pub const DEFAULT_FILE_TRANSFER_WINDOW_SIZE: usize = 8;
+ pub const DEFAULT_FILE_TRANSFER_MAX_RETRIES: u32 = 5;
++pub const DEFAULT_MAX_INBOUND_FILE_SIZE: u64 = 256 * 1024 * 1024;
++pub const DEFAULT_MAX_PARALLEL_TRANSFERS: usize = 4;
++pub const DEFAULT_MAX_BANDWIDTH: u64 = 16 * 1024 * 1024;
++pub const DEFAULT_MAX_DISK_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
++pub const DEFAULT_INBOUND_TRANSFER_TTL_SECS: u64 = 15 * 60;
++
++#[derive(Debug, Clone)]
++pub struct FileTransferLimits {
++    pub max_file_size: u64,
++    pub max_parallel_transfers: usize,
++    pub max_bandwidth: u64,
++    pub max_disk_quota: u64,
++    pub transfer_ttl: Duration,
++}
++
++impl Default for FileTransferLimits {
++    fn default() -> Self {
++        Self {
++            max_file_size: DEFAULT_MAX_INBOUND_FILE_SIZE,
++            max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
++            max_bandwidth: DEFAULT_MAX_BANDWIDTH,
++            max_disk_quota: DEFAULT_MAX_DISK_QUOTA,
++            transfer_ttl: Duration::from_secs(DEFAULT_INBOUND_TRANSFER_TTL_SECS),
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum InboundTransferDecision {
++    Pending,
++    Rejected,
++}
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct FileMetadata {
+     pub file_id: String,
+     pub name: String,
+     pub size: u64,
+     pub hash: String,
+     pub mime: String,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct ChunkMetadata {
+     pub file_id: String,
+     pub chunk_index: u64,
+     pub offset: u64,
+     pub chunk_size: u32,
+     pub chunk_hash: String,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum FileTransferFrame {
+     Init {
+         metadata: FileMetadata,
+         chunk_size: u32,
+         total_chunks: u64,
+@@ -294,155 +327,351 @@ impl FileTransferSender {
+                 metadata: chunk.metadata,
+                 data: chunk.data,
+             })
+     }
+ 
+     // Rebuilds the current send window from persisted in-memory session state.
+     pub fn resume_frames(&mut self, file_id: &str) -> Vec<FileTransferFrame> {
+         let mut frames = Vec::new();
+         if let Some(session) = self.sessions.get_mut(file_id) {
+             for chunk in session.fill_window() {
+                 frames.push(FileTransferFrame::Chunk {
+                     metadata: chunk.metadata,
+                     data: chunk.data,
+                 });
+             }
+         }
+         frames
+     }
+ }
+ 
+ #[derive(Debug)]
+ pub struct ReceiverSession {
+     metadata: FileMetadata,
+     part_path: PathBuf,
+     received: BTreeMap<u64, ChunkMetadata>,
++    bytes_received: u64,
++    created_at: Instant,
++    last_activity: Instant,
++    bandwidth_window_started_at: Instant,
++    bandwidth_window_bytes: u64,
++}
++
++#[derive(Debug)]
++struct PendingSession {
++    metadata: FileMetadata,
++    created_at: Instant,
+ }
+ 
+ #[derive(Debug)]
+ pub struct FileTransferReceiver {
+     root: PathBuf,
++    limits: FileTransferLimits,
+     sessions: HashMap<String, ReceiverSession>,
++    pending: HashMap<String, PendingSession>,
+     progress: TransferProgressStore,
+ }
+ 
+ impl FileTransferReceiver {
+     // Creates a receiver rooted at a directory for temporary and finalized files.
+     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
++        Self::with_limits(root, FileTransferLimits::default())
++    }
++
++    // Creates a receiver rooted at a directory for temporary and finalized files.
++    pub fn with_limits(root: impl AsRef<Path>, limits: FileTransferLimits) -> Result<Self> {
+         let root = root.as_ref().to_path_buf();
+         fs::create_dir_all(&root)?;
+         Ok(Self {
+             root,
++            limits,
+             sessions: HashMap::new(),
++            pending: HashMap::new(),
+             progress: TransferProgressStore::default(),
+         })
+     }
+ 
+-    // Initializes receiver state and allocates a .part file for incoming chunks.
+-    pub fn handle_init(&mut self, metadata: FileMetadata) -> Result<PathBuf> {
++    fn active_and_pending_count(&self) -> usize {
++        self.sessions.len().saturating_add(self.pending.len())
++    }
++
++    fn check_init_limits(&self, metadata: &FileMetadata) -> Result<InboundTransferDecision> {
++        if metadata.size > self.limits.max_file_size {
++            tracing::warn!(target: "security", file_id = %metadata.file_id, declared_size = metadata.size, max_file_size = self.limits.max_file_size, "reject oversized transfer");
++            return Ok(InboundTransferDecision::Rejected);
++        }
++
++        if self.active_and_pending_count() >= self.limits.max_parallel_transfers {
++            tracing::warn!(target: "security", active_and_pending = self.active_and_pending_count(), max_parallel = self.limits.max_parallel_transfers, "reject transfer due to max_parallel_transfers");
++            return Ok(InboundTransferDecision::Rejected);
++        }
++
++        let projected = self.current_disk_usage()?.saturating_add(metadata.size);
++        if projected > self.limits.max_disk_quota {
++            tracing::warn!(target: "security", file_id = %metadata.file_id, projected_usage = projected, max_disk_quota = self.limits.max_disk_quota, "reject transfer due to disk quota exceeded");
++            return Ok(InboundTransferDecision::Rejected);
++        }
++
++        Ok(InboundTransferDecision::Pending)
++    }
++
++    // Registers inbound transfer metadata and waits for explicit user decision.
++    pub fn handle_init(&mut self, metadata: FileMetadata) -> Result<InboundTransferDecision> {
++        self.gc_expired_transfers()?;
++        if self.check_init_limits(&metadata)? == InboundTransferDecision::Rejected {
++            return Ok(InboundTransferDecision::Rejected);
++        }
++
++        if self.sessions.contains_key(&metadata.file_id)
++            || self.pending.contains_key(&metadata.file_id)
++        {
++            tracing::warn!(target: "security", file_id = %metadata.file_id, "reject transfer with duplicate file id");
++            return Ok(InboundTransferDecision::Rejected);
++        }
++
++        self.pending.insert(
++            metadata.file_id.clone(),
++            PendingSession {
++                metadata,
++                created_at: Instant::now(),
++            },
++        );
++        Ok(InboundTransferDecision::Pending)
++    }
++
++    // Explicitly accepts a pending transfer and allocates a .part file.
++    pub fn accept_transfer(&mut self, file_id: &str) -> Result<PathBuf> {
++        self.gc_expired_transfers()?;
++        let pending = self
++            .pending
++            .remove(file_id)
++            .ok_or_else(|| anyhow!("missing pending transfer for file {file_id}"))?;
++        let metadata = pending.metadata;
++        if self.check_init_limits(&metadata)? == InboundTransferDecision::Rejected {
++            return Err(anyhow!(
++                "transfer {} rejected by limits before accept",
++                metadata.file_id
++            ));
++        }
++
+         let part_path = self.root.join(format!("{}.part", metadata.file_id));
+         let file = OpenOptions::new()
+             .create(true)
+             .write(true)
+             .truncate(false)
+             .open(&part_path)?;
+         file.set_len(metadata.size)?;
+ 
+         self.sessions.insert(
+             metadata.file_id.clone(),
+             ReceiverSession {
+                 metadata,
+                 part_path: part_path.clone(),
+                 received: BTreeMap::new(),
++                bytes_received: 0,
++                created_at: Instant::now(),
++                last_activity: Instant::now(),
++                bandwidth_window_started_at: Instant::now(),
++                bandwidth_window_bytes: 0,
+             },
+         );
+         Ok(part_path)
+     }
+ 
++    // Explicitly rejects a pending inbound transfer request.
++    pub fn reject_transfer(&mut self, file_id: &str, reason: &str) {
++        if self.pending.remove(file_id).is_some() {
++            tracing::warn!(target: "security", %file_id, %reason, "rejected inbound transfer by user decision");
++        }
++    }
++
+     // Validates and writes a chunk into the .part file, then returns ChunkAck.
+     pub fn handle_chunk(
+         &mut self,
+         metadata: ChunkMetadata,
+         data: &[u8],
+     ) -> Result<FileTransferFrame> {
+-        let session = self
+-            .sessions
+-            .get_mut(&metadata.file_id)
+-            .ok_or_else(|| anyhow!("missing receiver session for file {}", metadata.file_id))?;
+         if metadata.chunk_size as usize != data.len() {
++            if self.sessions.contains_key(&metadata.file_id) {
++                let _ = self.cancel_transfer(&metadata.file_id);
++            }
+             return Err(anyhow!(
+                 "chunk size mismatch for file {} index {}",
+                 metadata.file_id,
+                 metadata.chunk_index
+             ));
+         }
+         let actual_hash = compute_sha256_hex(data);
+         if actual_hash != metadata.chunk_hash {
++            tracing::warn!(target: "security", file_id = %metadata.file_id, chunk_index = metadata.chunk_index, "hash mismatch while receiving chunk");
++            let _ = self.cancel_transfer(&metadata.file_id);
+             return Err(anyhow!(
+                 "chunk hash mismatch for file {} index {}",
+                 metadata.file_id,
+                 metadata.chunk_index
+             ));
+         }
+ 
+-        let mut file = OpenOptions::new().write(true).open(&session.part_path)?;
+-        file.seek(SeekFrom::Start(metadata.offset))?;
+-        file.write_all(data)?;
+-        file.flush()?;
++        let now = Instant::now();
++        let mut should_cancel = None::<&str>;
++        {
++            let session = self
++                .sessions
++                .get_mut(&metadata.file_id)
++                .ok_or_else(|| anyhow!("missing receiver session for file {}", metadata.file_id))?;
++
++            if metadata.offset.saturating_add(metadata.chunk_size as u64) > session.metadata.size {
++                tracing::warn!(target: "security", file_id = %metadata.file_id, declared_size = session.metadata.size, offset = metadata.offset, chunk_size = metadata.chunk_size, "chunk exceeds declared file size");
++                should_cancel = Some("declared size exceeded");
++            } else {
++                if now.duration_since(session.bandwidth_window_started_at) >= Duration::from_secs(1)
++                {
++                    session.bandwidth_window_started_at = now;
++                    session.bandwidth_window_bytes = 0;
++                }
++                let projected_window = session
++                    .bandwidth_window_bytes
++                    .saturating_add(data.len() as u64);
++                if projected_window > self.limits.max_bandwidth {
++                    tracing::warn!(target: "security", file_id = %metadata.file_id, projected_bandwidth = projected_window, max_bandwidth = self.limits.max_bandwidth, "cancelling transfer due to bandwidth limit exceeded");
++                    should_cancel = Some("bandwidth limit exceeded");
++                } else {
++                    let mut file = OpenOptions::new().write(true).open(&session.part_path)?;
++                    file.seek(SeekFrom::Start(metadata.offset))?;
++                    file.write_all(data)?;
++                    file.flush()?;
++
++                    session
++                        .received
++                        .insert(metadata.chunk_index, metadata.clone());
++                    session.bytes_received =
++                        session.bytes_received.saturating_add(data.len() as u64);
++                    session.last_activity = now;
++                    session.bandwidth_window_bytes = projected_window;
++
++                    if session.bytes_received > session.metadata.size {
++                        tracing::warn!(target: "security", file_id = %metadata.file_id, bytes_received = session.bytes_received, declared_size = session.metadata.size, "cancelling transfer due to actual size exceeding declared size");
++                        should_cancel = Some("actual size exceeded");
++                    }
++                }
++            }
++        }
++
++        if let Some(reason) = should_cancel {
++            self.cancel_transfer(&metadata.file_id)?;
++            return Err(anyhow!("{} for file {}", reason, metadata.file_id));
++        }
+ 
+-        session
+-            .received
+-            .insert(metadata.chunk_index, metadata.clone());
+         self.progress
+             .record_ack(&metadata.file_id, metadata.chunk_index);
+         let next_expected_chunk = self.progress.next_expected_chunk(&metadata.file_id);
+ 
+         Ok(FileTransferFrame::ChunkAck {
+             file_id: metadata.file_id,
+             chunk_index: metadata.chunk_index,
+             next_expected_chunk,
+         })
+     }
+ 
+     // Verifies full file hash and renames .part file to final filename.
+     pub fn finalize(&mut self, file_id: &str, full_hash: &str) -> Result<PathBuf> {
+         let session = self
+             .sessions
+             .remove(file_id)
+             .ok_or_else(|| anyhow!("missing receiver session for file {file_id}"))?;
+         let mut part = File::open(&session.part_path)?;
+         let mut buf = Vec::new();
+         part.read_to_end(&mut buf)?;
+         let actual_hash = compute_sha256_hex(&buf);
+         if actual_hash != full_hash {
++            tracing::warn!(target: "security", %file_id, "hash mismatch while finalizing transfer");
++            if session.part_path.exists() {
++                fs::remove_file(&session.part_path)?;
++            }
+             return Err(anyhow!("file hash mismatch for file {file_id}"));
+         }
+         let final_path = self.root.join(&session.metadata.name);
+         fs::rename(&session.part_path, &final_path)?;
+         self.progress.clear(file_id);
+         Ok(final_path)
+     }
++
++    // Removes timed-out pending and active transfers and their `.part` files.
++    pub fn gc_expired_transfers(&mut self) -> Result<()> {
++        let now = Instant::now();
++
++        self.pending
++            .retain(|file_id, pending| {
++                let expired = now.duration_since(pending.created_at) > self.limits.transfer_ttl;
++                if expired {
++                    tracing::warn!(target: "security", %file_id, "expired pending transfer was garbage collected");
++                }
++                !expired
++            });
++
++        let expired_file_ids: Vec<String> = self
++            .sessions
++            .iter()
++            .filter_map(|(file_id, session)| {
++                let expired = now.duration_since(session.last_activity) > self.limits.transfer_ttl
++                    || now.duration_since(session.created_at) > self.limits.transfer_ttl;
++                if expired {
++                    Some(file_id.clone())
++                } else {
++                    None
++                }
++            })
++            .collect();
++        for file_id in expired_file_ids {
++            tracing::warn!(target: "security", %file_id, "expired active transfer was garbage collected");
++            self.cancel_transfer(&file_id)?;
++        }
++
++        Ok(())
++    }
++
++    fn cancel_transfer(&mut self, file_id: &str) -> Result<()> {
++        if let Some(session) = self.sessions.remove(file_id) {
++            if session.part_path.exists() {
++                fs::remove_file(&session.part_path)?;
++            }
++        }
++        self.progress.clear(file_id);
++        Ok(())
++    }
++
++    fn current_disk_usage(&self) -> Result<u64> {
++        let mut total = 0u64;
++        for entry in fs::read_dir(&self.root)? {
++            let entry = entry?;
++            let metadata = entry.metadata()?;
++            if metadata.is_file() {
++                total = total.saturating_add(metadata.len());
++            }
++        }
++        Ok(total)
++    }
+ }
+ 
+ impl FileTransferQueue {
+     // Creates a bounded queue for inbound file-transfer frames.
+     pub fn new(capacity: usize) -> Self {
+         let (sender, receiver) = mpsc::channel(capacity);
+         Self { sender, receiver }
+     }
+ 
+     // Returns a sender used to push file-transfer frames into the queue.
+     pub fn sender(&self) -> FileTransferQueueSender {
+         FileTransferQueueSender {
+             sender: self.sender.clone(),
+         }
+     }
+ 
+     // Tries to dequeue the next inbound file-transfer frame without waiting.
+     pub fn try_dequeue(&mut self) -> Option<InboundFileTransferFrame> {
+         self.receiver.try_recv().ok()
+     }
+ }
+ 
+ impl FileTransferQueueSender {
+     // Tries to enqueue an inbound file-transfer frame without waiting.
+     pub fn try_enqueue(&self, frame: InboundFileTransferFrame) -> Result<()> {
+@@ -485,45 +714,128 @@ mod tests {
+         };
+ 
+         let mut sender = FileTransferSender::new(RetryPolicy::default());
+         let (_init, initial_frames) = sender
+             .start_transfer(metadata, payload, 256 * 1024, 2)
+             .expect("start transfer");
+         assert_eq!(initial_frames.len(), 2);
+ 
+         let next = sender.on_chunk_ack("f1", 0);
+         assert_eq!(next.len(), 1);
+     }
+ 
+     #[test]
+     fn receiver_writes_part_and_finalizes() {
+         let root = tempfile::tempdir().expect("tempdir");
+         let mut receiver = FileTransferReceiver::new(root.path()).expect("receiver");
+ 
+         let payload = b"hello-file".to_vec();
+         let metadata = FileMetadata {
+             file_id: "f2".to_string(),
+             name: "final.bin".to_string(),
+             size: payload.len() as u64,
+             hash: compute_sha256_hex(&payload),
+             mime: "application/octet-stream".to_string(),
+         };
+-        receiver.handle_init(metadata.clone()).expect("init");
++        let decision = receiver.handle_init(metadata.clone()).expect("init");
++        assert_eq!(decision, InboundTransferDecision::Pending);
++        receiver.accept_transfer(&metadata.file_id).expect("accept");
+ 
+         let chunk_meta = ChunkMetadata {
+             file_id: metadata.file_id.clone(),
+             chunk_index: 0,
+             offset: 0,
+             chunk_size: payload.len() as u32,
+             chunk_hash: compute_sha256_hex(&payload),
+         };
+         let ack = receiver
+             .handle_chunk(chunk_meta, &payload)
+             .expect("write chunk");
+         assert!(matches!(ack, FileTransferFrame::ChunkAck { .. }));
+ 
+         let path = receiver
+             .finalize(&metadata.file_id, &metadata.hash)
+             .expect("finalize");
+         assert!(path.ends_with("final.bin"));
+     }
+-}
+\ No newline at end of file
++    #[test]
++    fn receiver_rejects_oversized_declared_size() {
++        let root = tempfile::tempdir().expect("tempdir");
++        let limits = FileTransferLimits {
++            max_file_size: 4,
++            ..FileTransferLimits::default()
++        };
++        let mut receiver =
++            FileTransferReceiver::with_limits(root.path(), limits).expect("receiver");
++
++        let metadata = FileMetadata {
++            file_id: "too-big".to_string(),
++            name: "oversized.bin".to_string(),
++            size: 5,
++            hash: "x".to_string(),
++            mime: "application/octet-stream".to_string(),
++        };
++
++        let decision = receiver.handle_init(metadata).expect("init");
++        assert_eq!(decision, InboundTransferDecision::Rejected);
++    }
++
++    #[test]
++    fn receiver_gc_removes_expired_part_file() {
++        let root = tempfile::tempdir().expect("tempdir");
++        let limits = FileTransferLimits {
++            transfer_ttl: Duration::from_secs(0),
++            ..FileTransferLimits::default()
++        };
++        let mut receiver =
++            FileTransferReceiver::with_limits(root.path(), limits).expect("receiver");
++
++        let payload = b"hello-file".to_vec();
++        let metadata = FileMetadata {
++            file_id: "expired".to_string(),
++            name: "expired.bin".to_string(),
++            size: payload.len() as u64,
++            hash: compute_sha256_hex(&payload),
++            mime: "application/octet-stream".to_string(),
++        };
++
++        let decision = receiver.handle_init(metadata.clone()).expect("init");
++        assert_eq!(decision, InboundTransferDecision::Pending);
++        let part = receiver.accept_transfer(&metadata.file_id).expect("accept");
++        assert!(part.exists());
++
++        std::thread::sleep(Duration::from_millis(2));
++        receiver.gc_expired_transfers().expect("gc");
++        assert!(!part.exists());
++    }
++
++    #[test]
++    fn receiver_cancels_transfer_on_chunk_hash_mismatch() {
++        let root = tempfile::tempdir().expect("tempdir");
++        let mut receiver = FileTransferReceiver::new(root.path()).expect("receiver");
++
++        let payload = b"hello-file".to_vec();
++        let metadata = FileMetadata {
++            file_id: "bad-hash".to_string(),
++            name: "bad.bin".to_string(),
++            size: payload.len() as u64,
++            hash: compute_sha256_hex(&payload),
++            mime: "application/octet-stream".to_string(),
++        };
++
++        let decision = receiver.handle_init(metadata.clone()).expect("init");
++        assert_eq!(decision, InboundTransferDecision::Pending);
++        let part = receiver.accept_transfer(&metadata.file_id).expect("accept");
++
++        let chunk_meta = ChunkMetadata {
++            file_id: metadata.file_id.clone(),
++            chunk_index: 0,
++            offset: 0,
++            chunk_size: payload.len() as u32,
++            chunk_hash: "definitely-not-correct".to_string(),
++        };
++
++        let result = receiver.handle_chunk(chunk_meta, &payload);
++        assert!(result.is_err());
++        assert!(!part.exists());
++    }
++}
