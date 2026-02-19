@@ -783,7 +783,7 @@ mod tests {
     fn receiver_gc_removes_expired_part_file() {
         let root = tempfile::tempdir().expect("tempdir");
         let limits = FileTransferLimits {
-            transfer_ttl: Duration::from_secs(0),
+            transfer_ttl: Duration::from_millis(1),
             ..FileTransferLimits::default()
         };
         let mut receiver =
