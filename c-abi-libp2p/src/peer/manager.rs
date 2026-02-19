@@ -655,24 +655,40 @@ impl PeerManager {
         data: Vec<u8>,
         chunk_size: usize,
     ) {
-        let chunk_size = chunk_size_or_default(chunk_size);
+        use sha2::{Digest, Sha256};
+
+        let chunk_size = chunk_size_or_default(chunk_size).clamp(
+            crate::messaging::DEFAULT_FILE_TRANSFER_CHUNK_SIZE,
+            crate::messaging::MAX_FILE_TRANSFER_CHUNK_SIZE,
+        );
+        let total_chunks = data.chunks(chunk_size).len() as u64;
         let init_request_id = self.swarm.behaviour_mut().file_transfer.send_request(
             &recipient,
             FileTransferRequest {
                 frame: FileTransferFrame::Init {
                     metadata: metadata.clone(),
+                    chunk_size: chunk_size as u32,
+                    total_chunks,
                 },
             },
         );
         self.pending_file_transfer_requests.insert(init_request_id);
 
         for (index, chunk) in data.chunks(chunk_size).enumerate() {
+            let mut hasher = Sha256::new();
+            hasher.update(chunk);
+            let chunk_hash = hex::encode(hasher.finalize());
             let request_id = self.swarm.behaviour_mut().file_transfer.send_request(
                 &recipient,
                 FileTransferRequest {
                     frame: FileTransferFrame::Chunk {
-                        file_id: metadata.file_id.clone(),
-                        offset: (index * chunk_size) as u64,
+                        metadata: crate::messaging::ChunkMetadata {
+                            file_id: metadata.file_id.clone(),
+                            chunk_index: index as u64,
+                            offset: (index * chunk_size) as u64,
+                            chunk_size: chunk.len() as u32,
+                            chunk_hash,
+                        },
                         data: chunk.to_vec(),
                     },
                 },
@@ -685,6 +701,8 @@ impl PeerManager {
             FileTransferRequest {
                 frame: FileTransferFrame::Complete {
                     file_id: metadata.file_id,
+                    total_chunks,
+                    file_hash: metadata.hash,
                 },
             },
         );
@@ -1117,6 +1135,12 @@ impl PeerManager {
                         pending.retry_delay = DELIVERY_MAX_RETRY_DELAY;
                         pending.next_retry_at = Instant::now() + DELIVERY_MAX_RETRY_DELAY;
                         let _ = pending;
+                        self.emit_delivery_status(
+                            &recipient_peer_id,
+                            ack.envelope_id.as_str(),
+                            "stored",
+                            None,
+                        );
                         self.emit_delivery_status(
                             &recipient_peer_id,
                             ack.envelope_id.as_str(),
@@ -1765,11 +1789,12 @@ impl PeerManager {
                     channel,
                     request_id,
                 } => {
+                    let frame = request.frame;
                     let enqueue_result =
                         self.file_transfer_sender
                             .try_enqueue(InboundFileTransferFrame {
                                 from_peer: peer,
-                                frame: request.frame,
+                                frame: frame.clone(),
                             });
                     let accepted = enqueue_result.is_ok();
                     if let Err(err) = enqueue_result {
@@ -1783,6 +1808,20 @@ impl PeerManager {
                         .is_err()
                     {
                         tracing::debug!(target: "peer", %peer, ?request_id, "failed to send file transfer response");
+                    }
+
+                    if let FileTransferFrame::Chunk { metadata, .. } = frame {
+                        let ack_request_id = self.swarm.behaviour_mut().file_transfer.send_request(
+                            &peer,
+                            FileTransferRequest {
+                                frame: FileTransferFrame::ChunkAck {
+                                    file_id: metadata.file_id,
+                                    chunk_index: metadata.chunk_index,
+                                    next_expected_chunk: metadata.chunk_index.saturating_add(1),
+                                },
+                            },
+                        );
+                        self.pending_file_transfer_requests.insert(ack_request_id);
                     }
                 }
                 request_response::Message::Response {

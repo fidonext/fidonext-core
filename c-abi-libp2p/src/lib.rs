@@ -1791,7 +1791,7 @@ pub extern "C" fn cabi_node_receive_file_transfer(
     }
 
     match event.frame {
-        messaging::FileTransferFrame::Init { metadata } => {
+        messaging::FileTransferFrame::Init { metadata, .. } => {
             unsafe {
                 *frame_kind = CABI_FILE_TRANSFER_FRAME_INIT;
             }
@@ -1815,16 +1815,12 @@ pub extern "C" fn cabi_node_receive_file_transfer(
                 payload_written_len,
             )
         }
-        messaging::FileTransferFrame::Chunk {
-            file_id,
-            offset: _,
-            data,
-        } => {
+        messaging::FileTransferFrame::Chunk { metadata, data } => {
             unsafe {
                 *frame_kind = CABI_FILE_TRANSFER_FRAME_CHUNK;
             }
             let status = write_c_string(
-                &file_id,
+                &metadata.file_id,
                 file_id_buffer,
                 file_id_buffer_len,
                 file_id_written_len,
@@ -1839,7 +1835,7 @@ pub extern "C" fn cabi_node_receive_file_transfer(
                 payload_written_len,
             )
         }
-        messaging::FileTransferFrame::Complete { file_id } => {
+        messaging::FileTransferFrame::Complete { file_id, .. } => {
             unsafe {
                 *frame_kind = CABI_FILE_TRANSFER_FRAME_COMPLETE;
             }
@@ -1853,6 +1849,31 @@ pub extern "C" fn cabi_node_receive_file_transfer(
                 return status;
             }
             CABI_STATUS_SUCCESS
+        }
+        messaging::FileTransferFrame::ChunkAck {
+            file_id,
+            chunk_index,
+            next_expected_chunk,
+        } => {
+            unsafe {
+                *frame_kind = CABI_FILE_TRANSFER_FRAME_STATUS;
+            }
+            let code = write_c_string(
+                &file_id,
+                file_id_buffer,
+                file_id_buffer_len,
+                file_id_written_len,
+            );
+            if code != CABI_STATUS_SUCCESS {
+                return code;
+            }
+            let payload = format!("ack={}\nnext={}", chunk_index, next_expected_chunk);
+            write_bytes(
+                payload.as_bytes(),
+                payload_buffer,
+                payload_buffer_len,
+                payload_written_len,
+            )
         }
         messaging::FileTransferFrame::Status { file_id, status } => {
             unsafe {
