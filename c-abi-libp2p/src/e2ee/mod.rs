@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -52,6 +52,33 @@ const LIBSIGNAL_STATE_SCHEMA_VERSION: u32 = 1;
 const LIBSIGNAL_MESSAGE_PROTOCOL: &str = "signal-libsignal-message-v1";
 const LIBSIGNAL_MESSAGE_KIND_PREKEY: &str = "prekey";
 const LIBSIGNAL_MESSAGE_KIND_SESSION: &str = "session";
+const FILE_CHUNK_PROTOCOL: &str = "e2ee-file-chunk-v1";
+const FILE_MANIFEST_PROTOCOL: &str = "e2ee-file-manifest-v1";
+const FILE_CHUNK_NONCE_CONTEXT: &[u8] = b"fidonext-file-chunk-nonce-v1";
+
+pub const FILE_KEY_LEN: usize = 32;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileChunkRecord {
+    schema_version: u32,
+    protocol: String,
+    file_id: String,
+    chunk_index: u64,
+    sequence: u64,
+    nonce_b64: String,
+    ciphertext_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileIntegrityManifest {
+    schema_version: u32,
+    protocol: String,
+    file_id: String,
+    total_chunks: u64,
+    sha256_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature_b64: Option<String>,
+}
 
 pub async fn official_libsignal_roundtrip_smoke() -> Result<()> {
     use libsignal_protocol::{
@@ -3415,4 +3442,263 @@ pub fn build_libsignal_bundle_from_record(record: &PreKeyBundleRecord) -> Result
         identity_key,
     )
     .map_err(|e| anyhow!("PreKeyBundle::new: {}", e))
+}
+
+/// Computes streaming SHA-256 of a file without loading it fully into memory.
+pub fn file_integrity_sha256(path: &Path) -> Result<[u8; 32]> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open file for sha256: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read file for sha256: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_slice());
+    Ok(out)
+}
+
+/// Signs arbitrary bytes using an identity seed-derived Ed25519 key.
+pub fn sign_with_seed(seed: &[u8; IDENTITY_SEED_LEN], payload: &[u8]) -> Result<Vec<u8>> {
+    let keypair = keypair_from_seed(seed)?;
+    keypair
+        .sign(payload)
+        .map_err(|err| anyhow!("failed to sign payload: {err}"))
+}
+
+/// Verifies a signature against payload bytes and protobuf-encoded public key.
+pub fn verify_signature(public_key: &[u8], payload: &[u8], signature: &[u8]) -> Result<()> {
+    let key = identity::PublicKey::try_decode_protobuf(public_key)
+        .context("failed to decode public key")?;
+    if key.verify(payload, signature) {
+        Ok(())
+    } else {
+        Err(anyhow!("signature verification failed"))
+    }
+}
+
+/// Derives a protobuf-encoded public key from an identity seed.
+pub fn public_key_from_seed(seed: &[u8; IDENTITY_SEED_LEN]) -> Result<Vec<u8>> {
+    let keypair = keypair_from_seed(seed)?;
+    Ok(keypair.public().encode_protobuf())
+}
+
+/// Encrypts one file chunk with AAD bound to file_id/chunk_index/sequence.
+pub fn encrypt_file_chunk(
+    file_key: &[u8; FILE_KEY_LEN],
+    file_id: &str,
+    chunk_index: u64,
+    sequence: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    if file_id.trim().is_empty() {
+        return Err(anyhow!("file_id cannot be empty"));
+    }
+    if plaintext.is_empty() {
+        return Err(anyhow!("chunk plaintext cannot be empty"));
+    }
+
+    let nonce = derive_file_chunk_nonce(file_key, file_id, chunk_index, sequence);
+    let aad = build_file_chunk_aad(file_id, chunk_index, sequence)?;
+    let ciphertext = aead_encrypt(file_key, &nonce, &aad, plaintext)?;
+
+    let record = FileChunkRecord {
+        schema_version: E2EE_SCHEMA_VERSION,
+        protocol: FILE_CHUNK_PROTOCOL.to_string(),
+        file_id: file_id.to_string(),
+        chunk_index,
+        sequence,
+        nonce_b64: encode_bytes(&nonce),
+        ciphertext_b64: encode_bytes(&ciphertext),
+    };
+    serde_json::to_vec(&record).context("failed to serialize file chunk record")
+}
+
+/// Decrypts and authenticates one file chunk against expected file/chunk coordinates.
+pub fn decrypt_file_chunk(
+    file_key: &[u8; FILE_KEY_LEN],
+    expected_file_id: &str,
+    expected_chunk_index: u64,
+    expected_sequence: u64,
+    encoded_chunk: &[u8],
+) -> Result<Vec<u8>> {
+    if expected_file_id.trim().is_empty() {
+        return Err(anyhow!("expected_file_id cannot be empty"));
+    }
+    let record: FileChunkRecord =
+        serde_json::from_slice(encoded_chunk).context("failed to decode file chunk json")?;
+    if record.schema_version != E2EE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported file chunk schema version: {}",
+            record.schema_version
+        ));
+    }
+    if record.protocol != FILE_CHUNK_PROTOCOL {
+        return Err(anyhow!("unsupported file chunk protocol"));
+    }
+    if record.file_id != expected_file_id {
+        return Err(anyhow!("file chunk file_id mismatch"));
+    }
+    if record.chunk_index != expected_chunk_index {
+        return Err(anyhow!("file chunk index mismatch"));
+    }
+    if record.sequence != expected_sequence {
+        return Err(anyhow!("file chunk sequence mismatch"));
+    }
+
+    let nonce = decode_base64_fixed_12(&record.nonce_b64, "nonce_b64")?;
+    let expected_nonce = derive_file_chunk_nonce(
+        file_key,
+        expected_file_id,
+        expected_chunk_index,
+        expected_sequence,
+    );
+    if nonce != expected_nonce {
+        return Err(anyhow!("file chunk nonce mismatch"));
+    }
+
+    let aad = build_file_chunk_aad(expected_file_id, expected_chunk_index, expected_sequence)?;
+    let ciphertext = decode_base64(&record.ciphertext_b64, "ciphertext_b64")?;
+    aead_decrypt(file_key, &nonce, &aad, &ciphertext)
+}
+
+/// Builds a file integrity manifest with SHA-256 and optional signature.
+pub fn build_file_integrity_manifest(
+    file_id: &str,
+    total_chunks: u64,
+    file_sha256: &[u8; 32],
+    signature: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if file_id.trim().is_empty() {
+        return Err(anyhow!("file_id cannot be empty"));
+    }
+    let manifest = FileIntegrityManifest {
+        schema_version: E2EE_SCHEMA_VERSION,
+        protocol: FILE_MANIFEST_PROTOCOL.to_string(),
+        file_id: file_id.to_string(),
+        total_chunks,
+        sha256_hex: hex::encode(file_sha256),
+        signature_b64: signature.map(encode_bytes),
+    };
+    serde_json::to_vec(&manifest).context("failed to serialize file integrity manifest")
+}
+
+/// Verifies file manifest fields and optional signature against expected values.
+pub fn verify_file_integrity_manifest(
+    encoded_manifest: &[u8],
+    expected_file_id: &str,
+    expected_total_chunks: u64,
+    expected_sha256: &[u8; 32],
+    signer_public_key: Option<&[u8]>,
+) -> Result<()> {
+    if expected_file_id.trim().is_empty() {
+        return Err(anyhow!("expected_file_id cannot be empty"));
+    }
+    let manifest: FileIntegrityManifest =
+        serde_json::from_slice(encoded_manifest).context("failed to decode file manifest json")?;
+    if manifest.schema_version != E2EE_SCHEMA_VERSION {
+        return Err(anyhow!("unsupported manifest schema version"));
+    }
+    if manifest.protocol != FILE_MANIFEST_PROTOCOL {
+        return Err(anyhow!("unsupported manifest protocol"));
+    }
+    if manifest.file_id != expected_file_id {
+        return Err(anyhow!("manifest file_id mismatch"));
+    }
+    if manifest.total_chunks != expected_total_chunks {
+        return Err(anyhow!("manifest total_chunks mismatch"));
+    }
+    if manifest.sha256_hex != hex::encode(expected_sha256) {
+        return Err(anyhow!("manifest sha256 mismatch"));
+    }
+
+    if let Some(public_key) = signer_public_key {
+        let signature_b64 = manifest
+            .signature_b64
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest signature is missing"))?;
+        let signature = decode_base64(signature_b64, "signature_b64")?;
+        let payload = manifest_signature_payload(
+            &manifest.file_id,
+            manifest.total_chunks,
+            &manifest.sha256_hex,
+        );
+        verify_signature(public_key, payload.as_bytes(), &signature)?;
+    }
+    Ok(())
+}
+
+/// Constructs canonical payload bytes used for file manifest signatures.
+pub fn manifest_signature_payload(file_id: &str, total_chunks: u64, sha256_hex: &str) -> String {
+    format!("{}:{}:{}", file_id, total_chunks, sha256_hex)
+}
+
+// Builds canonical AAD for chunk-level authenticated encryption.
+fn build_file_chunk_aad(file_id: &str, chunk_index: u64, sequence: u64) -> Result<Vec<u8>> {
+    if file_id.trim().is_empty() {
+        return Err(anyhow!("file_id cannot be empty"));
+    }
+    Ok(format!(
+        "{}:{}:{}:{}",
+        FILE_CHUNK_PROTOCOL, file_id, chunk_index, sequence
+    )
+    .into_bytes())
+}
+
+// Derives a deterministic per-chunk nonce from file key and chunk coordinates.
+fn derive_file_chunk_nonce(
+    file_key: &[u8; FILE_KEY_LEN],
+    file_id: &str,
+    chunk_index: u64,
+    sequence: u64,
+) -> [u8; 12] {
+    let mut hasher = Sha256::new();
+    hasher.update(FILE_CHUNK_NONCE_CONTEXT);
+    hasher.update(file_key);
+    hasher.update(file_id.as_bytes());
+    hasher.update(chunk_index.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&hash[..12]);
+    nonce
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_chunk_roundtrip_and_binding() {
+        let key = [7u8; FILE_KEY_LEN];
+        let file_id = "file-123";
+        let chunk = b"chunk-data";
+
+        let encoded = encrypt_file_chunk(&key, file_id, 2, 5, chunk).expect("encrypt");
+        let plain = decrypt_file_chunk(&key, file_id, 2, 5, &encoded).expect("decrypt");
+        assert_eq!(plain, chunk);
+
+        let bad = decrypt_file_chunk(&key, file_id, 3, 5, &encoded);
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn manifest_signature_verification() {
+        let mut seed = [3u8; IDENTITY_SEED_LEN];
+        seed[0] = 9;
+        let digest = [1u8; 32];
+        let payload = manifest_signature_payload("f", 1, &hex::encode(digest));
+        let sig = sign_with_seed(&seed, payload.as_bytes()).expect("sign");
+        let manifest =
+            build_file_integrity_manifest("f", 1, &digest, Some(&sig)).expect("manifest");
+        let pubkey = public_key_from_seed(&seed).expect("pubkey");
+        verify_file_integrity_manifest(&manifest, "f", 1, &digest, Some(&pubkey)).expect("verify");
+    }
 }

@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use cabi_rust_libp2p::{
-    e2ee, AddrState, DhtQueryError, DiscoveryQueue, MessageQueue, PeerManager, PeerManagerHandle,
-    TransportConfig, DEFAULT_DISCOVERY_QUEUE_CAPACITY, DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    e2ee, AddrState, DhtQueryError, DiscoveryQueue, FileTransferQueue, MessageQueue, PeerManager,
+    PeerManagerHandle, TransportConfig, DEFAULT_DISCOVERY_QUEUE_CAPACITY,
+    DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY, DEFAULT_MESSAGE_QUEUE_CAPACITY,
 };
 use libp2p::Multiaddr;
 use serde_json::Value;
@@ -22,6 +23,7 @@ struct TestNode {
     name: &'static str,
     handle: PeerManagerHandle,
     message_queue: MessageQueue,
+    _file_transfer_queue: FileTransferQueue,
     task: JoinHandle<Result<()>>,
 }
 
@@ -50,11 +52,13 @@ async fn spawn_node(
     let config = TransportConfig::new(false, false).with_identity_seed(profile.libp2p_seed);
 
     let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+    let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
     let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
     let addr_state = Arc::new(RwLock::new(AddrState::default()));
     let (manager, handle) = PeerManager::new(
         config,
         message_queue.sender(),
+        file_transfer_queue.sender(),
         discovery_queue.sender(),
         addr_state,
         bootstrap_peers,
@@ -71,6 +75,7 @@ async fn spawn_node(
         name,
         handle,
         message_queue,
+        _file_transfer_queue: file_transfer_queue,
         task,
     })
 }
