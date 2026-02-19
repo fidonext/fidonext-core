@@ -10,8 +10,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(PING_SOURCES
+  ping.cpp
+  abi_bindings.cpp
+  cli_args.cpp
+  dyn_lib.cpp
+  ping_app.cpp
+)
+
 # Add source to this project's executable.
-add_executable (ping "ping.cpp")
+add_executable(ping ${PING_SOURCES})
 
 # Defines
 target_compile_definitions(ping PRIVATE
