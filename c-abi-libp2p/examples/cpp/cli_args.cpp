@@ -84,6 +84,7 @@ void printUsageAndExit()
   std::cout << "relay_chat usage:\n"
             << "  --role relay|leaf (default: leaf)\n"
             << "  --use-quic\n"
+            << "  --use-ws (use WebSocket transport; default listen /tcp/.../ws)\n"
             << "  --listen <multiaddr>\n"
             << "  --bootstrap <multiaddr> (repeatable)\n"
             << "  --force-hop (relay only; start with hop enabled without waiting for AutoNAT)\n"
@@ -125,6 +126,10 @@ Arguments parseArgs(const int argc, char** argv)
     else if (arg == "--use-quic")
     {
       args.useQuic = true;
+    }
+    else if (arg == "--use-ws")
+    {
+      args.useWebsocket = true;
     }
     else if (arg == "--force-hop")
     {
@@ -173,7 +178,12 @@ Arguments parseArgs(const int argc, char** argv)
 
   if (!listenProvided)
   {
-    args.listen = defaultListen(args.useQuic);
+    args.listen = args.useWebsocket ? "/ip4/127.0.0.1/tcp/41000/ws" : defaultListen(args.useQuic);
+  }
+
+  if (args.useQuic && args.useWebsocket)
+  {
+    throw std::invalid_argument("--use-quic and --use-ws cannot be used together");
   }
 
   return args;

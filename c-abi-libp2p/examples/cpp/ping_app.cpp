@@ -5,10 +5,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace ping_example {
 
@@ -30,6 +37,7 @@ std::vector<const char*> toCStrVector(const std::vector<std::string>& values)
 void* createNode(
   const CabiRustLibp2p& abi,
   const bool useQuic,
+  const bool useWebsocket,
   const bool enableRelayHop,
   const std::vector<std::string>& bootstrapPeers,
   const std::optional<std::array<uint8_t, 32>>& seed)
@@ -47,7 +55,15 @@ void* createNode(
     seedLen = seedStorage.size();
   }
 
-  void* node = abi.NewNode(useQuic, enableRelayHop, bootstrapPtrs.data(), bootstrapPtrs.size(), seedPtr, seedLen);
+  void* node = nullptr;
+  if (abi.NewNodeV2)
+  {
+    node = abi.NewNodeV2(useQuic, useWebsocket, enableRelayHop, bootstrapPtrs.data(), bootstrapPtrs.size(), seedPtr, seedLen);
+  }
+  else if (!useWebsocket)
+  {
+    node = abi.NewNode(useQuic, enableRelayHop, bootstrapPtrs.data(), bootstrapPtrs.size(), seedPtr, seedLen);
+  }
   if (!node)
   {
     throw std::runtime_error("failed to create node; see Rust logs for details");
@@ -88,16 +104,17 @@ bool waitForPublicAutonat(const CabiRustLibp2p& abi, void* node, const std::chro
     const int status = abi.AutonatStatus(node);
     if (status == CABI_AUTONAT_PUBLIC)
     {
+      std::cout << "AutoNAT: PUBLIC\n";
       return true;
     }
 
     if (status == CABI_AUTONAT_PRIVATE)
     {
-      std::cout << "AutoNAT: private\n";
+      std::cout << "AutoNAT: PRIVATE\n";
     }
     else if (status == CABI_AUTONAT_UNKNOWN)
     {
-      std::cout << "AutoNAT: unknown\n";
+      std::cout << "AutoNAT: UNKNOWN\n";
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -172,6 +189,17 @@ void recvLoop(const CabiRustLibp2p& abi, void* node, std::atomic<bool>& keepRunn
   }
 }
 
+
+// Returns true when stdin is attached to an interactive terminal.
+bool isInteractiveStdin()
+{
+#ifdef _WIN32
+  return _isatty(_fileno(stdin)) != 0;
+#else
+  return isatty(fileno(stdin)) != 0;
+#endif
+}
+
 // Foreground send loop that reads stdin and forwards messages through the ABI.
 void sendLoop(const CabiRustLibp2p& abi, void* node, std::atomic<bool>& keepRunning)
 {
@@ -190,6 +218,8 @@ void sendLoop(const CabiRustLibp2p& abi, void* node, std::atomic<bool>& keepRunn
     if (line == "/addrs")
     {
       getAddrsSnapshot(abi, node);
+      std::cout << "Enter payload (empty line or /quit to exit):\n";
+      continue;
     }
 
     const int sendStatus = abi.EnqueueMessage(node, reinterpret_cast<const uint8_t*>(line.data()), line.size());
@@ -201,6 +231,12 @@ void sendLoop(const CabiRustLibp2p& abi, void* node, std::atomic<bool>& keepRunn
     }
 
     std::cout << "Enter payload (empty line or /quit to exit):\n";
+  }
+
+  if (keepRunning.load(std::memory_order_acquire) && std::cin.eof())
+  {
+    std::cout << "STDIN closed; stopping send loop.\n";
+    keepRunning.store(false, std::memory_order_release);
   }
 }
 
@@ -245,6 +281,7 @@ bool loadAbi(const DynamicLibrary& library, CabiRustLibp2p& abi)
 {
   abi.InitTracing = reinterpret_cast<InitTracingFunc>(library.symbol("cabi_init_tracing"));
   abi.NewNode = reinterpret_cast<NewNodeFunc>(library.symbol("cabi_node_new"));
+  abi.NewNodeV2 = reinterpret_cast<NewNodeV2Func>(library.symbol("cabi_node_new_v2"));
   abi.ReserveRelay = reinterpret_cast<ReserveRelayFunc>(library.symbol("cabi_node_reserve_relay"));
   abi.ListenNode = reinterpret_cast<ListenNodeFunc>(library.symbol("cabi_node_listen"));
   abi.DialNode = reinterpret_cast<DialNodeFunc>(library.symbol("cabi_node_dial"));
@@ -273,10 +310,12 @@ int runPingApp(const CabiRustLibp2p& abi, const Arguments& args)
   std::atomic<bool> keepRunning(true);
 
   // Step 1. Create node and print PeerId.
-  node.reset(createNode(abi, args.useQuic, false, args.bootstrapPeers, args.identitySeed));
+  const bool enableInitialHop = args.role == Role::Relay && args.forceHop;
+  node.reset(createNode(abi, args.useQuic, args.useWebsocket, enableInitialHop, args.bootstrapPeers, args.identitySeed));
   std::cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
 
   // Step 2. Start listening.
+  std::cout << "Attempting to listen on " << args.listen << "...\n";
   int status = abi.ListenNode(node.handle, args.listen.c_str());
   std::cout << "Listening on " << args.listen << "\n";
   if (status != CABI_STATUS_SUCCESS)
@@ -289,7 +328,7 @@ int runPingApp(const CabiRustLibp2p& abi, const Arguments& args)
   {
     if (args.forceHop)
     {
-      std::cout << "Force hop enabled; skipping AutoNAT wait\n";
+      std::cout << "Force hop enabled; relay started with hop support.\n";
     }
     else
     {
@@ -299,20 +338,20 @@ int runPingApp(const CabiRustLibp2p& abi, const Arguments& args)
 
       if (waitForPublicAutonat(abi, node.handle, waitTime))
       {
-        std::cout << "AutoNAT is PUBLIC; restarting with relay hop enabled\n";
-        node.reset(createNode(abi, args.useQuic, true, args.bootstrapPeers, args.identitySeed));
+        std::cout << "AutoNAT PUBLIC detected. Restarting relay with hop enabled.\n";
+        node.reset(createNode(abi, args.useQuic, args.useWebsocket, true, args.bootstrapPeers, args.identitySeed));
 
+        std::cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
+        std::cout << "Attempting to listen on " << args.listen << "...\n";
         status = abi.ListenNode(node.handle, args.listen.c_str());
-        std::cout << "Listening with hop relay on " << args.listen << "\n";
         if (status != CABI_STATUS_SUCCESS)
         {
           throw std::runtime_error("cabi_node_listen failed after hop restart: " + statusMessage(status));
         }
-        std::cout << "Local PeerId: " << readPeerId(abi, node.handle) << "\n";
       }
       else
       {
-        std::cout << "AutoNAT did not report PUBLIC within window; staying without hop\n";
+        std::cout << "AutoNAT did not report PUBLIC; continuing without hop.\n";
         reserveOnRelays(abi, node.handle, args.bootstrapPeers);
       }
     }
@@ -322,9 +361,20 @@ int runPingApp(const CabiRustLibp2p& abi, const Arguments& args)
   dialPeers(abi, node.handle, args.bootstrapPeers, "bootstrap");
   dialPeers(abi, node.handle, args.targetPeers, "target");
 
-  // Step 5. Run interactive messaging loops.
+  // Step 5. Run receive loop and optional interactive send loop.
   std::thread receiver(recvLoop, std::cref(abi), node.handle, std::ref(keepRunning));
-  sendLoop(abi, node.handle, keepRunning);
+  if (isInteractiveStdin())
+  {
+    sendLoop(abi, node.handle, keepRunning);
+  }
+  else
+  {
+    std::cout << "STDIN is non-interactive; running receive-only mode. Press Ctrl+C to exit.\n";
+    while (keepRunning.load(std::memory_order_acquire))
+    {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  }
   keepRunning.store(false, std::memory_order_release);
   receiver.join();
 
