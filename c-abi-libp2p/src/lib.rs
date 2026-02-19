@@ -43,6 +43,14 @@ pub const CABI_STATUS_QUEUE_EMPTY: c_int = -1;
 /// Provided buffer is too small to fit the dequeued message.
 pub const CABI_STATUS_BUFFER_TOO_SMALL: c_int = -2;
 
+/// No file-transfer frame available in the internal queue.
+pub const CABI_STATUS_FILE_TRANSFER_EMPTY: c_int = -3;
+
+pub const CABI_FILE_TRANSFER_FRAME_INIT: c_int = 0;
+pub const CABI_FILE_TRANSFER_FRAME_CHUNK: c_int = 1;
+pub const CABI_FILE_TRANSFER_FRAME_COMPLETE: c_int = 2;
+pub const CABI_FILE_TRANSFER_FRAME_STATUS: c_int = 3;
+
 /// The discovery query timed out.
 pub const CABI_STATUS_TIMEOUT: c_int = 6;
 /// The target peer could not be located in the DHT.
@@ -82,6 +90,7 @@ struct ManagedNode {
     worker: Option<JoinHandle<()>>,
     autonat_status: watch::Receiver<autonat::NatStatus>,
     message_queue: messaging::MessageQueue,
+    file_transfer_queue: messaging::FileTransferQueue,
     discovery_queue: peer::DiscoveryQueue,
     discovery_sequence: AtomicU64,
     addr_state: Arc<RwLock<AddrState>>,
@@ -92,12 +101,15 @@ impl ManagedNode {
     fn new(config: transport::TransportConfig, bootstrap_peers: Vec<Multiaddr>) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
         let message_queue = messaging::MessageQueue::new(messaging::DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue =
+            messaging::FileTransferQueue::new(messaging::DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
         let discovery_queue = peer::DiscoveryQueue::new(peer::DEFAULT_DISCOVERY_QUEUE_CAPACITY);
         let addr_state = Arc::new(RwLock::new(AddrState::default()));
 
         let (manager, handle) = peer::PeerManager::new(
             config,
             message_queue.sender(),
+            file_transfer_queue.sender(),
             discovery_queue.sender(),
             addr_state.clone(),
             bootstrap_peers,
@@ -116,6 +128,7 @@ impl ManagedNode {
             autonat_status,
             worker: Some(worker),
             message_queue,
+            file_transfer_queue,
             discovery_queue,
             discovery_sequence: AtomicU64::new(0),
             addr_state,
@@ -190,6 +203,27 @@ impl ManagedNode {
     /// Attempts to pull a message from the internal queue without blocking.
     fn try_dequeue_message(&mut self) -> Option<Vec<u8>> {
         self.message_queue.try_dequeue()
+    }
+
+    // Starts an outbound file transfer to a specific peer via the dedicated transport protocol.
+    fn start_file_transfer(
+        &self,
+        recipient: PeerId,
+        metadata: messaging::FileMetadata,
+        data: Vec<u8>,
+        chunk_size: usize,
+    ) -> Result<()> {
+        self.runtime
+            .block_on(
+                self.handle
+                    .start_file_transfer(recipient, metadata, data, chunk_size),
+            )
+            .context("failed to start file transfer")
+    }
+
+    // Tries to pull the next inbound file-transfer frame without blocking.
+    fn try_dequeue_file_transfer(&mut self) -> Option<messaging::InboundFileTransferFrame> {
+        self.file_transfer_queue.try_dequeue()
     }
 
     /// Returns the local peer identifier.
@@ -324,9 +358,14 @@ pub extern "C" fn cabi_identity_sign_with_seed(
     out_signature_len: usize,
     out_written_len: *mut usize,
 ) -> c_int {
-    if seed_ptr.is_null() || payload_ptr.is_null() || out_signature.is_null() || out_written_len.is_null() {
+    if seed_ptr.is_null()
+        || payload_ptr.is_null()
+        || out_signature.is_null()
+        || out_written_len.is_null()
+    {
         return CABI_STATUS_NULL_POINTER;
     }
+
     if seed_len != 32 || payload_len == 0 || out_signature_len == 0 {
         return CABI_STATUS_INVALID_ARGUMENT;
     }
@@ -346,7 +385,13 @@ pub extern "C" fn cabi_identity_sign_with_seed(
         Ok(value) => value,
         Err(_) => return CABI_STATUS_INTERNAL_ERROR,
     };
-    write_bytes(&signature, out_signature, out_signature_len, out_written_len)
+
+    write_bytes(
+        &signature,
+        out_signature,
+        out_signature_len,
+        out_written_len,
+    )
 }
 
 #[no_mangle]
@@ -370,7 +415,13 @@ pub extern "C" fn cabi_identity_peer_id_from_public_key(
         Err(_) => return CABI_STATUS_INVALID_ARGUMENT,
     };
     let peer_id = PeerId::from(public_key).to_string();
-    write_c_string(peer_id.as_str(), out_buffer, out_buffer_len, out_written_len)
+
+    write_c_string(
+        peer_id.as_str(),
+        out_buffer,
+        out_buffer_len,
+        out_written_len,
+    )
 }
 
 #[no_mangle]
@@ -1345,7 +1396,7 @@ pub extern "C" fn cabi_node_local_peer_id(
 /// C-ABI. Requests a circuit-relay reservation on the given relay address.
 pub extern "C" fn cabi_node_reserve_relay(
     handle: *mut CabiNodeHandle,
-    address: *const c_char
+    address: *const c_char,
 ) -> c_int {
     let node = match node_from_ptr(handle) {
         Ok(node) => node,
@@ -1610,6 +1661,218 @@ pub extern "C" fn cabi_node_dequeue_message(
             }
 
             CABI_STATUS_SUCCESS
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI: starts a stream-based file transfer to the selected peer.
+pub extern "C" fn cabi_node_start_file_transfer(
+    handle: *mut CabiNodeHandle,
+    peer_id: *const c_char,
+    file_id: *const c_char,
+    file_name: *const c_char,
+    file_size: u64,
+    file_hash: *const c_char,
+    file_mime: *const c_char,
+    data_ptr: *const u8,
+    data_len: usize,
+    chunk_size: usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    if data_ptr.is_null()
+        || file_id.is_null()
+        || file_name.is_null()
+        || file_hash.is_null()
+        || file_mime.is_null()
+    {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if data_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    let file_id = match parse_required_c_string(file_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let file_name = match parse_required_c_string(file_name) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let file_hash = match parse_required_c_string(file_hash) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let file_mime = match parse_required_c_string(file_mime) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let data = unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec();
+    let metadata = messaging::FileMetadata {
+        file_id,
+        name: file_name,
+        size: file_size,
+        hash: file_hash,
+        mime: file_mime,
+    };
+
+    match node.start_file_transfer(peer_id, metadata, data, chunk_size) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::error!(target: "ffi", %err, "failed to start file transfer");
+            CABI_STATUS_INTERNAL_ERROR
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI: reads the next inbound file-transfer frame from the dedicated queue.
+pub extern "C" fn cabi_node_receive_file_transfer(
+    handle: *mut CabiNodeHandle,
+    frame_kind: *mut c_int,
+    from_peer_buffer: *mut c_char,
+    from_peer_buffer_len: usize,
+    from_peer_written_len: *mut usize,
+    file_id_buffer: *mut c_char,
+    file_id_buffer_len: usize,
+    file_id_written_len: *mut usize,
+    payload_buffer: *mut u8,
+    payload_buffer_len: usize,
+    payload_written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+
+    if frame_kind.is_null()
+        || from_peer_buffer.is_null()
+        || from_peer_written_len.is_null()
+        || file_id_buffer.is_null()
+        || file_id_written_len.is_null()
+        || payload_buffer.is_null()
+        || payload_written_len.is_null()
+    {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if from_peer_buffer_len == 0 || file_id_buffer_len == 0 || payload_buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    unsafe {
+        *from_peer_written_len = 0;
+        *file_id_written_len = 0;
+        *payload_written_len = 0;
+    }
+
+    let event = match node.try_dequeue_file_transfer() {
+        Some(event) => event,
+        None => return CABI_STATUS_FILE_TRANSFER_EMPTY,
+    };
+
+    let from_peer = event.from_peer.to_string();
+    let from_peer_status = write_c_string(
+        &from_peer,
+        from_peer_buffer,
+        from_peer_buffer_len,
+        from_peer_written_len,
+    );
+    if from_peer_status != CABI_STATUS_SUCCESS {
+        return from_peer_status;
+    }
+
+    match event.frame {
+        messaging::FileTransferFrame::Init { metadata } => {
+            unsafe {
+                *frame_kind = CABI_FILE_TRANSFER_FRAME_INIT;
+            }
+            let status = write_c_string(
+                &metadata.file_id,
+                file_id_buffer,
+                file_id_buffer_len,
+                file_id_written_len,
+            );
+            if status != CABI_STATUS_SUCCESS {
+                return status;
+            }
+            let payload = format!(
+                "name={}\\nsize={}\\nhash={}\\nmime={}",
+                metadata.name, metadata.size, metadata.hash, metadata.mime
+            );
+            write_bytes(
+                payload.as_bytes(),
+                payload_buffer,
+                payload_buffer_len,
+                payload_written_len,
+            )
+        }
+        messaging::FileTransferFrame::Chunk {
+            file_id,
+            offset: _,
+            data,
+        } => {
+            unsafe {
+                *frame_kind = CABI_FILE_TRANSFER_FRAME_CHUNK;
+            }
+            let status = write_c_string(
+                &file_id,
+                file_id_buffer,
+                file_id_buffer_len,
+                file_id_written_len,
+            );
+            if status != CABI_STATUS_SUCCESS {
+                return status;
+            }
+            write_bytes(
+                &data,
+                payload_buffer,
+                payload_buffer_len,
+                payload_written_len,
+            )
+        }
+        messaging::FileTransferFrame::Complete { file_id } => {
+            unsafe {
+                *frame_kind = CABI_FILE_TRANSFER_FRAME_COMPLETE;
+            }
+            let status = write_c_string(
+                &file_id,
+                file_id_buffer,
+                file_id_buffer_len,
+                file_id_written_len,
+            );
+            if status != CABI_STATUS_SUCCESS {
+                return status;
+            }
+            CABI_STATUS_SUCCESS
+        }
+        messaging::FileTransferFrame::Status { file_id, status } => {
+            unsafe {
+                *frame_kind = CABI_FILE_TRANSFER_FRAME_STATUS;
+            }
+            let code = write_c_string(
+                &file_id,
+                file_id_buffer,
+                file_id_buffer_len,
+                file_id_written_len,
+            );
+            if code != CABI_STATUS_SUCCESS {
+                return code;
+            }
+            write_bytes(
+                status.as_bytes(),
+                payload_buffer,
+                payload_buffer_len,
+                payload_written_len,
+            )
         }
     }
 }

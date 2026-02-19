@@ -10,11 +10,10 @@ use futures::StreamExt;
 use libp2p::{
     autonat,
     core::Multiaddr,
-    gossipsub, identity, identify,
+    gossipsub, identify, identity,
     kad::{self, store::RecordStore, QueryResult},
     multiaddr::Protocol,
-    request_response,
-    relay,
+    relay, request_response,
     swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
 };
@@ -48,18 +47,19 @@ fn mailbox_fetch_next_interval() -> Duration {
 }
 
 use crate::{
-    peer::addr_events::{AddrEvent, AddrState},
     messaging::{
-        build_ack, build_envelope_from_payload, build_mailbox_fetch, build_nack, encode_frame,
-        is_addressed_payload, now_unix_seconds, parse_frame, DeliveryAck, DeliveryEnvelope,
-        DeliveryAckKind, DeliveryFrame, DeliveryMailboxFetch, DeliveryNack, DeliveryNackReason,
-        MessageQueueSender,
+        build_ack, build_envelope_from_payload, build_mailbox_fetch, build_nack,
+        chunk_size_or_default, encode_frame, is_addressed_payload, now_unix_seconds, parse_frame,
+        DeliveryAck, DeliveryAckKind, DeliveryEnvelope, DeliveryFrame, DeliveryMailboxFetch,
+        DeliveryNack, DeliveryNackReason, FileMetadata, FileTransferFrame, FileTransferQueueSender,
+        InboundFileTransferFrame, MessageQueueSender,
     },
-    peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
+    peer::addr_events::{AddrEvent, AddrState},
     peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
+    peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
     transport::{
-        BehaviourEvent, DeliveryDirectRequest, DeliveryDirectResponse, NetworkBehaviour,
-        TransportConfig,
+        BehaviourEvent, DeliveryDirectRequest, DeliveryDirectResponse, FileTransferRequest,
+        FileTransferResponse, NetworkBehaviour, TransportConfig,
     },
     //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
@@ -90,6 +90,13 @@ pub enum PeerCommand {
     GetDhtRecord {
         key: Vec<u8>,
         response: oneshot::Sender<std::result::Result<Vec<u8>, DhtQueryError>>,
+    },
+    /// File sending pipeline.
+    StartFileTransfer {
+        recipient: PeerId,
+        metadata: FileMetadata,
+        data: Vec<u8>,
+        chunk_size: usize,
     },
     /// Shut the manager down gracefully.
     Shutdown,
@@ -223,6 +230,25 @@ impl PeerManagerHandle {
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
+
+    // Requests starting an outbound file transfer to the target peer via the dedicated protocol.
+    pub async fn start_file_transfer(
+        &self,
+        recipient: PeerId,
+        metadata: FileMetadata,
+        data: Vec<u8>,
+        chunk_size: usize,
+    ) -> Result<()> {
+        self.command_sender
+            .send(PeerCommand::StartFileTransfer {
+                recipient,
+                metadata,
+                data,
+                chunk_size,
+            })
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +295,7 @@ pub struct PeerManager {
     local_peer_id: PeerId,
     keypair: identity::Keypair,
     inbound_sender: MessageQueueSender,
+    file_transfer_sender: FileTransferQueueSender,
     gossipsub_topic: gossipsub::IdentTopic,
     autonat_status: watch::Sender<autonat::NatStatus>,
     discovery_sender: DiscoveryEventSender,
@@ -286,6 +313,7 @@ pub struct PeerManager {
     mailbox_store: Option<PersistentMailboxStore>,
     pending_envelopes: HashMap<String, PendingEnvelope>,
     pending_direct_requests: HashMap<request_response::OutboundRequestId, PendingDirectRequest>,
+    pending_file_transfer_requests: HashSet<request_response::OutboundRequestId>,
     delivered_envelopes: HashMap<String, u64>,
     mailbox_queues: HashMap<PeerId, VecDeque<StoredEnvelope>>,
     next_mailbox_fetch_at: Instant,
@@ -297,6 +325,7 @@ impl PeerManager {
     pub fn new(
         config: TransportConfig,
         inbound_sender: MessageQueueSender,
+        file_transfer_sender: FileTransferQueueSender,
         discovery_sender: DiscoveryEventSender,
         addr_state: Arc<RwLock<AddrState>>,
         bootstrap_peers: Vec<Multiaddr>,
@@ -351,6 +380,7 @@ impl PeerManager {
             local_peer_id,
             keypair,
             inbound_sender,
+            file_transfer_sender,
             gossipsub_topic,
             autonat_status,
             discovery_sender,
@@ -367,6 +397,7 @@ impl PeerManager {
             mailbox_store,
             pending_envelopes: HashMap::new(),
             pending_direct_requests: HashMap::new(),
+            pending_file_transfer_requests: HashSet::new(),
             delivered_envelopes: HashMap::new(),
             mailbox_queues: HashMap::new(),
             next_mailbox_fetch_at: Instant::now() + mailbox_fetch_next_interval(),
@@ -600,11 +631,65 @@ impl PeerManager {
                 tracing::info!(target: "peer", ?query_id, "started dht get_record query");
                 Ok(false)
             }
+            PeerCommand::StartFileTransfer {
+                recipient,
+                metadata,
+                data,
+                chunk_size,
+            } => {
+                self.handle_start_file_transfer(recipient, metadata, data, chunk_size);
+                Ok(false)
+            }
             PeerCommand::Shutdown => {
                 tracing::info!(target: "peer", "shutdown requested");
                 Ok(true)
             }
         }
+    }
+
+    // Builds and sends the Init/Chunk/Complete sequence for a file transfer.
+    fn handle_start_file_transfer(
+        &mut self,
+        recipient: PeerId,
+        metadata: FileMetadata,
+        data: Vec<u8>,
+        chunk_size: usize,
+    ) {
+        let chunk_size = chunk_size_or_default(chunk_size);
+        let init_request_id = self.swarm.behaviour_mut().file_transfer.send_request(
+            &recipient,
+            FileTransferRequest {
+                frame: FileTransferFrame::Init {
+                    metadata: metadata.clone(),
+                },
+            },
+        );
+        self.pending_file_transfer_requests.insert(init_request_id);
+
+        for (index, chunk) in data.chunks(chunk_size).enumerate() {
+            let request_id = self.swarm.behaviour_mut().file_transfer.send_request(
+                &recipient,
+                FileTransferRequest {
+                    frame: FileTransferFrame::Chunk {
+                        file_id: metadata.file_id.clone(),
+                        offset: (index * chunk_size) as u64,
+                        data: chunk.to_vec(),
+                    },
+                },
+            );
+            self.pending_file_transfer_requests.insert(request_id);
+        }
+
+        let complete_request_id = self.swarm.behaviour_mut().file_transfer.send_request(
+            &recipient,
+            FileTransferRequest {
+                frame: FileTransferFrame::Complete {
+                    file_id: metadata.file_id,
+                },
+            },
+        );
+        self.pending_file_transfer_requests
+            .insert(complete_request_id);
     }
 
     fn handle_delivery_tick(&mut self) {
@@ -1032,6 +1117,12 @@ impl PeerManager {
                         pending.retry_delay = DELIVERY_MAX_RETRY_DELAY;
                         pending.next_retry_at = Instant::now() + DELIVERY_MAX_RETRY_DELAY;
                         let _ = pending;
+                        self.emit_delivery_status(
+                            &recipient_peer_id,
+                            ack.envelope_id.as_str(),
+                            "stored",
+                            None,
+                        );
                         self.emit_delivery_status(&recipient_peer_id, ack.envelope_id.as_str(), "stored", None);
                         tracing::debug!(
                             target: "peer",
@@ -1123,7 +1214,8 @@ impl PeerManager {
                     "retrying",
                     Some("quota_exceeded"),
                 );
-                self.pending_envelopes.insert(nack.envelope_id.clone(), pending);
+                self.pending_envelopes
+                    .insert(nack.envelope_id.clone(), pending);
                 tracing::warn!(
                     target: "peer",
                     envelope_id = %nack.envelope_id,
@@ -1511,6 +1603,10 @@ impl PeerManager {
                 self.handle_delivery_direct_event(event);
             }
 
+            BehaviourEvent::FileTransfer(event) => {
+                self.handle_file_transfer_event(event);
+            }
+
             BehaviourEvent::Autonat(event) => {
                 tracing::debug!(target:"peer", ?event, "autonat event");
 
@@ -1653,6 +1749,73 @@ impl PeerManager {
                     ?request_id,
                     "direct delivery response sent",
                 );
+            }
+        }
+    }
+
+    // Handles file-transfer protocol events and enqueues inbound frames into the dedicated queue.
+    fn handle_file_transfer_event(
+        &mut self,
+        event: request_response::Event<FileTransferRequest, FileTransferResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request,
+                    channel,
+                    request_id,
+                } => {
+                    let enqueue_result =
+                        self.file_transfer_sender
+                            .try_enqueue(InboundFileTransferFrame {
+                                from_peer: peer,
+                                frame: request.frame,
+                            });
+                    let accepted = enqueue_result.is_ok();
+                    if let Err(err) = enqueue_result {
+                        tracing::warn!(target: "peer", %err, "failed to enqueue inbound file transfer frame");
+                    }
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .file_transfer
+                        .send_response(channel, FileTransferResponse { accepted })
+                        .is_err()
+                    {
+                        tracing::debug!(target: "peer", %peer, ?request_id, "failed to send file transfer response");
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    self.pending_file_transfer_requests.remove(&request_id);
+                    if !response.accepted {
+                        tracing::warn!(target: "peer", %peer, ?request_id, "file transfer request was rejected");
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                self.pending_file_transfer_requests.remove(&request_id);
+                tracing::warn!(target: "peer", %peer, ?request_id, %error, "file transfer outbound request failed");
+            }
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                tracing::warn!(target: "peer", %peer, ?request_id, %error, "file transfer inbound request failed");
+            }
+            request_response::Event::ResponseSent {
+                peer, request_id, ..
+            } => {
+                tracing::debug!(target: "peer", %peer, ?request_id, "file transfer response sent");
             }
         }
     }

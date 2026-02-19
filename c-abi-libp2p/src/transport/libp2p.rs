@@ -11,15 +11,15 @@ use libp2p::{
     },
     gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
-    noise, ping, quic, relay, rendezvous,
-    request_response,
+    noise, ping, quic, relay, rendezvous, request_response,
     swarm::behaviour::toggle::Toggle,
     swarm::{Config as SwarmConfig, Swarm},
-    tcp, PeerId, StreamProtocol,
-    websocket,
+    tcp, websocket, PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+use crate::messaging::FileTransferFrame;
 
 /// Combined libp2p behaviour used across the node.
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -39,13 +39,15 @@ pub struct NetworkBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// Optional relay server (hop) behaviour for acting as a public relay.
     pub relay_server: Toggle<relay::Behaviour>,
-    /// Optional Rendezvous client for asking for a catalog of peers 
+    /// Optional Rendezvous client for asking for a catalog of peers
     pub rendezvous_client: Toggle<rendezvous::client::Behaviour>,
     /// Optional Rendezvous server for storing and sharing catalog of peers
     pub rendezvous_server: Toggle<rendezvous::server::Behaviour>,
     /// Direct unicast request-response channel for addressed delivery frames.
     pub delivery_direct:
         request_response::cbor::Behaviour<DeliveryDirectRequest, DeliveryDirectResponse>,
+    /// Dedicated stream-oriented protocol for file transfer bulk payloads.
+    pub file_transfer: request_response::cbor::Behaviour<FileTransferRequest, FileTransferResponse>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -62,6 +64,7 @@ pub enum BehaviourEvent {
     RendezvousClient(rendezvous::client::Event),
     RendezvousServer(rendezvous::server::Event),
     DeliveryDirect(request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>),
+    FileTransfer(request_response::Event<FileTransferRequest, FileTransferResponse>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +74,16 @@ pub struct DeliveryDirectRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryDirectResponse {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferRequest {
+    pub frame: FileTransferFrame,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferResponse {
     pub accepted: bool,
 }
 
@@ -128,9 +141,17 @@ impl From<rendezvous::server::Event> for BehaviourEvent {
     }
 }
 
-impl From<request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>> for BehaviourEvent {
+impl From<request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>>
+    for BehaviourEvent
+{
     fn from(event: request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>) -> Self {
         Self::DeliveryDirect(event)
+    }
+}
+
+impl From<request_response::Event<FileTransferRequest, FileTransferResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<FileTransferRequest, FileTransferResponse>) -> Self {
+        Self::FileTransfer(event)
     }
 }
 
@@ -280,6 +301,14 @@ impl TransportConfig {
             direct_cfg,
         );
 
+        let file_transfer = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/fidonext/file-transfer/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+        );
+
         NetworkBehaviour {
             kademlia,
             ping: ping::Behaviour::new(ping_config),
@@ -291,6 +320,7 @@ impl TransportConfig {
             rendezvous_client,
             rendezvous_server,
             delivery_direct,
+            file_transfer,
         }
     }
 

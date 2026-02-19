@@ -5,6 +5,8 @@
 
 pub mod delivery;
 pub mod messaging;
+pub mod file_transfer;
 
 pub use delivery::*;
+pub use file_transfer::*;
 pub use messaging::{MessageQueue, MessageQueueSender, DEFAULT_MESSAGE_QUEUE_CAPACITY};
