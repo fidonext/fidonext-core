@@ -3,6 +3,10 @@
 //! For now we expose a simple in-memory queue that can be used by the FFI
 //! surface to pass binary payloads between the host runtime and the Rust core.
 
+pub mod delivery;
 pub mod messaging;
+pub mod file_transfer;
 
-pub use messaging::{ MessageQueue, MessageQueueSender, DEFAULT_MESSAGE_QUEUE_CAPACITY};
+pub use delivery::*;
+pub use file_transfer::*;
+pub use messaging::{MessageQueue, MessageQueueSender, DEFAULT_MESSAGE_QUEUE_CAPACITY};

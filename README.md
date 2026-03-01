@@ -77,6 +77,24 @@ The FidoNext messenger provides:
 - Multi-relay routing
 - Offline message caching
 
+## Current Implementation Status
+
+This repository currently ships the low-level networking/E2EE core in
+`c-abi-libp2p/` (Rust + C-ABI + Python examples).
+
+- Messaging transport: `libp2p` (gossipsub + Kademlia DHT).
+- End-to-end encryption: official `libsignal` runtime path for auto messaging.
+- Auto E2EE mode is strict: message establishment/decryption requires
+  `libsignal` prekey bundle fields (legacy explicit prekey/session auto path is
+  disabled).
+- Single-device delivery mode: each profile/device is currently treated as an
+  independent peer endpoint.
+- Smoke coverage:
+  - Rust local mesh: `cargo run --example e2ee_local_mesh`
+  - Python local mesh: `E2EE_MODE=on bash c-abi-libp2p/examples/python/run_local_mesh.sh`
+- Protocol drafts:
+  - Relay policy + offline mailbox: `c-abi-libp2p/docs/relay-policy-offline-mailbox-spec.md`
+
 ## Repository Structure
 
 /protocol/ — Phoenix Protocol specification & research

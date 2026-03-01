@@ -3,21 +3,23 @@
 use anyhow::{anyhow, Result};
 use futures::future::Either;
 use libp2p::{
+    autonat,
     core::{
         muxing::StreamMuxerBox,
         transport::{Boxed, Transport},
         upgrade,
     },
-    gossipsub,
-    identify, identity,
+    gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
-    noise, ping, quic,
+    noise, ping, quic, relay, rendezvous, request_response,
+    swarm::behaviour::toggle::Toggle,
     swarm::{Config as SwarmConfig, Swarm},
-    tcp, PeerId, autonat, 
-    relay, swarm::behaviour::toggle::Toggle,
-    rendezvous
+    tcp, websocket, PeerId, StreamProtocol,
 };
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+use crate::messaging::FileTransferFrame;
 
 /// Combined libp2p behaviour used across the node.
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -37,10 +39,15 @@ pub struct NetworkBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// Optional relay server (hop) behaviour for acting as a public relay.
     pub relay_server: Toggle<relay::Behaviour>,
-    /// Optional Rendezvous client for asking for a catalog of peers 
+    /// Optional Rendezvous client for asking for a catalog of peers
     pub rendezvous_client: Toggle<rendezvous::client::Behaviour>,
     /// Optional Rendezvous server for storing and sharing catalog of peers
     pub rendezvous_server: Toggle<rendezvous::server::Behaviour>,
+    /// Direct unicast request-response channel for addressed delivery frames.
+    pub delivery_direct:
+        request_response::cbor::Behaviour<DeliveryDirectRequest, DeliveryDirectResponse>,
+    /// Dedicated stream-oriented protocol for file transfer bulk payloads.
+    pub file_transfer: request_response::cbor::Behaviour<FileTransferRequest, FileTransferResponse>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -48,6 +55,7 @@ pub struct NetworkBehaviour {
 pub enum BehaviourEvent {
     Kademlia(kad::Event),
     Ping(ping::Event),
+    /// Appears on creating connection and handshake on identity
     Identify(identify::Event),
     Autonat(autonat::Event),
     Gossipsub(gossipsub::Event),
@@ -55,6 +63,28 @@ pub enum BehaviourEvent {
     RelayServer(relay::Event),
     RendezvousClient(rendezvous::client::Event),
     RendezvousServer(rendezvous::server::Event),
+    DeliveryDirect(request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>),
+    FileTransfer(request_response::Event<FileTransferRequest, FileTransferResponse>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryDirectRequest {
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryDirectResponse {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferRequest {
+    pub frame: FileTransferFrame,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferResponse {
+    pub accepted: bool,
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -128,6 +158,20 @@ impl RelayHopMode {
     }
 }
 
+impl From<request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>>
+    for BehaviourEvent
+{
+    fn from(event: request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>) -> Self {
+        Self::DeliveryDirect(event)
+    }
+}
+
+impl From<request_response::Event<FileTransferRequest, FileTransferResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<FileTransferRequest, FileTransferResponse>) -> Self {
+        Self::FileTransfer(event)
+    }
+}
+
 /// Transport configuration builder.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -135,6 +179,8 @@ pub struct TransportConfig {
     pub use_quic: bool,
     /// Controls when the node should act as a hop relay.
     pub relay_hop_mode: RelayHopMode,
+    /// When set, enable WebSocket transport (/ws multiaddrs) alongside TCP.
+    pub use_websocket: bool,
     /// Controls whether rendezvous behaviours are enabled.
     pub enable_rendezvous: bool,
     /// Optional seed for deriving an exact Ed25519 identity keypair.
@@ -144,8 +190,9 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            use_quic: false, // Turn on for quic
-            relay_hop_mode: RelayHopMode::Disabled, // Turn on for node act as relay (at least try)
+            use_quic: false,
+            relay_hop_mode: RelayHopMode::Disabled,
+            use_websocket: false,
             enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
             identity_seed: None, // Pass to use identity seed for generating keypair
         }
@@ -153,7 +200,7 @@ impl Default for TransportConfig {
 }
 
 impl TransportConfig {
-     /// Creates a new configuration with the provided flags.
+    /// Creates a new configuration with the provided flags.
     pub fn new(use_quic: bool, relay_hop_mode: RelayHopMode) -> Self {
         Self {
             use_quic,
@@ -242,6 +289,9 @@ impl TransportConfig {
             Toggle::from(None)
         };
 
+        let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
+        kademlia.set_mode(Some(kad::Mode::Server));
+
         let rendezvous_client = if enable_rendezvous {
             Toggle::from(Some(rendezvous::client::Behaviour::new(
                 keypair.clone(),
@@ -258,8 +308,26 @@ impl TransportConfig {
             Toggle::from(None)
         };
 
+        let direct_cfg =
+            request_response::Config::default().with_request_timeout(Duration::from_secs(8));
+        let delivery_direct = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/fidonext/delivery-direct/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            direct_cfg,
+        );
+
+        let file_transfer = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/fidonext/file-transfer/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+        );
+
         NetworkBehaviour {
-            kademlia: kad::Behaviour::with_config(peer_id, store, kad_config),
+            kademlia,
             ping: ping::Behaviour::new(ping_config),
             identify: identify::Behaviour::new(identify_config),
             autonat: autonat::Behaviour::new(peer_id, autonat_config),
@@ -268,6 +336,8 @@ impl TransportConfig {
             relay_server,
             rendezvous_client,
             rendezvous_server,
+            delivery_direct,
+            file_transfer,
         }
     }
 
@@ -276,16 +346,13 @@ impl TransportConfig {
         &self,
         keypair: &identity::Keypair,
         local_peer_id: PeerId,
-    ) -> Result<(
-        Boxed<(PeerId, StreamMuxerBox)>,
-        relay::client::Behaviour,
-     )> {
+    ) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
         let noise_config = noise::Config::new(keypair)
             .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
 
         let tcp_transport = Self::build_tcp_transport(noise_config.clone())?;
 
-        let base_transport = if self.use_quic {
+        let mut base_transport: Boxed<(PeerId, StreamMuxerBox)> = if self.use_quic {
             let quic_transport = Self::build_quic_transport(keypair);
             quic_transport
                 .or_transport(tcp_transport)
@@ -296,6 +363,16 @@ impl TransportConfig {
         } else {
             tcp_transport
         };
+
+        if self.use_websocket {
+            let ws_transport = Self::build_ws_transport(noise_config.clone())?;
+            base_transport = ws_transport
+                .or_transport(base_transport)
+                .map(|either, _| match either {
+                    Either::Left(output) | Either::Right(output) => output,
+                })
+                .boxed();
+        }
 
         let (relay_transport, relay_client) =
             Self::build_relay_transport(noise_config.clone(), local_peer_id);
@@ -330,14 +407,22 @@ impl TransportConfig {
             .boxed()
     }
 
+    /// Configures WebSocket transport (/ws multiaddrs) over TCP, then Noise + Yamux.
+    fn build_ws_transport(noise_config: noise::Config) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default());
+        let ws_transport = websocket::Config::new(tcp_transport);
+        Ok(ws_transport
+            .upgrade(upgrade::Version::V1Lazy)
+            .authenticate(noise_config)
+            .multiplex(libp2p::yamux::Config::default())
+            .boxed())
+    }
+
     /// Configures Relay transport
     fn build_relay_transport(
         noise_config: noise::Config,
         local_peer_id: PeerId,
-    ) -> (
-        Boxed<(PeerId, StreamMuxerBox)>,
-        relay::client::Behaviour,
-    ) {
+    ) -> (Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour) {
         let (relay_transport, relay_client) = relay::client::new(local_peer_id);
 
         let relay_transport = relay_transport
