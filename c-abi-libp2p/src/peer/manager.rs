@@ -14,7 +14,7 @@ use libp2p::{
     kad::{self, store::RecordStore, QueryResult},
     multiaddr::Protocol,
     relay, request_response,
-    swarm::{behaviour::toggle::Toggle, DialError, Swarm, SwarmEvent},
+    swarm::{DialError, Swarm, SwarmEvent},
     PeerId,
 };
 use rand::Rng;
@@ -59,7 +59,7 @@ use crate::{
     peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
     transport::{
         BehaviourEvent, DeliveryDirectRequest, DeliveryDirectResponse, FileTransferRequest,
-        FileTransferResponse, NetworkBehaviour, RelayHopMode, TransportConfig,
+        FileTransferResponse, NetworkBehaviour, TransportConfig,
     },
     //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
@@ -298,7 +298,6 @@ pub struct PeerManager {
     file_transfer_sender: FileTransferQueueSender,
     gossipsub_topic: gossipsub::IdentTopic,
     autonat_status: watch::Sender<autonat::NatStatus>,
-    relay_hop_mode: RelayHopMode,
     discovery_sender: DiscoveryEventSender,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
     dht_put_queries: HashMap<kad::QueryId, PendingDhtPutQuery>,
@@ -331,8 +330,7 @@ impl PeerManager {
         addr_state: Arc<RwLock<AddrState>>,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<(Self, PeerManagerHandle)> {
-        let relay_hop_mode = config.relay_hop_mode;
-        let mailbox_enabled = relay_hop_mode != RelayHopMode::Disabled;
+        let mailbox_enabled = config.hop_relay;
         let (keypair, swarm) = config.build()?;
         let local_peer_id = PeerId::from(keypair.public());
         let (command_sender, command_receiver) = mpsc::channel(32);
@@ -385,7 +383,6 @@ impl PeerManager {
             file_transfer_sender,
             gossipsub_topic,
             autonat_status,
-            relay_hop_mode,
             discovery_sender,
             discovery_queries: HashMap::new(),
             dht_put_queries: HashMap::new(),
@@ -1644,8 +1641,6 @@ impl PeerManager {
                             "autonat status receiver dropped; skipping update"
                         );
                     }
-
-                    self.apply_autonat_relay_policy(&new);
                 }
             }
 
@@ -1927,35 +1922,6 @@ impl PeerManager {
                 }
             }
         }
-    }
-
-    fn apply_autonat_relay_policy(&mut self, status: &autonat::NatStatus) {
-        if self.relay_hop_mode != RelayHopMode::AutoOnPublic {
-            return;
-        }
-
-        match status {
-            autonat::NatStatus::Public(address) => {
-                self.swarm.add_external_address(address.clone());
-                self.enable_relay_hop();
-            }
-            autonat::NatStatus::Private | autonat::NatStatus::Unknown => {
-                self.disable_relay_hop();
-            }
-        }
-    }
-
-    fn enable_relay_hop(&mut self) {
-        self.swarm.behaviour_mut().relay_server = Toggle::from(Some(relay::Behaviour::new(
-            self.local_peer_id.clone(),
-            relay::Config::default(),
-        )));
-        tracing::info!(target: "peer", "relay hop enabled after AutoNAT public");
-    }
-
-    fn disable_relay_hop(&mut self) {
-        self.swarm.behaviour_mut().relay_server = Toggle::from(None);
-        tracing::info!(target: "peer", "relay hop disabled after AutoNAT private/unknown");
     }
 
     fn handle_put_record_result(

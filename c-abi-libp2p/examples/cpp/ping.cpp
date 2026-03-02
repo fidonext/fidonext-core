@@ -3,7 +3,6 @@
 #include "dyn_lib.h"
 #include "ping_app.h"
 
-
 #include <csignal>
 #include <exception>
 #include <iostream>

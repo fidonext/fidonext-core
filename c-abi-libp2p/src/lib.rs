@@ -74,13 +74,6 @@ pub const CABI_AUTONAT_PRIVATE: c_int = 1;
 /// AutoNAT reports the node as publicly reachable.
 pub const CABI_AUTONAT_PUBLIC: c_int = 2;
 
-/// Relay hop mode: never enable hop relay behaviour.
-pub const CABI_RELAY_HOP_MODE_DISABLED: c_int = 0;
-/// Relay hop mode: enable hop relay behaviour immediately.
-pub const CABI_RELAY_HOP_MODE_ENABLED: c_int = 1;
-/// Relay hop mode: enable hop relay behaviour after AutoNAT reports public.
-pub const CABI_RELAY_HOP_MODE_AUTO_ON_PUBLIC: c_int = 2;
-
 
 /// Discovery event carries an address for a peer.
 pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
@@ -1476,7 +1469,8 @@ pub extern "C" fn cabi_e2ee_verify_file_manifest(
 
 #[no_mangle]
 /// C-ABI. Returns the latest AutoNAT status observed for the node.
-/// Use it for observability; relay hop can be auto-enabled based on this status.
+/// Use it to detect the node is public or not, which can be a signal to recreate
+/// node as relay also
 pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
     let node = match node_from_ptr(handle) {
         Ok(node) => node,
@@ -1490,19 +1484,10 @@ pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
     }
 }
 
-fn parse_relay_hop_mode(mode: c_int) -> FfiResult<transport::RelayHopMode> {
-    match mode {
-        CABI_RELAY_HOP_MODE_DISABLED => Ok(transport::RelayHopMode::Disabled),
-        CABI_RELAY_HOP_MODE_ENABLED => Ok(transport::RelayHopMode::Enabled),
-        CABI_RELAY_HOP_MODE_AUTO_ON_PUBLIC => Ok(transport::RelayHopMode::AutoOnPublic),
-        _ => Err(CABI_STATUS_INVALID_ARGUMENT),
-    }
-}
-
 fn create_node(
     use_quic: bool,
     use_websocket: bool,
-    relay_hop_mode: transport::RelayHopMode,
+    enable_relay_hop: bool,
     bootstrap_peers: *const *const c_char,
     bootstrap_peers_len: usize,
     identity_seed_ptr: *const u8,
@@ -1535,7 +1520,7 @@ fn create_node(
     let config = transport::TransportConfig {
         use_quic,
         use_websocket,
-        relay_hop_mode,
+        hop_relay: enable_relay_hop,
         identity_seed,
         ..Default::default()
     };
@@ -1555,7 +1540,6 @@ fn create_node(
 #[no_mangle]
 /// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode, bootstrap peers,
 /// and a fixed Ed25519 identity seed.
-/// When enable_relay_hop is true, relay hop is enabled automatically after AutoNAT reports public reachability.
 pub extern "C" fn cabi_node_new(
     use_quic: bool,
     enable_relay_hop: bool,
@@ -1564,16 +1548,10 @@ pub extern "C" fn cabi_node_new(
     identity_seed_ptr: *const u8,
     identity_seed_len: usize,
 ) -> *mut CabiNodeHandle {
-    let relay_hop_mode = if enable_relay_hop {
-        transport::RelayHopMode::AutoOnPublic
-    } else {
-        transport::RelayHopMode::Disabled
-    };
-
     create_node(
         use_quic,
         false,
-        relay_hop_mode,
+        enable_relay_hop,
         bootstrap_peers,
         bootstrap_peers_len,
         identity_seed_ptr,
@@ -1596,49 +1574,10 @@ pub extern "C" fn cabi_node_new_v2(
     identity_seed_ptr: *const u8,
     identity_seed_len: usize,
 ) -> *mut CabiNodeHandle {
-    let relay_hop_mode = if enable_relay_hop {
-        transport::RelayHopMode::AutoOnPublic
-    } else {
-        transport::RelayHopMode::Disabled
-    };
-
     create_node(
         use_quic,
         use_websocket,
-        relay_hop_mode,
-        bootstrap_peers,
-        bootstrap_peers_len,
-        identity_seed_ptr,
-        identity_seed_len,
-    )
-}
-
-#[no_mangle]
-/// C-ABI. Creates a new node instance with an explicit relay hop mode (disabled, enabled, or auto on public).
-pub extern "C" fn cabi_node_new_with_relay_mode(
-    use_quic: bool,
-    relay_hop_mode: c_int,
-    bootstrap_peers: *const *const c_char,
-    bootstrap_peers_len: usize,
-    identity_seed_ptr: *const u8,
-    identity_seed_len: usize,
-) -> *mut CabiNodeHandle {
-    let relay_hop_mode = match parse_relay_hop_mode(relay_hop_mode) {
-        Ok(mode) => mode,
-        Err(status) => {
-            tracing::error!(
-                target: "ffi",
-                status,
-                "invalid relay hop mode provided; node creation aborted"
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    create_node(
-        use_quic,
-        false,
-        relay_hop_mode,
+        enable_relay_hop,
         bootstrap_peers,
         bootstrap_peers_len,
         identity_seed_ptr,
