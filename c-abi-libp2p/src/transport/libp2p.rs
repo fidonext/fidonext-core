@@ -173,9 +173,9 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            use_quic: false,     // Turn on for quic
+            use_quic: false, // Turn on for quic
             use_websocket: false, // Turn on for ws transport (wss via reverse-proxy)
-            hop_relay: false,    // Turn on for node act as relay (at least try)
+            hop_relay: false, // Turn on for node act as relay (at least try)
             enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
             identity_seed: None, // Pass to use identity seed for generating keypair
         }

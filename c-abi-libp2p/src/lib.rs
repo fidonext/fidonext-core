@@ -74,6 +74,7 @@ pub const CABI_AUTONAT_PRIVATE: c_int = 1;
 /// AutoNAT reports the node as publicly reachable.
 pub const CABI_AUTONAT_PUBLIC: c_int = 2;
 
+
 /// Discovery event carries an address for a peer.
 pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
 /// Discovery query has finished.
@@ -1483,67 +1484,7 @@ pub extern "C" fn cabi_autonat_status(handle: *mut CabiNodeHandle) -> c_int {
     }
 }
 
-#[no_mangle]
-/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode, bootstrap peers,
-/// and a fixed Ed25519 identity seed.
-pub extern "C" fn cabi_node_new(
-    use_quic: bool,
-    enable_relay_hop: bool,
-    bootstrap_peers: *const *const c_char,
-    bootstrap_peers_len: usize,
-    identity_seed_ptr: *const u8,
-    identity_seed_len: usize,
-) -> *mut CabiNodeHandle {
-    let bootstrap_peers = match parse_bootstrap_peers(bootstrap_peers, bootstrap_peers_len) {
-        Ok(peers) => peers,
-        Err(status) => {
-            tracing::error!(
-                target: "ffi",
-                status,
-                "failed to parse bootstrap peers; node creation aborted"
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    let identity_seed = match parse_identity_seed(identity_seed_ptr, identity_seed_len) {
-        Ok(seed) => seed,
-        Err(status) => {
-            tracing::error!(
-                target: "ffi",
-                status,
-                "invalid identity seed provided; node creation aborted"
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    let config = transport::TransportConfig {
-        use_quic,
-        hop_relay: enable_relay_hop,
-        identity_seed,
-        ..Default::default()
-    };
-
-    match ManagedNode::new(config, bootstrap_peers) {
-        Ok(node) => {
-            let boxed = Box::new(node);
-            Box::into_raw(boxed) as *mut CabiNodeHandle
-        }
-        Err(err) => {
-            tracing::error!(target: "ffi", %err, "failed to create node");
-            ptr::null_mut()
-        }
-    }
-}
-
-#[no_mangle]
-/// C-ABI. Creates a new node instance (v2) with optional WebSocket transport enabled.
-///
-/// - When `use_websocket=true`, the node can listen/dial `/.../tcp/.../ws` multiaddrs.
-/// - WSS (`/wss`) is typically achieved by running a TLS reverse-proxy (Caddy/Nginx)
-///   in front of the node and forwarding to its `/ws` listener.
-pub extern "C" fn cabi_node_new_v2(
+fn create_node(
     use_quic: bool,
     use_websocket: bool,
     enable_relay_hop: bool,
@@ -1594,6 +1535,54 @@ pub extern "C" fn cabi_node_new_v2(
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+/// C-ABI. Creates a new node instance and returns its handle with optional relay hop mode, bootstrap peers,
+/// and a fixed Ed25519 identity seed.
+pub extern "C" fn cabi_node_new(
+    use_quic: bool,
+    enable_relay_hop: bool,
+    bootstrap_peers: *const *const c_char,
+    bootstrap_peers_len: usize,
+    identity_seed_ptr: *const u8,
+    identity_seed_len: usize,
+) -> *mut CabiNodeHandle {
+    create_node(
+        use_quic,
+        false,
+        enable_relay_hop,
+        bootstrap_peers,
+        bootstrap_peers_len,
+        identity_seed_ptr,
+        identity_seed_len,
+    )
+}
+
+#[no_mangle]
+/// C-ABI. Creates a new node instance (v2) with optional WebSocket transport enabled.
+///
+/// - When `use_websocket=true`, the node can listen/dial `/.../tcp/.../ws` multiaddrs.
+/// - WSS (`/wss`) is typically achieved by running a TLS reverse-proxy (Caddy/Nginx)
+///   in front of the node and forwarding to its `/ws` listener.
+pub extern "C" fn cabi_node_new_v2(
+    use_quic: bool,
+    use_websocket: bool,
+    enable_relay_hop: bool,
+    bootstrap_peers: *const *const c_char,
+    bootstrap_peers_len: usize,
+    identity_seed_ptr: *const u8,
+    identity_seed_len: usize,
+) -> *mut CabiNodeHandle {
+    create_node(
+        use_quic,
+        use_websocket,
+        enable_relay_hop,
+        bootstrap_peers,
+        bootstrap_peers_len,
+        identity_seed_ptr,
+        identity_seed_len,
+    )
 }
 
 #[no_mangle]
