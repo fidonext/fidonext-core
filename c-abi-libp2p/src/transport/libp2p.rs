@@ -289,7 +289,15 @@ impl TransportConfig {
     ) -> NetworkBehaviour {
         let peer_id = PeerId::from(keypair.public());
         let mut kad_config = kad::Config::default();
-        kad_config.set_query_timeout(Duration::from_secs(5));
+        // TD-18: bumped from 5 s -> 15 s. On the two-relay test fleet the
+        // DHT routing table routinely carries < 3 peers, and a 5 s
+        // query_timeout was tight enough that profile-record `get_record`
+        // rounds regularly hit `DhtQueryError::Timeout` before Kademlia
+        // finished walking the sparse routing table (QA scenario 2,
+        // 2026-04-20). 15 s is a simple, non-adaptive bump — tighten back
+        // once the fleet grows or once we add peer-count-aware adaptive
+        // timeouts.
+        kad_config.set_query_timeout(Duration::from_secs(15));
         let store = MemoryStore::new(peer_id);
 
         let ping_config = ping::Config::new();

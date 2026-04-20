@@ -30,6 +30,13 @@ const DELIVERY_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DELIVERY_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAILBOX_FETCH_INTERVAL: Duration = Duration::from_secs(8);
 const MAILBOX_FETCH_JITTER_SECONDS: u64 = 3;
+/// TD-18: cadence for core-side periodic DHT re-announce of the locally
+/// cached self-profile record. Matches the 10-minute cadence Android uses in
+/// `Libp2pService.startPeriodicReannounce()`. The loop only runs after the
+/// host has successfully published a profile record through
+/// `cabi_e2ee_publish_profile_record` at least once in this process's
+/// lifetime; nothing is published if no profile has been set yet.
+const PROFILE_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RELAY_PLACEMENT_N: usize = 5;
 const RELAY_PLACEMENT_W: usize = 3;
 const RELAY_READ_N: usize = 5;
@@ -100,6 +107,18 @@ pub enum PeerCommand {
     Publish(Vec<u8>),
     /// Store a binary record in Kademlia.
     PutDhtRecord {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+        response: oneshot::Sender<std::result::Result<(), DhtQueryError>>,
+    },
+    /// TD-18: store a signed self-profile record in Kademlia **and** cache
+    /// the signed bytes so the manager can re-put them every
+    /// [`PROFILE_REANNOUNCE_INTERVAL`]. Caching happens regardless of the
+    /// DHT put outcome: if the initial put fails, the next periodic tick
+    /// retries with the same cached bytes. `key` is derived from the local
+    /// peer_id by the caller — typically via `e2ee::profile_record::profile_dht_key`.
+    PutProfileRecord {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_seconds: u64,
@@ -288,6 +307,36 @@ impl PeerManagerHandle {
         })?
     }
 
+    /// TD-18: store a signed profile record in the DHT AND cache the bytes so
+    /// the manager can re-put them on a 10-minute interval. On a sparse DHT,
+    /// a single `put_record` often does not survive churn between publish and
+    /// the first remote fetch; the periodic re-put keeps the record reachable
+    /// without the host having to re-sign. Returns the same error codes as
+    /// [`Self::dht_put_record`]. Used exclusively by
+    /// `cabi_e2ee_publish_profile_record`.
+    pub async fn dht_put_profile_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+    ) -> std::result::Result<(), DhtQueryError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::PutProfileRecord {
+                key,
+                value,
+                ttl_seconds,
+                response: tx,
+            })
+            .await
+            .map_err(|err| {
+                DhtQueryError::Internal(format!("peer manager command channel closed: {err}"))
+            })?;
+        rx.await.map_err(|_| {
+            DhtQueryError::Internal("dht put profile record response channel closed".to_string())
+        })?
+    }
+
     /// Resolves a key from the DHT and returns raw record bytes.
     pub async fn dht_get_record(
         &self,
@@ -468,6 +517,16 @@ pub struct PeerManager {
     /// only the avatar-fetch path populates this map; M6.1 and later
     /// content-addressed fetches will share it.
     pending_blob_fetches: HashMap<request_response::OutboundRequestId, PendingBlobFetch>,
+    // TD-18: cached signed self-profile record bytes + matching DHT key +
+    // TTL, populated on every successful `PeerCommand::PutProfileRecord`
+    // call. The periodic re-announce tick re-puts these bytes at the same
+    // key to keep the record alive on a sparse DHT between host-driven
+    // publishes. Caching the already-signed bytes (not the inputs) keeps
+    // the re-announce path dependency-free: no access to the profile file,
+    // no re-signing, no wall-clock timestamp drift.
+    self_profile_record_key: Option<Vec<u8>>,
+    self_profile_record_bytes: Option<Vec<u8>>,
+    self_profile_record_ttl_seconds: u64,
 }
 
 #[derive(Debug)]
@@ -561,6 +620,9 @@ impl PeerManager {
             self_avatar_sha256: None,
             self_avatar_bytes: None,
             pending_blob_fetches: HashMap::new(),
+            self_profile_record_key: None,
+            self_profile_record_bytes: None,
+            self_profile_record_ttl_seconds: 0,
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -587,6 +649,15 @@ impl PeerManager {
     pub async fn run(mut self) -> Result<()> {
         let mut delivery_tick = tokio::time::interval(DELIVERY_TICK_INTERVAL);
         delivery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // TD-18: periodic re-put of the cached self-profile record. First
+        // tick fires after the full interval (not immediately) so the host's
+        // own initial publish is not duplicated on boot. No-op until the
+        // host has set a profile for the first time.
+        let mut profile_reannounce_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + PROFILE_REANNOUNCE_INTERVAL,
+            PROFILE_REANNOUNCE_INTERVAL,
+        );
+        profile_reannounce_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(command) = self.command_receiver.recv() => {
@@ -596,6 +667,9 @@ impl PeerManager {
                 }
                 _ = delivery_tick.tick() => {
                     self.handle_delivery_tick();
+                }
+                _ = profile_reannounce_tick.tick() => {
+                    self.handle_profile_reannounce_tick();
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
@@ -716,62 +790,31 @@ impl PeerManager {
                 ttl_seconds,
                 response,
             } => {
-                if key.is_empty() || value.is_empty() {
-                    let _ = response.send(Err(DhtQueryError::Internal(
-                        "dht put requires non-empty key and value".to_string(),
-                    )));
-                    return Ok(false);
+                self.start_dht_put(key, value, ttl_seconds, Some(response));
+                Ok(false)
+            }
+            PeerCommand::PutProfileRecord {
+                key,
+                value,
+                ttl_seconds,
+                response,
+            } => {
+                // TD-18: cache FIRST so the periodic re-announce tick picks
+                // the bytes up even if the DHT put itself times out. If a
+                // fresher record arrives via a subsequent publish, the
+                // cache is overwritten below.
+                if !key.is_empty() && !value.is_empty() {
+                    self.self_profile_record_key = Some(key.clone());
+                    self.self_profile_record_bytes = Some(value.clone());
+                    self.self_profile_record_ttl_seconds = ttl_seconds;
+                    tracing::debug!(
+                        target: "peer",
+                        bytes = value.len(),
+                        ttl_seconds,
+                        "cached self-profile record for periodic re-announce",
+                    );
                 }
-                let expires = if ttl_seconds == 0 {
-                    None
-                } else {
-                    Some(Instant::now() + Duration::from_secs(ttl_seconds))
-                };
-                let record = kad::Record {
-                    key: kad::RecordKey::new(&key),
-                    value,
-                    publisher: Some(self.local_peer_id.clone()),
-                    expires,
-                };
-                let local_fallback_record = record.clone();
-                match self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .put_record(record, kad::Quorum::One)
-                {
-                    Ok(query_id) => {
-                        self.dht_put_queries.insert(
-                            query_id,
-                            PendingDhtPutQuery {
-                                response,
-                                fallback_record: local_fallback_record,
-                            },
-                        );
-                        tracing::info!(target: "peer", ?query_id, "started dht put_record query");
-                    }
-                    Err(err) => match self
-                        .swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .store_mut()
-                        .put(local_fallback_record)
-                    {
-                        Ok(_) => {
-                            tracing::warn!(
-                                target: "peer",
-                                %err,
-                                "dht put_record quorum not met, stored record locally as fallback",
-                            );
-                            let _ = response.send(Ok(()));
-                        }
-                        Err(store_err) => {
-                            let _ = response.send(Err(DhtQueryError::Internal(format!(
-                                "failed to start dht put_record query: {err}; local fallback failed: {store_err}"
-                            ))));
-                        }
-                    },
-                }
+                self.start_dht_put(key, value, ttl_seconds, Some(response));
                 Ok(false)
             }
             PeerCommand::GetDhtRecord { key, response } => {
@@ -940,6 +983,118 @@ impl PeerManager {
         );
         self.pending_file_transfer_requests
             .insert(complete_request_id);
+    }
+
+    /// Shared DHT put helper used by both `PutDhtRecord` and
+    /// `PutProfileRecord`. Factored out so the TD-18 periodic re-announce
+    /// (which doesn't carry a oneshot response) can reuse the exact same
+    /// quorum / fallback semantics as the host-driven put path. Passing
+    /// `None` for `response` fires-and-forgets (the periodic tick does not
+    /// block on the outcome).
+    fn start_dht_put(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+        response: Option<oneshot::Sender<std::result::Result<(), DhtQueryError>>>,
+    ) {
+        if key.is_empty() || value.is_empty() {
+            if let Some(tx) = response {
+                let _ = tx.send(Err(DhtQueryError::Internal(
+                    "dht put requires non-empty key and value".to_string(),
+                )));
+            }
+            return;
+        }
+        let expires = if ttl_seconds == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(ttl_seconds))
+        };
+        let record = kad::Record {
+            key: kad::RecordKey::new(&key),
+            value,
+            publisher: Some(self.local_peer_id.clone()),
+            expires,
+        };
+        let local_fallback_record = record.clone();
+        match self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(record, kad::Quorum::One)
+        {
+            Ok(query_id) => {
+                if let Some(tx) = response {
+                    self.dht_put_queries.insert(
+                        query_id,
+                        PendingDhtPutQuery {
+                            response: tx,
+                            fallback_record: local_fallback_record,
+                        },
+                    );
+                }
+                tracing::info!(target: "peer", ?query_id, "started dht put_record query");
+            }
+            Err(err) => match self
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .put(local_fallback_record)
+            {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "peer",
+                        %err,
+                        "dht put_record quorum not met, stored record locally as fallback",
+                    );
+                    if let Some(tx) = response {
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+                Err(store_err) => {
+                    if let Some(tx) = response {
+                        let _ = tx.send(Err(DhtQueryError::Internal(format!(
+                            "failed to start dht put_record query: {err}; local fallback failed: {store_err}"
+                        ))));
+                    } else {
+                        tracing::warn!(
+                            target: "peer",
+                            %err,
+                            %store_err,
+                            "dht put_record fallback failed during periodic re-announce",
+                        );
+                    }
+                }
+            },
+        }
+    }
+
+    /// TD-18: re-put the cached self-profile record bytes to the DHT. Called
+    /// once per [`PROFILE_REANNOUNCE_INTERVAL`] from the event loop. No-op
+    /// when no profile has been published yet (fresh install / user never
+    /// saved profile). The DHT put is fire-and-forget — if it fails, the
+    /// next tick retries.
+    fn handle_profile_reannounce_tick(&mut self) {
+        let (Some(key), Some(bytes)) = (
+            self.self_profile_record_key.clone(),
+            self.self_profile_record_bytes.clone(),
+        ) else {
+            tracing::trace!(
+                target: "peer",
+                "profile re-announce tick fired with no cached record (no-op)",
+            );
+            return;
+        };
+        let ttl = self.self_profile_record_ttl_seconds;
+        tracing::info!(
+            target: "peer",
+            bytes = bytes.len(),
+            ttl_seconds = ttl,
+            "periodic re-announce: re-putting cached profile record to DHT",
+        );
+        self.start_dht_put(key, bytes, ttl, None);
     }
 
     fn handle_delivery_tick(&mut self) {
@@ -3129,5 +3284,146 @@ mod avatar_fetch_tests {
         assert_eq!(zero, [0u8; 32]);
 
         shutdown(node).await;
+    }
+}
+
+#[cfg(test)]
+mod profile_reannounce_tests {
+    //! TD-18 · periodic DHT re-announce of the locally cached profile record.
+    //!
+    //! These tests construct a `PeerManager` directly (no `spawn` + event
+    //! loop) so the test can drive `handle_profile_reannounce_tick()` as a
+    //! plain method call and inspect Kademlia's local record store after
+    //! each invocation. On an unconnected node `put_record` has no peers
+    //! to query, so the manager's NoKnownPeers fallback writes the record
+    //! to `store_mut()`. Observing that store therefore tells us whether
+    //! the tick re-put the cached bytes or was a no-op.
+    use super::*;
+    use crate::messaging::{
+        FileTransferQueue, MessageQueue, DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY,
+        DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    };
+    use crate::peer::addr_events::AddrState;
+    use crate::peer::discovery::{DiscoveryQueue, DEFAULT_DISCOVERY_QUEUE_CAPACITY};
+    use crate::transport::TransportConfig;
+    use libp2p::kad::{self, store::RecordStore};
+    use std::sync::{Arc, RwLock};
+
+    fn build_manager(seed: [u8; 32]) -> PeerManager {
+        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, _handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            addr_state,
+            Vec::new(),
+        )
+        .expect("peer manager");
+        // Deliberately leak the queues/handle so their senders don't close
+        // mid-test. The manager never runs its event loop here; we drive it
+        // by calling methods directly.
+        std::mem::forget(message_queue);
+        std::mem::forget(file_transfer_queue);
+        std::mem::forget(discovery_queue);
+        std::mem::forget(_handle);
+        manager
+    }
+
+    fn record_value(manager: &mut PeerManager, key: &[u8]) -> Option<Vec<u8>> {
+        manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad::RecordKey::new(&key.to_vec()))
+            .map(|rec| rec.value.clone())
+    }
+
+    #[test]
+    fn reannounce_tick_without_cached_record_is_noop() {
+        // Before the host has ever called publish_profile_record, the tick
+        // must be a pure no-op: no record stored, no panic.
+        let mut manager = build_manager([101u8; 32]);
+        assert!(manager.self_profile_record_bytes.is_none());
+        assert!(manager.self_profile_record_key.is_none());
+        manager.handle_profile_reannounce_tick();
+        assert!(manager.self_profile_record_bytes.is_none());
+        assert!(manager.self_profile_record_key.is_none());
+    }
+
+    #[test]
+    fn publish_profile_record_caches_bytes_for_reannounce() {
+        // Drive the PutProfileRecord command directly. The manager must
+        // populate its cache fields so the next periodic tick has
+        // something to re-put.
+        let mut manager = build_manager([102u8; 32]);
+        let key: Vec<u8> = b"td18-key-abc".to_vec();
+        let value: Vec<u8> = b"td18-signed-profile-record-bytes".to_vec();
+
+        let (tx, _rx) = oneshot::channel();
+        let ok = manager
+            .handle_command(PeerCommand::PutProfileRecord {
+                key: key.clone(),
+                value: value.clone(),
+                ttl_seconds: 3600,
+                response: tx,
+            })
+            .expect("handle_command");
+        assert!(!ok, "PutProfileRecord must not request shutdown");
+
+        assert_eq!(manager.self_profile_record_key.as_deref(), Some(&key[..]));
+        assert_eq!(
+            manager.self_profile_record_bytes.as_deref(),
+            Some(&value[..]),
+        );
+        assert_eq!(manager.self_profile_record_ttl_seconds, 3600);
+    }
+
+    #[test]
+    fn reannounce_tick_reputs_cached_record_to_dht() {
+        // Happy path: after caching, firing the tick must invoke the DHT
+        // put path. On an unconnected manager the NoKnownPeers fallback
+        // lands the record in the local Kademlia store, so observing that
+        // store is a proxy for "tick called start_dht_put with the cached
+        // bytes".
+        let mut manager = build_manager([103u8; 32]);
+        let key: Vec<u8> = b"td18-reannounce-key".to_vec();
+        let value: Vec<u8> = b"td18-signed-bytes-v1".to_vec();
+
+        // Seed the cache directly (equivalent to a successful
+        // cabi_e2ee_publish_profile_record call having already run).
+        manager.self_profile_record_key = Some(key.clone());
+        manager.self_profile_record_bytes = Some(value.clone());
+        manager.self_profile_record_ttl_seconds = 1800;
+
+        // Sanity: local store is empty before the tick.
+        let before = record_value(&mut manager, &key);
+        assert!(before.is_none(), "local store must be empty before tick");
+
+        manager.handle_profile_reannounce_tick();
+
+        // After the tick the cached record must be visible in Kademlia's
+        // local store (the NoKnownPeers fallback path on an unconnected
+        // node). Regression guard: if a future change removes the DHT
+        // put from the tick, this assertion trips.
+        let after = record_value(&mut manager, &key);
+        assert_eq!(
+            after.as_deref(),
+            Some(&value[..]),
+            "reannounce tick must re-put the cached bytes",
+        );
+
+        // Firing the tick again keeps the cache state intact (no clearing).
+        manager.handle_profile_reannounce_tick();
+        assert_eq!(manager.self_profile_record_key.as_deref(), Some(&key[..]));
+        assert_eq!(
+            manager.self_profile_record_bytes.as_deref(),
+            Some(&value[..]),
+        );
     }
 }

@@ -193,6 +193,20 @@ impl ManagedNode {
             .block_on(self.handle.dht_put_record(key, value, ttl_seconds))
     }
 
+    /// TD-18: stores a signed self-profile record in Kademlia AND caches the
+    /// bytes so the peer manager can re-put them on its periodic re-announce
+    /// timer. Used by `cabi_e2ee_publish_profile_record`; all other DHT
+    /// callers should stick with `dht_put_record`.
+    fn dht_put_profile_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_seconds: u64,
+    ) -> std::result::Result<(), peer::DhtQueryError> {
+        self.runtime
+            .block_on(self.handle.dht_put_profile_record(key, value, ttl_seconds))
+    }
+
     /// Resolves a binary record from Kademlia.
     fn dht_get_record(&self, key: Vec<u8>) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
         self.runtime.block_on(self.handle.dht_get_record(key))
@@ -1344,7 +1358,13 @@ pub extern "C" fn cabi_e2ee_publish_profile_record(
         ttl_seconds
     };
 
-    match node.dht_put_record(key, payload, effective_ttl) {
+    // TD-18: go through `dht_put_profile_record` rather than the generic
+    // `dht_put_record` so the PeerManager caches the signed bytes and
+    // re-puts them every PROFILE_REANNOUNCE_INTERVAL. On sparse DHTs a
+    // single put rarely survives churn between publish and the first
+    // remote fetch; the periodic re-put keeps the record reachable without
+    // the host (Android Libp2pService) having to re-sign.
+    match node.dht_put_profile_record(key, payload, effective_ttl) {
         Ok(_) => CABI_STATUS_SUCCESS,
         Err(err) => dht_error_to_status(err),
     }
