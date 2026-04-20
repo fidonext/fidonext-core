@@ -333,38 +333,27 @@ fn persist_profile(path: &Path, stored: &StoredIdentityProfile) -> Result<()> {
         .context("failed to fsync identity profile data")?;
     drop(file);
 
-    // TD-20(b): commit via hard_link so a concurrent writer that already produced
-    // the final profile makes us fail loudly with AlreadyExists instead of silently
-    // clobbering the winner's file. fs::rename on Unix is replace-by-default and
-    // would swallow the race. persist_profile is only called from create_profile,
-    // which is gated by `path.exists()` in load_or_create_profile -- the final path
-    // MUST NOT exist at this point, so AlreadyExists is a legitimate error.
-    let link_result = fs::hard_link(&temp_path, path);
-    if let Err(err) = link_result {
+    // TD-23: commit via fs::rename. Earlier TD-20(b) used hard_link + remove_file
+    // to get AlreadyExists semantics on a racing writer, but Android SELinux
+    // policy for `untrusted_app -> app_data_file:file` does NOT grant the `link`
+    // permission (only create/read/write/open/getattr/setattr/rename/unlink), so
+    // hard_link is denied by the kernel on every real device. fs::rename is
+    // explicitly allowed and is atomic on Unix (replace-by-default semantics).
+    //
+    // Dropping the AlreadyExists invariant is safe: persist_profile is only
+    // called from create_profile, which in turn is gated by `!path.exists()` in
+    // load_or_create_profile, and the Android binding serializes init under the
+    // TD-20(a) Mutex, so in practice there is exactly one writer. The
+    // randomized temp suffix (temporary_path) still guarantees that two
+    // hypothetical concurrent writers never share a scratch file.
+    if let Err(err) = fs::rename(&temp_path, path) {
         // Best-effort cleanup of our scratch file before bubbling the error.
         let _ = fs::remove_file(&temp_path);
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(anyhow!(
-                "identity profile already exists at {} (concurrent persist_profile race?): {}",
-                path.display(),
-                err
-            ));
-        }
         return Err(anyhow::Error::new(err).context(format!(
             "failed to publish identity profile into place: {} -> {}",
             temp_path.display(),
             path.display()
         )));
-    }
-    // Remove the temp hardlink source; the final path now owns the inode.
-    if let Err(err) = fs::remove_file(&temp_path) {
-        // Non-fatal: final file is in place. Log-worthy via context, but don't fail.
-        tracing::warn!(
-            target = "fidonext::e2ee",
-            temp = %temp_path.display(),
-            error = %err,
-            "failed to remove temporary identity profile scratch file"
-        );
     }
 
     #[cfg(unix)]
@@ -3751,17 +3740,19 @@ mod tests {
         verify_file_integrity_manifest(&manifest, "f", 1, &digest, Some(&pubkey)).expect("verify");
     }
 
-    // TD-20(b): defense-in-depth check that persist_profile cannot silently
-    // clobber an existing identity file. The Android-side Mutex (TD-20(a))
-    // should already serialize init, but this guards against a future binding
-    // that forgets to do so. Invariants:
-    //   (a) exactly one persist_profile succeeds when two writers race on the
-    //       same final path,
-    //   (b) the losing writer returns a descriptive error (AlreadyExists),
-    //   (c) the on-disk file parses back as a valid StoredIdentityProfile
-    //       belonging to the winning writer (not a torn mash of both).
+    // TD-23: positive coverage of the Android-compatible commit path. The old
+    // TD-20(b) invariant was "persist_profile refuses to clobber an existing
+    // final file" (via hard_link + AlreadyExists). That invariant is dropped
+    // because Android SELinux denies `link` on app_data_file. The primary race
+    // defense is now the TD-20(a) Android-side Mutex.
+    //
+    // What we DO still guarantee and assert here:
+    //   (a) fs::rename successfully replaces an existing profile (legitimate
+    //       profile updates used to be impossible under TD-20(b)),
+    //   (b) the final file contains the NEW bytes after the replace,
+    //   (c) no scratch .tmp files are left behind in the parent dir.
     #[test]
-    fn persist_profile_refuses_to_clobber_existing_file() {
+    fn persist_profile_replaces_existing_file_via_rename() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
@@ -3784,29 +3775,26 @@ mod tests {
             created_at_unix: 2000,
         };
 
-        // Writer A lands first; simulates the Mutex winner in TD-20(a).
+        // Writer A lands first.
         persist_profile(&path, &profile_a).expect("first persist_profile should succeed");
         assert!(path.exists(), "profile file must exist after first write");
 
-        // Writer B races in without the Mutex (simulated); must NOT overwrite.
-        let err = persist_profile(&path, &profile_b)
-            .expect_err("second persist_profile must fail loudly, not clobber");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("already exists") || msg.to_lowercase().contains("alreadyexists"),
-            "error must describe the AlreadyExists collision, got: {msg}"
-        );
+        // Writer B replaces A via fs::rename. Invariant (a): must succeed.
+        persist_profile(&path, &profile_b)
+            .expect("second persist_profile must replace the existing file via rename");
 
-        // Invariant (c): the surviving file is profile A, intact and parseable.
+        // Invariant (b): the surviving file is profile B (the newer bytes),
+        // intact and parseable.
         let raw = fs::read_to_string(&path).expect("read final profile");
         let parsed: StoredIdentityProfile =
             serde_json::from_str(&raw).expect("final file must parse as StoredIdentityProfile");
-        assert_eq!(parsed.device_id, profile_a.device_id);
-        assert_eq!(parsed.account_seed_b64, profile_a.account_seed_b64);
-        assert_eq!(parsed.libp2p_seed_b64, profile_a.libp2p_seed_b64);
-        assert_eq!(parsed.created_at_unix, profile_a.created_at_unix);
+        assert_eq!(parsed.device_id, profile_b.device_id);
+        assert_eq!(parsed.account_seed_b64, profile_b.account_seed_b64);
+        assert_eq!(parsed.libp2p_seed_b64, profile_b.libp2p_seed_b64);
+        assert_eq!(parsed.created_at_unix, profile_b.created_at_unix);
 
-        // Invariant: no scratch .tmp files left behind in the parent dir.
+        // Invariant (c): no scratch .tmp files left behind in the parent dir
+        // (rename consumes the temp path, so nothing should remain).
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .expect("read dir")
             .filter_map(|entry| entry.ok())
