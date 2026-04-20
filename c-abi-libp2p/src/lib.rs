@@ -1101,36 +1101,286 @@ pub extern "C" fn cabi_e2ee_fetch_key_update(
     write_bytes(&payload, out_buffer, out_buffer_len, written_len)
 }
 
-#[no_mangle]
-/// C-ABI. Legacy device-directory validation API (disabled in single-device mode).
-pub extern "C" fn cabi_e2ee_validate_device_directory(
-    payload_ptr: *const u8,
-    payload_len: usize,
-    now_unix: u64,
-) -> c_int {
-    let _ = (payload_ptr, payload_len, now_unix);
-    tracing::warn!(
-        target: "ffi",
-        "device directory API is disabled in single-device mode"
-    );
-    CABI_STATUS_INVALID_ARGUMENT
-}
+// Legacy `cabi_e2ee_{validate,fetch}_device_directory` were the single-device
+// stubs superseded by the TD-05 profile-record API below. They were never wired
+// through the Android JNI (`fidonext_android/app/src/main/cpp/libp2p_jni.c`),
+// so removing the symbols is safe. The replacement lives under
+// `cabi_e2ee_profile_*` — see below.
+
+/// Default TTL for profile records in the DHT. 30 days matches the
+/// `DEFAULT_KEY_UPDATE_TTL_SECONDS` mental model (but is longer, since profile
+/// records are refreshed only when the user edits them, not on every session).
+pub const CABI_E2EE_PROFILE_DEFAULT_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[no_mangle]
-/// C-ABI. Legacy device-directory fetch API (disabled in single-device mode).
-pub extern "C" fn cabi_e2ee_fetch_device_directory(
-    handle: *mut CabiNodeHandle,
-    account_id: *const c_char,
+/// C-ABI. Builds a signed CBOR profile record for the caller's own identity.
+///
+/// Signs with the profile's `account_seed` (Ed25519) under the
+/// `"fidonext-profile-record-v1\x00"` domain separator. `avatar_sha256_ptr` may
+/// be null (or `avatar_sha256_len` may be 0) if the profile has no avatar.
+/// `updated_at_unix = 0` substitutes the current wall clock.
+pub extern "C" fn cabi_e2ee_build_profile_record(
+    profile_path: *const c_char,
+    peer_id: *const c_char,
+    display_name: *const c_char,
+    nickname: *const c_char,
+    avatar_sha256_ptr: *const u8,
+    avatar_sha256_len: usize,
+    updated_at_unix: u64,
     out_buffer: *mut u8,
     out_buffer_len: usize,
     written_len: *mut usize,
 ) -> c_int {
-    let _ = (handle, account_id, out_buffer, out_buffer_len, written_len);
-    tracing::warn!(
-        target: "ffi",
-        "device directory API is disabled in single-device mode"
-    );
-    CABI_STATUS_INVALID_ARGUMENT
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(peer_id) => peer_id,
+        Err(status) => return status,
+    };
+    let display_name = match parse_required_c_string(display_name) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let nickname = match parse_required_c_string(nickname) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let avatar_sha256 = match parse_optional_avatar_sha256(avatar_sha256_ptr, avatar_sha256_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load profile for profile record"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let updated_at = if updated_at_unix == 0 {
+        unix_seconds_now()
+    } else {
+        updated_at_unix
+    };
+
+    let payload = match e2ee::profile_record::build_profile_record(
+        &profile,
+        &peer_id,
+        &display_name,
+        &nickname,
+        avatar_sha256.as_ref(),
+        updated_at,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build profile record");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Validates a signed CBOR profile record.
+///
+/// `previous_updated_at_unix = 0` means "no cached revision" (fresh add). Any
+/// non-zero value is treated as the caller's locally cached `updated_at` for
+/// the same peer_id — and a record whose `updated_at <= previous` is rejected
+/// as replay.
+pub extern "C" fn cabi_e2ee_validate_profile_record(
+    payload_ptr: *const u8,
+    payload_len: usize,
+    previous_updated_at_unix: u64,
+) -> c_int {
+    let payload = match parse_payload(payload_ptr, payload_len) {
+        Ok(payload) => payload,
+        Err(status) => return status,
+    };
+    let previous = if previous_updated_at_unix == 0 {
+        None
+    } else {
+        Some(previous_updated_at_unix)
+    };
+    match e2ee::profile_record::validate_profile_record(&payload, previous) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "profile record validation failed");
+            CABI_STATUS_INVALID_ARGUMENT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Computes the 32-byte Kademlia key used to publish a profile record
+/// for the given peer. The key is `SHA-256("fidonext/profile/v1/" || peer_id)`.
+pub extern "C" fn cabi_e2ee_profile_dht_key(
+    peer_id: *const c_char,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(peer_id) => peer_id,
+        Err(status) => return status,
+    };
+    let key = e2ee::profile_record::profile_dht_key(&peer_id);
+    write_bytes(&key, out_buffer, out_buffer_len, written_len)
+}
+
+#[no_mangle]
+/// C-ABI. Publishes the local profile record to the DHT under the key returned
+/// by [`cabi_e2ee_profile_dht_key`]. Builds and signs the record with the
+/// profile's `account_seed`, then calls `dht_put_record` at the hashed key.
+///
+/// `ttl_seconds = 0` uses [`CABI_E2EE_PROFILE_DEFAULT_TTL_SECONDS`].
+pub extern "C" fn cabi_e2ee_publish_profile_record(
+    handle: *mut CabiNodeHandle,
+    profile_path: *const c_char,
+    peer_id: *const c_char,
+    display_name: *const c_char,
+    nickname: *const c_char,
+    avatar_sha256_ptr: *const u8,
+    avatar_sha256_len: usize,
+    updated_at_unix: u64,
+    ttl_seconds: u64,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let display_name = match parse_required_c_string(display_name) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let nickname = match parse_required_c_string(nickname) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let avatar_sha256 = match parse_optional_avatar_sha256(avatar_sha256_ptr, avatar_sha256_len) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load profile for profile publish"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let updated_at = if updated_at_unix == 0 {
+        unix_seconds_now()
+    } else {
+        updated_at_unix
+    };
+
+    let payload = match e2ee::profile_record::build_profile_record(
+        &profile,
+        &peer_id,
+        &display_name,
+        &nickname,
+        avatar_sha256.as_ref(),
+        updated_at,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build profile record");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    let key = e2ee::profile_record::profile_dht_key(&peer_id);
+    let effective_ttl = if ttl_seconds == 0 {
+        CABI_E2EE_PROFILE_DEFAULT_TTL_SECONDS
+    } else {
+        ttl_seconds
+    };
+
+    match node.dht_put_record(key, payload, effective_ttl) {
+        Ok(_) => CABI_STATUS_SUCCESS,
+        Err(err) => dht_error_to_status(err),
+    }
+}
+
+#[no_mangle]
+/// C-ABI. Fetches and validates a signed profile record for `peer_id` from the
+/// DHT. Signature + schema validation runs **inside** the Rust module before
+/// the record bytes are copied into `out_buffer`; callers never see an
+/// unvalidated record. Returns `CABI_STATUS_INVALID_ARGUMENT` on validation
+/// failure, `CABI_STATUS_NOT_FOUND` on DHT miss.
+pub extern "C" fn cabi_e2ee_fetch_profile_record(
+    handle: *mut CabiNodeHandle,
+    peer_id: *const c_char,
+    previous_updated_at_unix: u64,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let peer_id = match parse_peer_id(peer_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let key = e2ee::profile_record::profile_dht_key(&peer_id);
+    let payload = match node.dht_get_record(key) {
+        Ok(value) => value,
+        Err(err) => return dht_error_to_status(err),
+    };
+
+    let previous = if previous_updated_at_unix == 0 {
+        None
+    } else {
+        Some(previous_updated_at_unix)
+    };
+    let record = match e2ee::profile_record::validate_profile_record(&payload, previous) {
+        Ok(record) => record,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "fetched profile record validation failed");
+            return CABI_STATUS_INVALID_ARGUMENT;
+        }
+    };
+
+    // Extra safety: the peer_id inside the record MUST equal the peer_id we
+    // queried. This catches a malicious DHT replica serving a different
+    // peer's (validly-signed) record under our requested key.
+    if record.peer_id != peer_id {
+        tracing::warn!(
+            target: "ffi",
+            requested = %peer_id,
+            got = %record.peer_id,
+            "profile record peer_id mismatch"
+        );
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+
+    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
 }
 
 #[no_mangle]
@@ -2325,6 +2575,28 @@ fn parse_payload(data_ptr: *const u8, data_len: usize) -> FfiResult<Vec<u8>> {
 
     let payload = unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec();
     Ok(payload)
+}
+
+/// Parse an optional fixed-length avatar SHA-256. `len = 0` means "no avatar"
+/// and returns `Ok(None)`. `len` must otherwise equal
+/// [`e2ee::profile_record::AVATAR_SHA256_LEN`] (32).
+fn parse_optional_avatar_sha256(
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult<Option<[u8; e2ee::profile_record::AVATAR_SHA256_LEN]>> {
+    if data_len == 0 {
+        return Ok(None);
+    }
+    if data_ptr.is_null() {
+        return Err(CABI_STATUS_NULL_POINTER);
+    }
+    if data_len != e2ee::profile_record::AVATAR_SHA256_LEN {
+        return Err(CABI_STATUS_INVALID_ARGUMENT);
+    }
+    let bytes = unsafe { slice::from_raw_parts(data_ptr, data_len) };
+    let mut out = [0u8; e2ee::profile_record::AVATAR_SHA256_LEN];
+    out.copy_from_slice(bytes);
+    Ok(Some(out))
 }
 
 // Parses a c string into vector with bootstraps.

@@ -32,6 +32,13 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+// TD-05 self-profile record (peer_id -> { display_name, nickname, avatar_sha256 }).
+// Lives in a submodule because the CBOR + canonical-encoding surface is isolated
+// from the libsignal prekey / keyupdate code in this file; TD-16 will eventually
+// retrofit the same domain-separator discipline on KeyUpdateRecord /
+// PreKeyBundleRecord, which is why the profile_record module is the template.
+pub mod profile_record;
+
 pub(crate) const IDENTITY_SEED_LEN: usize = 32;
 const PROFILE_SCHEMA_VERSION: u32 = 1;
 const E2EE_SCHEMA_VERSION: u32 = 1;

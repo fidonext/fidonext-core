@@ -27,6 +27,11 @@ chacha20poly1305 = "0.10"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", package = "libsignal-protocol" }
 sled = "0.34"
 tempfile = "3.25.0"
+# Canonical CBOR. Explicit, deterministic encoding per security-crypto-engineer
+# review of the nickname-registry design (fidonext-core/docs/nickname-registry-design.md
+# §"Crypto Review", item 3b). serde_cbor is not deterministic on maps; ciborium +
+# a hand-sorted integer-keyed map gives us reproducible signatures.
+ciborium = "0.2"
 
 [build-dependencies]
 cbindgen = "0.26"   # generate .h
