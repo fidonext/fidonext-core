@@ -119,9 +119,12 @@ pub struct DeliveryMailboxFetch {
 
 #[derive(Debug, Deserialize)]
 struct OutgoingPayloadProbe {
+    #[serde(default)]
     to_peer_id: String,
     #[serde(default)]
     payload_type: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
     #[serde(default)]
     message_id: Option<String>,
     #[serde(default)]
@@ -192,6 +195,20 @@ pub fn is_addressed_payload(payload: &[u8]) -> bool {
         Err(_) => return false,
     };
     !parsed.to_peer_id.trim().is_empty()
+}
+
+/// Extract the top-level `schema` field from a JSON payload, if present. Used by
+/// `handle_publish_command` to improve diagnostics on the "addressed non-libsignal" drop path —
+/// contributors who add a new message type with `to_peer_id` but without `payload_type=libsignal`
+/// previously got a generic warn with no hint at which schema was being dropped. See TD-03 / TD-10.
+pub fn payload_schema(payload: &[u8]) -> Option<String> {
+    let parsed: OutgoingPayloadProbe = serde_json::from_slice(payload).ok()?;
+    parsed
+        .schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub fn build_envelope_from_payload(
@@ -307,5 +324,61 @@ impl DeliveryFrame {
             Self::Nack(frame) => frame.cover_padding_b64 = value,
             Self::MailboxFetch(frame) => frame.cover_padding_b64 = value,
         }
+    }
+}
+
+#[cfg(test)]
+mod td10_tests {
+    use super::*;
+
+    #[test]
+    fn payload_schema_extracts_top_level_field() {
+        let payload = br#"{"schema":"fidonext-prekey-exchange-v1","type":"request"}"#;
+        assert_eq!(
+            payload_schema(payload).as_deref(),
+            Some("fidonext-prekey-exchange-v1")
+        );
+    }
+
+    #[test]
+    fn payload_schema_trims_whitespace_and_rejects_empty() {
+        let with_spaces = br#"{"schema":"  trimmed  "}"#;
+        assert_eq!(payload_schema(with_spaces).as_deref(), Some("trimmed"));
+
+        let empty = br#"{"schema":"   "}"#;
+        assert_eq!(payload_schema(empty), None);
+
+        let missing = br#"{"type":"request"}"#;
+        assert_eq!(payload_schema(missing), None);
+
+        let invalid_json = b"not json at all";
+        assert_eq!(payload_schema(invalid_json), None);
+    }
+
+    #[test]
+    fn addressed_without_payload_type_is_detected_as_addressed_but_not_envelope() {
+        // This is the TD-03 trap: addressed (has to_peer_id) but not libsignal.
+        // Regression guard: if this classification shifts, downstream strict-E2EE logic
+        // in manager.rs::handle_publish_command would silently change behaviour.
+        let payload = br#"{"schema":"fidonext-prekey-exchange-v1","to_peer_id":"12D3KooWExample","type":"request"}"#;
+        assert!(
+            is_addressed_payload(payload),
+            "must be detected as addressed"
+        );
+
+        let fake_peer = libp2p::PeerId::random();
+        assert!(
+            build_envelope_from_payload(&fake_peer, payload, 0, 0).is_none(),
+            "must NOT build an envelope when payload_type is not libsignal"
+        );
+    }
+
+    #[test]
+    fn target_peer_id_does_not_trigger_addressed_path() {
+        // TD-03 fix on the Android side renamed `to_peer_id` → `target_peer_id` on the
+        // prekey exchange JSON so that is_addressed_payload() returns false and the packet
+        // falls through to gossipsub. Regression guard for that workaround.
+        let payload = br#"{"schema":"fidonext-prekey-exchange-v1","target_peer_id":"12D3KooWExample","type":"request"}"#;
+        assert!(!is_addressed_payload(payload));
     }
 }
