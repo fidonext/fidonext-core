@@ -35,4 +35,18 @@ $RECYCLE.BIN/
 # logs
 c-abi-libp2p/examples/python/logs/
 
+# Python bytecode cache from example scripts
+__pycache__/
+*.pyc
+
 *.patch
+
+# Secrets / local agent state — never commit
+.claude/
+secrets/
+*.secret
+*.secrets.json
+relay-inventory.json
+.env
+.env.*
+!.env.example
