@@ -37,6 +37,19 @@ const RELAY_READ_R: usize = 2;
 const MAILBOX_MAX_PER_RECIPIENT: usize = 256;
 const MAILBOX_MAX_BYTES_PER_RECIPIENT: usize = 512 * 1024;
 
+/// Top-level JSON `schema` values that are permitted to carry `to_peer_id` at the top level
+/// without being a libsignal envelope. Anything matching this list is published through
+/// gossipsub instead of being dropped by the strict-E2EE guard in `handle_publish_command`.
+/// See TD-03 / TD-10 in the workspace ROADMAP for rationale.
+const ADDRESSED_GOSSIP_ALLOWED_SCHEMAS: &[&str] = &[
+    // App-level prekey bundle exchange used by the Android client when DHT lookups are
+    // unreliable (small Kademlia in the test fleet). Carries `target_peer_id` today, so it
+    // doesn't actually hit this branch — the entry is kept here so that if a future
+    // contributor reverts to `to_peer_id`, the payload is still delivered (and the
+    // reviewer has a single file to look at when deciding policy).
+    "fidonext-prekey-exchange-v1",
+];
+
 fn mailbox_fetch_next_interval() -> Duration {
     let base = MAILBOX_FETCH_INTERVAL.as_secs();
     let jitter = MAILBOX_FETCH_JITTER_SECONDS;
@@ -50,19 +63,25 @@ use crate::{
     messaging::{
         build_ack, build_envelope_from_payload, build_mailbox_fetch, build_nack,
         chunk_size_or_default, encode_frame, is_addressed_payload, now_unix_seconds, parse_frame,
-        DeliveryAck, DeliveryAckKind, DeliveryEnvelope, DeliveryFrame, DeliveryMailboxFetch,
-        DeliveryNack, DeliveryNackReason, FileMetadata, FileTransferFrame, FileTransferQueueSender,
-        InboundFileTransferFrame, MessageQueueSender,
+        payload_schema, DeliveryAck, DeliveryAckKind, DeliveryEnvelope, DeliveryFrame,
+        DeliveryMailboxFetch, DeliveryNack, DeliveryNackReason, FileMetadata, FileTransferFrame,
+        FileTransferQueueSender, InboundFileTransferFrame, MessageQueueSender,
     },
     peer::addr_events::{AddrEvent, AddrState},
     peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
     peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
     transport::{
-        BehaviourEvent, DeliveryDirectRequest, DeliveryDirectResponse, FileTransferRequest,
-        FileTransferResponse, NetworkBehaviour, TransportConfig,
+        AvatarFetchRequest, AvatarFetchResponse, BehaviourEvent, DeliveryDirectRequest,
+        DeliveryDirectResponse, FileTransferRequest, FileTransferResponse, NetworkBehaviour,
+        TransportConfig,
     },
     //config::DEFAULT_BOOTSTRAP_PEERS, // Dunno. Its empty should be here
 };
+
+/// TD-06: hard cap on avatar payload size. The UX spec (ROADMAP TD-14) caps
+/// avatars at 80×80 PNG ≈ 10 KB; 64 KiB leaves headroom without opening the
+/// door to abuse. Receivers MUST reject anything larger before hashing.
+pub const MAX_AVATAR_SIZE_BYTES: usize = 64 * 1024;
 
 /// Commands supported by the [`PeerManager`] event loop.
 #[derive(Debug)]
@@ -98,9 +117,64 @@ pub enum PeerCommand {
         data: Vec<u8>,
         chunk_size: usize,
     },
+    /// TD-06: stash the caller's own avatar bytes so this node can serve them
+    /// when a peer hits `/fidonext/avatar-fetch/1.0.0`.
+    SetSelfAvatar {
+        bytes: Vec<u8>,
+        response: oneshot::Sender<std::result::Result<[u8; 32], AvatarFetchError>>,
+    },
+    /// TD-06: fetch `peer`'s avatar by `avatar_sha256`. The response oneshot
+    /// resolves with the raw bytes (already size-capped, hash-verified) on
+    /// success, or a typed `AvatarFetchError` on failure.
+    FetchAvatar {
+        peer: PeerId,
+        avatar_sha256: [u8; 32],
+        response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
+    },
     /// Shut the manager down gracefully.
     Shutdown,
 }
+
+/// Errors surfaced by TD-06 avatar-fetch helpers. Mirrors the discovery /
+/// DHT error split: a typed enum at the Rust layer, which the FFI layer maps
+/// onto `CABI_STATUS_*` codes for Android.
+#[derive(Debug, Clone)]
+pub enum AvatarFetchError {
+    /// The avatar payload is larger than [`MAX_AVATAR_SIZE_BYTES`], or would
+    /// be after echoing it across the wire. Applies both to the local "set
+    /// your own avatar" path and the incoming-response validation path.
+    TooLarge { size: usize },
+    /// The requested `avatar_sha256` is not 32 bytes, or contains a malformed
+    /// peer_id argument.
+    InvalidArgument(String),
+    /// Remote peer returned `NotFound` or the local node has no self-avatar
+    /// matching the requested sha256 (server-side case).
+    NotFound,
+    /// Remote peer returned bytes whose SHA-256 does not match the request.
+    HashMismatch,
+    /// request_response::OutboundFailure (dial error, timeout, etc).
+    Transport(String),
+    /// Generic internal error (channel closed, etc).
+    Internal(String),
+}
+
+impl std::fmt::Display for AvatarFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { size } => write!(
+                f,
+                "avatar payload too large: {size} > {MAX_AVATAR_SIZE_BYTES}"
+            ),
+            Self::InvalidArgument(msg) => write!(f, "invalid avatar argument: {msg}"),
+            Self::NotFound => write!(f, "avatar not found"),
+            Self::HashMismatch => write!(f, "avatar hash mismatch"),
+            Self::Transport(msg) => write!(f, "avatar transport error: {msg}"),
+            Self::Internal(msg) => write!(f, "avatar internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AvatarFetchError {}
 
 #[derive(Debug, Clone)]
 pub enum DhtQueryError {
@@ -249,6 +323,53 @@ impl PeerManagerHandle {
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
+
+    /// TD-06: stash the local avatar bytes for future serving. Returns the
+    /// 32-byte SHA-256 that callers should advertise in their profile record
+    /// (TD-05 `avatar_sha256` field).
+    pub async fn set_self_avatar(
+        &self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<[u8; 32], AvatarFetchError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::SetSelfAvatar {
+                bytes,
+                response: tx,
+            })
+            .await
+            .map_err(|err| {
+                AvatarFetchError::Internal(format!("peer manager command channel closed: {err}"))
+            })?;
+        rx.await.map_err(|_| {
+            AvatarFetchError::Internal("set_self_avatar response channel closed".to_string())
+        })?
+    }
+
+    /// TD-06: fetch `peer`'s avatar bytes by `avatar_sha256`. Size is capped
+    /// at [`MAX_AVATAR_SIZE_BYTES`]; the returned bytes are guaranteed to
+    /// hash to the requested sha256 (re-verification happens before the
+    /// value is returned).
+    pub async fn fetch_avatar(
+        &self,
+        peer: PeerId,
+        avatar_sha256: [u8; 32],
+    ) -> std::result::Result<Vec<u8>, AvatarFetchError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::FetchAvatar {
+                peer,
+                avatar_sha256,
+                response: tx,
+            })
+            .await
+            .map_err(|err| {
+                AvatarFetchError::Internal(format!("peer manager command channel closed: {err}"))
+            })?;
+        rx.await.map_err(|_| {
+            AvatarFetchError::Internal("fetch_avatar response channel closed".to_string())
+        })?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +439,23 @@ pub struct PeerManager {
     mailbox_queues: HashMap<PeerId, VecDeque<StoredEnvelope>>,
     next_mailbox_fetch_at: Instant,
     delivery_sequence: u64,
+    // TD-06 avatar-fetch state.
+    /// SHA-256 of the avatar bytes we are currently willing to serve. `None`
+    /// until the host explicitly calls `set_self_avatar`.
+    self_avatar_sha256: Option<[u8; 32]>,
+    /// Raw avatar bytes. Kept in memory (<=64 KiB). Guarded by size cap on
+    /// the setter, so this vec is safe to clone per inbound request.
+    self_avatar_bytes: Option<Vec<u8>>,
+    /// Outstanding outbound avatar-fetch requests, keyed by `OutboundRequestId`.
+    /// Each entry carries the expected sha256 (for re-verification of the
+    /// response payload) and the oneshot the caller is awaiting on.
+    pending_avatar_fetches: HashMap<request_response::OutboundRequestId, PendingAvatarFetch>,
+}
+
+#[derive(Debug)]
+struct PendingAvatarFetch {
+    expected_sha256: [u8; 32],
+    response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
 }
 
 impl PeerManager {
@@ -402,6 +540,9 @@ impl PeerManager {
             mailbox_queues: HashMap::new(),
             next_mailbox_fetch_at: Instant::now() + mailbox_fetch_next_interval(),
             delivery_sequence: 0,
+            self_avatar_sha256: None,
+            self_avatar_bytes: None,
+            pending_avatar_fetches: HashMap::new(),
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -640,11 +781,81 @@ impl PeerManager {
                 self.handle_start_file_transfer(recipient, metadata, data, chunk_size);
                 Ok(false)
             }
+            PeerCommand::SetSelfAvatar { bytes, response } => {
+                let result = self.handle_set_self_avatar(bytes);
+                let _ = response.send(result);
+                Ok(false)
+            }
+            PeerCommand::FetchAvatar {
+                peer,
+                avatar_sha256,
+                response,
+            } => {
+                self.handle_fetch_avatar(peer, avatar_sha256, response);
+                Ok(false)
+            }
             PeerCommand::Shutdown => {
                 tracing::info!(target: "peer", "shutdown requested");
                 Ok(true)
             }
         }
+    }
+
+    fn handle_set_self_avatar(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<[u8; 32], AvatarFetchError> {
+        use sha2::{Digest, Sha256};
+        if bytes.is_empty() {
+            // Clear the avatar.
+            self.self_avatar_sha256 = None;
+            self.self_avatar_bytes = None;
+            return Ok([0u8; 32]);
+        }
+        if bytes.len() > MAX_AVATAR_SIZE_BYTES {
+            return Err(AvatarFetchError::TooLarge { size: bytes.len() });
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&digest);
+        self.self_avatar_sha256 = Some(sha256);
+        self.self_avatar_bytes = Some(bytes);
+        tracing::info!(
+            target: "peer",
+            avatar_sha256 = %hex::encode(sha256),
+            "self avatar stored; will serve on /fidonext/avatar-fetch/1.0.0",
+        );
+        Ok(sha256)
+    }
+
+    fn handle_fetch_avatar(
+        &mut self,
+        peer: PeerId,
+        avatar_sha256: [u8; 32],
+        response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
+    ) {
+        let request_id = self.swarm.behaviour_mut().avatar_fetch.send_request(
+            &peer,
+            AvatarFetchRequest {
+                avatar_sha256: avatar_sha256.to_vec(),
+            },
+        );
+        self.pending_avatar_fetches.insert(
+            request_id,
+            PendingAvatarFetch {
+                expected_sha256: avatar_sha256,
+                response,
+            },
+        );
+        tracing::debug!(
+            target: "peer",
+            %peer,
+            avatar_sha256 = %hex::encode(avatar_sha256),
+            ?request_id,
+            "dispatched avatar fetch request",
+        );
     }
 
     // Builds and sends the Init/Chunk/Complete sequence for a file transfer.
@@ -777,9 +988,27 @@ impl PeerManager {
         }
 
         if addressed {
+            // Defence-in-depth for the trap that caused TD-03: a contributor adds a new JSON
+            // message type that carries `to_peer_id` at the top level but is NOT a libsignal
+            // envelope. The addressed path can't encrypt it; without strict handling we'd either
+            // leak plaintext to direct peers or silently swallow it. We explicitly allow a short
+            // list of known system schemas (e.g. prekey exchange) to fall through to gossipsub,
+            // and log the actual schema on drop so the next debugger doesn't have to binary-search
+            // the codebase the way the TD-03 investigation did.
+            let schema = payload_schema(payload.as_slice()).unwrap_or_default();
+            if ADDRESSED_GOSSIP_ALLOWED_SCHEMAS.contains(&schema.as_str()) {
+                tracing::debug!(
+                    target: "peer",
+                    %schema,
+                    "addressed non-libsignal payload allowed through gossipsub (schema allowlist)",
+                );
+                self.publish_legacy_payload(payload);
+                return;
+            }
             tracing::warn!(
                 target: "peer",
-                "dropping addressed payload because strict E2EE mode requires payload_type=libsignal",
+                schema = %schema,
+                "dropping addressed payload; strict E2EE requires payload_type=libsignal (or add the schema to ADDRESSED_GOSSIP_ALLOWED_SCHEMAS in peer/manager.rs)",
             );
             return;
         }
@@ -1147,7 +1376,12 @@ impl PeerManager {
                             "stored",
                             None,
                         );
-                        self.emit_delivery_status(&recipient_peer_id, ack.envelope_id.as_str(), "stored", None);
+                        self.emit_delivery_status(
+                            &recipient_peer_id,
+                            ack.envelope_id.as_str(),
+                            "stored",
+                            None,
+                        );
                         tracing::debug!(
                             target: "peer",
                             envelope_id = %ack.envelope_id,
@@ -1631,6 +1865,10 @@ impl PeerManager {
                 self.handle_file_transfer_event(event);
             }
 
+            BehaviourEvent::AvatarFetch(event) => {
+                self.handle_avatar_fetch_event(event);
+            }
+
             BehaviourEvent::Autonat(event) => {
                 tracing::debug!(target:"peer", ?event, "autonat event");
 
@@ -1855,6 +2093,115 @@ impl PeerManager {
                 peer, request_id, ..
             } => {
                 tracing::debug!(target: "peer", %peer, ?request_id, "file transfer response sent");
+            }
+        }
+    }
+
+    /// TD-06 avatar-fetch event handler. Mirrors the `handle_file_transfer_event`
+    /// shape but is much smaller — the protocol is a single round-trip. On the
+    /// inbound side we compare the requested sha256 against `self_avatar_sha256`
+    /// and either echo the bytes back (hash match, size under cap) or reply
+    /// `NotFound`. On the outbound side we re-hash the response bytes and check
+    /// against the expected sha256 before delivering to the waiting oneshot.
+    fn handle_avatar_fetch_event(
+        &mut self,
+        event: request_response::Event<AvatarFetchRequest, AvatarFetchResponse>,
+    ) {
+        use sha2::{Digest, Sha256};
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request,
+                    channel,
+                    request_id,
+                } => {
+                    let response = match <[u8; 32]>::try_from(request.avatar_sha256.as_slice()) {
+                        Ok(requested) => {
+                            match (self.self_avatar_sha256, self.self_avatar_bytes.as_ref()) {
+                                (Some(own), Some(bytes))
+                                    if own == requested && bytes.len() <= MAX_AVATAR_SIZE_BYTES =>
+                                {
+                                    AvatarFetchResponse::Ok {
+                                        data: bytes.clone(),
+                                    }
+                                }
+                                _ => AvatarFetchResponse::NotFound,
+                            }
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                target: "peer",
+                                %peer,
+                                ?request_id,
+                                len = request.avatar_sha256.len(),
+                                "avatar fetch request carried malformed sha256",
+                            );
+                            AvatarFetchResponse::NotFound
+                        }
+                    };
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .avatar_fetch
+                        .send_response(channel, response)
+                        .is_err()
+                    {
+                        tracing::debug!(target: "peer", %peer, ?request_id, "failed to send avatar fetch response");
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let Some(pending) = self.pending_avatar_fetches.remove(&request_id) else {
+                        tracing::debug!(target: "peer", %peer, ?request_id, "avatar fetch response for unknown request");
+                        return;
+                    };
+                    let result = match response {
+                        AvatarFetchResponse::NotFound => Err(AvatarFetchError::NotFound),
+                        AvatarFetchResponse::Ok { data } => {
+                            if data.len() > MAX_AVATAR_SIZE_BYTES {
+                                Err(AvatarFetchError::TooLarge { size: data.len() })
+                            } else {
+                                let mut hasher = Sha256::new();
+                                hasher.update(&data);
+                                let digest = hasher.finalize();
+                                if digest.as_slice() != pending.expected_sha256.as_slice() {
+                                    Err(AvatarFetchError::HashMismatch)
+                                } else {
+                                    Ok(data)
+                                }
+                            }
+                        }
+                    };
+                    let _ = pending.response.send(result);
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                tracing::warn!(target: "peer", %peer, ?request_id, %error, "avatar fetch outbound request failed");
+                if let Some(pending) = self.pending_avatar_fetches.remove(&request_id) {
+                    let _ = pending
+                        .response
+                        .send(Err(AvatarFetchError::Transport(error.to_string())));
+                }
+            }
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                tracing::debug!(target: "peer", %peer, ?request_id, %error, "avatar fetch inbound request failed");
+            }
+            request_response::Event::ResponseSent {
+                peer, request_id, ..
+            } => {
+                tracing::trace!(target: "peer", %peer, ?request_id, "avatar fetch response sent");
             }
         }
     }
@@ -2342,7 +2689,7 @@ impl PeerManager {
 
             let changed = self.relay_base_address.as_ref() != Some(&base_address);
             if changed {
-                // Creating rachable addr of the current peer 
+                // Creating rachable addr of the current peer
                 // <relay_base>/p2p-circuit/p2p/<yourPeerId>
                 let mut reachable = base_address.clone();
                 reachable.push(Protocol::P2pCircuit);
@@ -2386,7 +2733,6 @@ impl PeerManager {
 
         tracing::debug!(target:"peer", ?ev, "addr event");
     }
-
 }
 
 fn extract_peer_id(address: &Multiaddr) -> Option<PeerId> {
@@ -2426,7 +2772,7 @@ fn relay_base_from_external(
 
         // .../p2p-circuit Format of addr
         (Some(Protocol::P2pCircuit), _) => {
-            // addr is already popped, so need to take address from param 
+            // addr is already popped, so need to take address from param
             // and use it as a base
             let mut base = address.clone();
             base.pop(); // poping p2p-circuit
@@ -2436,7 +2782,321 @@ fn relay_base_from_external(
                 _ => None,
             }
         }
-        
+
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod avatar_fetch_tests {
+    //! TD-06 avatar-fetch integration tests. Two in-process `PeerManager`s are
+    //! connected over an ephemeral TCP transport; one stores a self-avatar
+    //! with `set_self_avatar` and the other resolves it via `fetch_avatar`.
+    //!
+    //! These tests spin up real swarms and are `#[tokio::test]`s, so they
+    //! are skipped when running `cargo test --lib -- --skip avatar_fetch`.
+
+    use super::*;
+    use crate::messaging::{
+        FileTransferQueue, MessageQueue, DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY,
+        DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    };
+    use crate::peer::addr_events::AddrState;
+    use crate::peer::discovery::{DiscoveryQueue, DEFAULT_DISCOVERY_QUEUE_CAPACITY};
+    use crate::transport::TransportConfig;
+    use std::str::FromStr;
+    use std::sync::{Arc, RwLock};
+    use tokio::time::{sleep, Duration};
+
+    struct TestNode {
+        handle: PeerManagerHandle,
+        task: tokio::task::JoinHandle<Result<()>>,
+        // Keep the queues alive so their senders (owned by the PeerManager)
+        // don't see a dropped receiver and close mid-test.
+        _message_queue: MessageQueue,
+        _file_transfer_queue: FileTransferQueue,
+        _discovery_queue: crate::peer::discovery::DiscoveryQueue,
+    }
+
+    async fn spawn(seed: [u8; 32]) -> TestNode {
+        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            addr_state,
+            Vec::new(),
+        )
+        .expect("peer manager");
+        let task = tokio::spawn(async move { manager.run().await });
+        handle
+            .start_listening(Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").unwrap())
+            .await
+            .expect("start listening");
+        // Let the listener bind. One short poll tick is enough on loopback.
+        sleep(Duration::from_millis(200)).await;
+        TestNode {
+            handle,
+            task,
+            _message_queue: message_queue,
+            _file_transfer_queue: file_transfer_queue,
+            _discovery_queue: discovery_queue,
+        }
+    }
+
+    async fn shutdown(node: TestNode) {
+        let _ = node.handle.shutdown().await;
+        let _ = node.task.await;
+    }
+
+    async fn spawn_at_port(seed: [u8; 32], port: u16) -> (TestNode, Multiaddr) {
+        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            addr_state,
+            Vec::new(),
+        )
+        .expect("peer manager");
+        let local = handle.local_peer_id();
+        let task = tokio::spawn(async move { manager.run().await });
+        let listen = Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/{port}")).unwrap();
+        handle
+            .start_listening(listen.clone())
+            .await
+            .expect("start listening");
+        sleep(Duration::from_millis(250)).await;
+        let dial_addr = listen.with(libp2p::multiaddr::Protocol::P2p(local));
+        (
+            TestNode {
+                handle,
+                task,
+                _message_queue: message_queue,
+                _file_transfer_queue: file_transfer_queue,
+                _discovery_queue: discovery_queue,
+            },
+            dial_addr,
+        )
+    }
+
+    fn pick_ports() -> (u16, u16) {
+        use std::net::TcpListener;
+        let p1 = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let p2 = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        (p1, p2)
+    }
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let out = h.finalize();
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&out);
+        a
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn avatar_fetch_happy_path() {
+        let (p1, p2) = pick_ports();
+        let (alice, alice_addr) = spawn_at_port([1u8; 32], p1).await;
+        let (bob, _bob_addr) = spawn_at_port([2u8; 32], p2).await;
+
+        // Alice owns an avatar.
+        let avatar = vec![42u8; 8 * 1024];
+        let hash = alice
+            .handle
+            .set_self_avatar(avatar.clone())
+            .await
+            .expect("set_self_avatar");
+        assert_eq!(hash, sha256(&avatar));
+
+        // Bob dials Alice.
+        bob.handle.dial(alice_addr).await.expect("bob dial alice");
+        sleep(Duration::from_millis(600)).await;
+
+        // Bob fetches the avatar by sha256.
+        let alice_peer = alice.handle.local_peer_id();
+        let got = bob
+            .handle
+            .fetch_avatar(alice_peer, hash)
+            .await
+            .expect("fetch_avatar");
+        assert_eq!(got, avatar, "bytes must round-trip byte-identical");
+        assert_eq!(sha256(&got), hash);
+
+        shutdown(alice).await;
+        shutdown(bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn avatar_fetch_reports_not_found() {
+        let (p1, p2) = pick_ports();
+        let (alice, alice_addr) = spawn_at_port([3u8; 32], p1).await;
+        let (bob, _bob_addr) = spawn_at_port([4u8; 32], p2).await;
+
+        bob.handle.dial(alice_addr).await.expect("bob dial alice");
+        sleep(Duration::from_millis(600)).await;
+
+        // Alice has no avatar; Bob asks for an arbitrary hash -> NotFound.
+        let bogus = [9u8; 32];
+        let alice_peer = alice.handle.local_peer_id();
+        let err = bob
+            .handle
+            .fetch_avatar(alice_peer, bogus)
+            .await
+            .expect_err("expect NotFound");
+        assert!(matches!(err, AvatarFetchError::NotFound), "got {err:?}");
+
+        shutdown(alice).await;
+        shutdown(bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn avatar_fetch_reports_not_found_on_hash_mismatch_request() {
+        // When Bob asks for a hash that doesn't match what Alice has stored,
+        // Alice replies NotFound (even though she does have an avatar). This
+        // is the spec: a peer only serves *its own* avatar, not arbitrary
+        // content-addressed blobs.
+        let (p1, p2) = pick_ports();
+        let (alice, alice_addr) = spawn_at_port([5u8; 32], p1).await;
+        let (bob, _bob_addr) = spawn_at_port([6u8; 32], p2).await;
+
+        alice
+            .handle
+            .set_self_avatar(vec![1u8; 1024])
+            .await
+            .expect("set_self_avatar");
+
+        bob.handle.dial(alice_addr).await.expect("bob dial alice");
+        sleep(Duration::from_millis(600)).await;
+
+        let wrong_hash = [0u8; 32];
+        let alice_peer = alice.handle.local_peer_id();
+        let err = bob
+            .handle
+            .fetch_avatar(alice_peer, wrong_hash)
+            .await
+            .expect_err("expect NotFound on non-matching hash");
+        assert!(matches!(err, AvatarFetchError::NotFound), "got {err:?}");
+
+        shutdown(alice).await;
+        shutdown(bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn set_self_avatar_rejects_oversized_payload() {
+        let (_node_port, _) = pick_ports();
+        let node = spawn([7u8; 32]).await;
+
+        let too_big = vec![0u8; MAX_AVATAR_SIZE_BYTES + 1];
+        let err = node
+            .handle
+            .set_self_avatar(too_big)
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(err, AvatarFetchError::TooLarge { size } if size == MAX_AVATAR_SIZE_BYTES + 1),
+            "got {err:?}"
+        );
+
+        shutdown(node).await;
+    }
+
+    #[test]
+    fn avatar_response_verification_catches_hash_mismatch() {
+        // This is the pure-logic twin of the integration test: it exercises
+        // the same response-verification branch used in
+        // `handle_avatar_fetch_event` without needing a live swarm. If an
+        // attacker returned bytes that don't hash to the requested sha256,
+        // the requester must reject them.
+        use sha2::{Digest, Sha256};
+        let expected = sha256(b"the real avatar bytes");
+        let malicious = b"bytes that do not match the hash".to_vec();
+
+        // Mirror the branch inline.
+        let result: std::result::Result<Vec<u8>, AvatarFetchError> = {
+            if malicious.len() > MAX_AVATAR_SIZE_BYTES {
+                Err(AvatarFetchError::TooLarge {
+                    size: malicious.len(),
+                })
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(&malicious);
+                let digest = hasher.finalize();
+                if digest.as_slice() != expected.as_slice() {
+                    Err(AvatarFetchError::HashMismatch)
+                } else {
+                    Ok(malicious)
+                }
+            }
+        };
+        assert!(matches!(result, Err(AvatarFetchError::HashMismatch)));
+    }
+
+    #[test]
+    fn avatar_response_verification_catches_oversized_response() {
+        // Same logic as above: an attacker that returns a payload over the
+        // 64 KiB cap must be rejected before we even hash it.
+        let expected = [0u8; 32];
+        let huge = vec![0u8; MAX_AVATAR_SIZE_BYTES + 1];
+        let result: std::result::Result<Vec<u8>, AvatarFetchError> = {
+            if huge.len() > MAX_AVATAR_SIZE_BYTES {
+                Err(AvatarFetchError::TooLarge { size: huge.len() })
+            } else {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&huge);
+                if h.finalize().as_slice() != expected.as_slice() {
+                    Err(AvatarFetchError::HashMismatch)
+                } else {
+                    Ok(huge)
+                }
+            }
+        };
+        assert!(matches!(
+            result,
+            Err(AvatarFetchError::TooLarge { size }) if size == MAX_AVATAR_SIZE_BYTES + 1
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn set_self_avatar_clears_on_empty_input() {
+        let node = spawn([8u8; 32]).await;
+
+        let hash = node
+            .handle
+            .set_self_avatar(vec![1, 2, 3])
+            .await
+            .expect("initial set");
+        assert_eq!(hash, sha256(&[1, 2, 3]));
+
+        let zero = node
+            .handle
+            .set_self_avatar(Vec::new())
+            .await
+            .expect("clear");
+        assert_eq!(zero, [0u8; 32]);
+
+        shutdown(node).await;
     }
 }

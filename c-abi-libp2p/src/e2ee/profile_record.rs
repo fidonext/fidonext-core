@@ -239,10 +239,7 @@ pub fn validate_profile_record(
                 signature = Some(bytes);
             }
             other => {
-                return Err(anyhow!(
-                    "unknown CBOR map key in profile record: {}",
-                    other
-                ));
+                return Err(anyhow!("unknown CBOR map key in profile record: {}", other));
             }
         }
     }
@@ -528,15 +525,8 @@ mod tests {
         let (profile, _tmp) = fresh_profile();
         let peer_id = derive_peer_id(&profile);
 
-        let encoded = build_profile_record(
-            &profile,
-            &peer_id,
-            "Bob",
-            "bob",
-            None,
-            1_700_000_000,
-        )
-        .expect("build");
+        let encoded = build_profile_record(&profile, &peer_id, "Bob", "bob", None, 1_700_000_000)
+            .expect("build");
         let record = validate_profile_record(&encoded, None).expect("validate");
         assert_eq!(record.avatar_sha256, None);
     }
@@ -546,15 +536,9 @@ mod tests {
         let (profile, _tmp) = fresh_profile();
         let peer_id = derive_peer_id(&profile);
 
-        let mut encoded = build_profile_record(
-            &profile,
-            &peer_id,
-            "Alice",
-            "alice",
-            None,
-            1_700_000_000,
-        )
-        .expect("build");
+        let mut encoded =
+            build_profile_record(&profile, &peer_id, "Alice", "alice", None, 1_700_000_000)
+                .expect("build");
 
         // Flip a bit near the middle of the record. CBOR tolerates most byte
         // flips without structural error, so the signature check is what must
@@ -578,15 +562,9 @@ mod tests {
         let (profile, _tmp) = fresh_profile();
         let peer_id = derive_peer_id(&profile);
 
-        let encoded = build_profile_record(
-            &profile,
-            &peer_id,
-            "Alice",
-            "alice",
-            None,
-            1_700_000_000,
-        )
-        .expect("build");
+        let encoded =
+            build_profile_record(&profile, &peer_id, "Alice", "alice", None, 1_700_000_000)
+                .expect("build");
 
         // Walk the bytes and flip a bit inside what we believe is the
         // signature region. Since our canonical encoder places key 15 last,
@@ -646,15 +624,9 @@ mod tests {
         let (profile, _tmp) = fresh_profile();
         let peer_id = derive_peer_id(&profile);
 
-        let encoded = build_profile_record(
-            &profile,
-            &peer_id,
-            "Alice",
-            "alice",
-            None,
-            1_700_000_100,
-        )
-        .expect("build");
+        let encoded =
+            build_profile_record(&profile, &peer_id, "Alice", "alice", None, 1_700_000_100)
+                .expect("build");
 
         // Equal -> reject.
         let err = validate_profile_record(&encoded, Some(1_700_000_100)).expect_err("replay");
@@ -834,15 +806,9 @@ mod tests {
         // Sanity: account_seed in both is untouched.
         assert_ne!(bogus_profile.libp2p_seed, profile.libp2p_seed);
 
-        let encoded = build_profile_record(
-            &profile,
-            &peer_id,
-            "Alice",
-            "alice",
-            None,
-            1_700_000_000,
-        )
-        .expect("build");
+        let encoded =
+            build_profile_record(&profile, &peer_id, "Alice", "alice", None, 1_700_000_000)
+                .expect("build");
 
         // Validation uses the embedded account_public_key_protobuf, so
         // regardless of whether libp2p_seed rotated, the record must still

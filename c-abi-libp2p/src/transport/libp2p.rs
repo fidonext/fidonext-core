@@ -48,6 +48,11 @@ pub struct NetworkBehaviour {
         request_response::cbor::Behaviour<DeliveryDirectRequest, DeliveryDirectResponse>,
     /// Dedicated stream-oriented protocol for file transfer bulk payloads.
     pub file_transfer: request_response::cbor::Behaviour<FileTransferRequest, FileTransferResponse>,
+    /// Small request-response channel for fetching avatars by their SHA-256
+    /// (TD-06). Runs on its own protocol `/fidonext/avatar-fetch/1.0.0` so it
+    /// never blocks a long file transfer and cannot be confused with the
+    /// chunked file-transfer init/chunk/complete flow.
+    pub avatar_fetch: request_response::cbor::Behaviour<AvatarFetchRequest, AvatarFetchResponse>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -65,6 +70,7 @@ pub enum BehaviourEvent {
     RendezvousServer(rendezvous::server::Event),
     DeliveryDirect(request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>),
     FileTransfer(request_response::Event<FileTransferRequest, FileTransferResponse>),
+    AvatarFetch(request_response::Event<AvatarFetchRequest, AvatarFetchResponse>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +91,25 @@ pub struct FileTransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTransferResponse {
     pub accepted: bool,
+}
+
+/// TD-06 avatar-fetch request. Carries the 32-byte SHA-256 of the avatar the
+/// requester wants. The responder either replies with `AvatarFetchResponse::Ok`
+/// if it owns the avatar with the matching hash, or with `NotFound` otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvatarFetchRequest {
+    pub avatar_sha256: Vec<u8>,
+}
+
+/// TD-06 avatar-fetch response. `Ok.data` carries the raw avatar bytes (size
+/// capped at 64 KiB by the caller before we even reach the wire). `NotFound`
+/// signals the responder has no avatar matching the requested hash. The
+/// requester re-verifies `SHA-256(data) == requested_hash` before surfacing
+/// the bytes to the caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AvatarFetchResponse {
+    Ok { data: Vec<u8> },
+    NotFound,
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -155,6 +180,12 @@ impl From<request_response::Event<FileTransferRequest, FileTransferResponse>> fo
     }
 }
 
+impl From<request_response::Event<AvatarFetchRequest, AvatarFetchResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<AvatarFetchRequest, AvatarFetchResponse>) -> Self {
+        Self::AvatarFetch(event)
+    }
+}
+
 /// Transport configuration builder.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -173,11 +204,11 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            use_quic: false,     // Turn on for quic
-            use_websocket: false, // Turn on for ws transport (wss via reverse-proxy)
-            hop_relay: false,    // Turn on for node act as relay (at least try)
+            use_quic: false,          // Turn on for quic
+            use_websocket: false,     // Turn on for ws transport (wss via reverse-proxy)
+            hop_relay: false,         // Turn on for node act as relay (at least try)
             enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
-            identity_seed: None, // Pass to use identity seed for generating keypair
+            identity_seed: None,      // Pass to use identity seed for generating keypair
         }
     }
 }
@@ -199,7 +230,6 @@ impl TransportConfig {
         self.identity_seed = Some(seed);
         self
     }
-
 
     /// Enables or disables rendezvous client/server behaviours.
     pub fn with_rendezvous_enabled(mut self, enable: bool) -> Self {
@@ -276,17 +306,15 @@ impl TransportConfig {
         kademlia.set_mode(Some(kad::Mode::Server));
 
         let rendezvous_client = if enable_rendezvous {
-            Toggle::from(Some(rendezvous::client::Behaviour::new(
-                keypair.clone(),
-            )))
+            Toggle::from(Some(rendezvous::client::Behaviour::new(keypair.clone())))
         } else {
             Toggle::from(None)
         };
 
         let rendezvous_server = if hop_relay {
-            Toggle::from(
-                Some(rendezvous::server::Behaviour::new(rendezvous::server::Config::default()))
-            )
+            Toggle::from(Some(rendezvous::server::Behaviour::new(
+                rendezvous::server::Config::default(),
+            )))
         } else {
             Toggle::from(None)
         };
@@ -309,6 +337,18 @@ impl TransportConfig {
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         );
 
+        // TD-06: small avatar-fetch channel. 8 s timeout is enough for a <=64 KiB
+        // blob over relay and short enough to unblock the UI quickly on cold
+        // peers. Separate protocol so it does not share the 30 s timeout with
+        // the (bulk) file-transfer protocol.
+        let avatar_fetch = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/fidonext/avatar-fetch/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(8)),
+        );
+
         NetworkBehaviour {
             kademlia,
             ping: ping::Behaviour::new(ping_config),
@@ -321,6 +361,7 @@ impl TransportConfig {
             rendezvous_server,
             delivery_direct,
             file_transfer,
+            avatar_fetch,
         }
     }
 
