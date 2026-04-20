@@ -224,12 +224,13 @@ impl ManagedNode {
     }
 
     /// TD-06: store the caller's own avatar bytes (<=64 KiB) so this node can
-    /// serve them to peers that dial `/fidonext/avatar-fetch/1.0.0`. Returns
-    /// the SHA-256 hash the caller should advertise in their profile record.
+    /// serve them to peers that dial `/fidonext/blob-fetch/1.0.0` with the
+    /// matching sha256 under the avatar handler policy. Returns the SHA-256
+    /// hash the caller should advertise in their profile record.
     fn set_self_avatar(
         &self,
         bytes: Vec<u8>,
-    ) -> std::result::Result<[u8; 32], peer::AvatarFetchError> {
+    ) -> std::result::Result<[u8; 32], peer::BlobFetchError> {
         self.runtime.block_on(self.handle.set_self_avatar(bytes))
     }
 
@@ -239,11 +240,11 @@ impl ManagedNode {
         peer: PeerId,
         avatar_sha256: [u8; 32],
         timeout: std::time::Duration,
-    ) -> std::result::Result<Vec<u8>, peer::AvatarFetchError> {
+    ) -> std::result::Result<Vec<u8>, peer::BlobFetchError> {
         let fut = self.handle.fetch_avatar(peer, avatar_sha256);
         self.runtime
             .block_on(async move { tokio::time::timeout(timeout, fut).await })
-            .map_err(|_| peer::AvatarFetchError::Transport("avatar fetch timed out".to_string()))?
+            .map_err(|_| peer::BlobFetchError::Transport("avatar fetch timed out".to_string()))?
     }
 
     // Tries to pull the next inbound file-transfer frame without blocking.
@@ -2227,11 +2228,15 @@ pub extern "C" fn cabi_node_start_file_transfer(
     }
 }
 
-/// TD-06 avatar-fetch protocol constants.
+/// TD-06 avatar-fetch protocol constants. The avatar fetch rides on top of
+/// the generic `/fidonext/blob-fetch/1.0.0` protocol (see §15) under an
+/// avatar-specific handler policy; the constants here remain avatar-scoped
+/// because the size cap and the on-wire sha256 width are policy choices, not
+/// primitive properties.
 ///
 /// Maximum size of an avatar payload in bytes. Requests larger than this are
 /// rejected both locally (by [`cabi_node_set_self_avatar`]) and on the wire
-/// (by the remote node's `handle_avatar_fetch_event`).
+/// (by the remote node's `handle_blob_fetch_event` avatar-policy branch).
 pub const CABI_MAX_AVATAR_SIZE_BYTES: usize = peer::MAX_AVATAR_SIZE_BYTES;
 /// The avatar hash width (SHA-256 = 32 bytes). FFI callers pass arrays of
 /// exactly this length.
@@ -2249,9 +2254,10 @@ pub const CABI_STATUS_AVATAR_TRANSPORT: c_int = 13;
 
 #[no_mangle]
 /// C-ABI. Stores the caller's own avatar bytes in the node so peers that
-/// dial `/fidonext/avatar-fetch/1.0.0` with the matching sha256 receive the
-/// payload. Writes the 32-byte SHA-256 digest the caller should advertise in
-/// their TD-05 profile record into `out_sha256`.
+/// dial `/fidonext/blob-fetch/1.0.0` with the matching sha256 receive the
+/// payload under the avatar handler policy. Writes the 32-byte SHA-256
+/// digest the caller should advertise in their TD-05 profile record into
+/// `out_sha256`.
 ///
 /// Passing `bytes_len = 0` clears the previously-stored avatar (the node will
 /// reply NotFound to future requests). `out_sha256` is still written with all
@@ -2302,7 +2308,8 @@ pub extern "C" fn cabi_node_set_self_avatar(
 /// guaranteed to hash to the requested sha256.
 ///
 /// `timeout_ms = 0` uses an 8-second default (matching the wire-level
-/// request_response timeout for the avatar-fetch protocol).
+/// request_response timeout for the `/fidonext/blob-fetch/1.0.0` protocol
+/// that carries the avatar payload).
 pub extern "C" fn cabi_node_fetch_avatar(
     handle: *mut CabiNodeHandle,
     peer_id: *const c_char,
@@ -2903,26 +2910,26 @@ fn dht_error_to_status(err: peer::DhtQueryError) -> c_int {
     }
 }
 
-fn avatar_error_to_status(err: peer::AvatarFetchError) -> c_int {
+fn avatar_error_to_status(err: peer::BlobFetchError) -> c_int {
     match err {
-        peer::AvatarFetchError::NotFound => CABI_STATUS_AVATAR_NOT_FOUND,
-        peer::AvatarFetchError::TooLarge { size } => {
+        peer::BlobFetchError::NotFound => CABI_STATUS_AVATAR_NOT_FOUND,
+        peer::BlobFetchError::TooLarge { size } => {
             tracing::warn!(target: "ffi", size, "avatar payload too large");
             CABI_STATUS_AVATAR_TOO_LARGE
         }
-        peer::AvatarFetchError::HashMismatch => {
+        peer::BlobFetchError::HashMismatch => {
             tracing::warn!(target: "ffi", "avatar hash mismatch");
             CABI_STATUS_AVATAR_HASH_MISMATCH
         }
-        peer::AvatarFetchError::Transport(message) => {
+        peer::BlobFetchError::Transport(message) => {
             tracing::warn!(target: "ffi", %message, "avatar fetch transport error");
             CABI_STATUS_AVATAR_TRANSPORT
         }
-        peer::AvatarFetchError::InvalidArgument(message) => {
+        peer::BlobFetchError::InvalidArgument(message) => {
             tracing::warn!(target: "ffi", %message, "avatar invalid argument");
             CABI_STATUS_INVALID_ARGUMENT
         }
-        peer::AvatarFetchError::Internal(message) => {
+        peer::BlobFetchError::Internal(message) => {
             tracing::warn!(target: "ffi", %message, "avatar fetch failed");
             CABI_STATUS_INTERNAL_ERROR
         }

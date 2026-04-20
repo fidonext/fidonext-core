@@ -48,11 +48,15 @@ pub struct NetworkBehaviour {
         request_response::cbor::Behaviour<DeliveryDirectRequest, DeliveryDirectResponse>,
     /// Dedicated stream-oriented protocol for file transfer bulk payloads.
     pub file_transfer: request_response::cbor::Behaviour<FileTransferRequest, FileTransferResponse>,
-    /// Small request-response channel for fetching avatars by their SHA-256
-    /// (TD-06). Runs on its own protocol `/fidonext/avatar-fetch/1.0.0` so it
-    /// never blocks a long file transfer and cannot be confused with the
-    /// chunked file-transfer init/chunk/complete flow.
-    pub avatar_fetch: request_response::cbor::Behaviour<AvatarFetchRequest, AvatarFetchResponse>,
+    /// Small request-response channel for fetching a content-addressed blob by
+    /// its SHA-256 (TD-06 / §15). Runs on its own protocol
+    /// `/fidonext/blob-fetch/1.0.0` so it never blocks a long file transfer
+    /// and cannot be confused with the chunked file-transfer
+    /// init/chunk/complete flow. The avatar fetch (TD-06) is the first
+    /// handler-level policy on top of this generic primitive; M6.1
+    /// channel-event-by-CID and future small-content-by-hash fetches reuse
+    /// the same behaviour with a different server-side policy.
+    pub blob_fetch: request_response::cbor::Behaviour<BlobFetchRequest, BlobFetchResponse>,
 }
 
 /// Event type produced by the composed [`NetworkBehaviour`].
@@ -70,7 +74,7 @@ pub enum BehaviourEvent {
     RendezvousServer(rendezvous::server::Event),
     DeliveryDirect(request_response::Event<DeliveryDirectRequest, DeliveryDirectResponse>),
     FileTransfer(request_response::Event<FileTransferRequest, FileTransferResponse>),
-    AvatarFetch(request_response::Event<AvatarFetchRequest, AvatarFetchResponse>),
+    BlobFetch(request_response::Event<BlobFetchRequest, BlobFetchResponse>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,21 +97,31 @@ pub struct FileTransferResponse {
     pub accepted: bool,
 }
 
-/// TD-06 avatar-fetch request. Carries the 32-byte SHA-256 of the avatar the
-/// requester wants. The responder either replies with `AvatarFetchResponse::Ok`
-/// if it owns the avatar with the matching hash, or with `NotFound` otherwise.
+/// Generic content-addressed blob-fetch request (TD-06 / §15). Carries the
+/// 32-byte SHA-256 of the blob the requester wants. The responder either
+/// replies with `BlobFetchResponse::Ok` if it is willing to serve a blob whose
+/// bytes hash to that digest under the handler-level policy for the remote
+/// peer, or with `NotFound` otherwise. The avatar-fetch TD-06 policy ("I only
+/// serve my own self-avatar") is one such handler; additional policies
+/// (channel-event-by-CID, sticker packs, link previews) ride the same wire.
+///
+/// Field name is kept as `avatar_sha256` for wire compatibility with
+/// `/fidonext/blob-fetch/1.0.0` as introduced in commit `dbfc7d6`; renaming it
+/// would be a real wire break. Field semantics are "content-addressed hash of
+/// the requested blob", independent of what content class the handler serves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarFetchRequest {
+pub struct BlobFetchRequest {
     pub avatar_sha256: Vec<u8>,
 }
 
-/// TD-06 avatar-fetch response. `Ok.data` carries the raw avatar bytes (size
-/// capped at 64 KiB by the caller before we even reach the wire). `NotFound`
-/// signals the responder has no avatar matching the requested hash. The
-/// requester re-verifies `SHA-256(data) == requested_hash` before surfacing
-/// the bytes to the caller.
+/// Generic blob-fetch response (TD-06 / §15). `Ok.data` carries the raw blob
+/// bytes (size capped by the handler-level policy; for the avatar handler
+/// this is 64 KiB, enforced by the caller before we even reach the wire).
+/// `NotFound` signals the responder has no blob matching the requested hash
+/// under its active policy. The requester re-verifies
+/// `SHA-256(data) == requested_hash` before surfacing the bytes to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AvatarFetchResponse {
+pub enum BlobFetchResponse {
     Ok { data: Vec<u8> },
     NotFound,
 }
@@ -180,9 +194,9 @@ impl From<request_response::Event<FileTransferRequest, FileTransferResponse>> fo
     }
 }
 
-impl From<request_response::Event<AvatarFetchRequest, AvatarFetchResponse>> for BehaviourEvent {
-    fn from(event: request_response::Event<AvatarFetchRequest, AvatarFetchResponse>) -> Self {
-        Self::AvatarFetch(event)
+impl From<request_response::Event<BlobFetchRequest, BlobFetchResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<BlobFetchRequest, BlobFetchResponse>) -> Self {
+        Self::BlobFetch(event)
     }
 }
 
@@ -337,13 +351,15 @@ impl TransportConfig {
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         );
 
-        // TD-06: small avatar-fetch channel. 8 s timeout is enough for a <=64 KiB
-        // blob over relay and short enough to unblock the UI quickly on cold
-        // peers. Separate protocol so it does not share the 30 s timeout with
-        // the (bulk) file-transfer protocol.
-        let avatar_fetch = request_response::cbor::Behaviour::new(
+        // TD-06 / §15: small generic blob-fetch channel. 8 s timeout is enough
+        // for a <=64 KiB blob over relay and short enough to unblock the UI
+        // quickly on cold peers. Separate protocol so it does not share the
+        // 30 s timeout with the (bulk) file-transfer protocol. The protocol
+        // is content-class-agnostic on the wire; per-content policy
+        // (avatar-only, channel-event-only, ...) is enforced in the handler.
+        let blob_fetch = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::new("/fidonext/avatar-fetch/1.0.0"),
+                StreamProtocol::new("/fidonext/blob-fetch/1.0.0"),
                 request_response::ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(8)),
@@ -361,7 +377,7 @@ impl TransportConfig {
             rendezvous_server,
             delivery_direct,
             file_transfer,
-            avatar_fetch,
+            blob_fetch,
         }
     }
 

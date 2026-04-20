@@ -71,7 +71,7 @@ use crate::{
     peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
     peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
     transport::{
-        AvatarFetchRequest, AvatarFetchResponse, BehaviourEvent, DeliveryDirectRequest,
+        BehaviourEvent, BlobFetchRequest, BlobFetchResponse, DeliveryDirectRequest,
         DeliveryDirectResponse, FileTransferRequest, FileTransferResponse, NetworkBehaviour,
         TransportConfig,
     },
@@ -118,37 +118,45 @@ pub enum PeerCommand {
         chunk_size: usize,
     },
     /// TD-06: stash the caller's own avatar bytes so this node can serve them
-    /// when a peer hits `/fidonext/avatar-fetch/1.0.0`.
-    SetSelfAvatar {
+    /// when a peer hits `/fidonext/blob-fetch/1.0.0` with the matching
+    /// sha256. The avatar handler is the only blob-fetch policy that
+    /// currently consults this state; a future M6.1 channel-event handler
+    /// will consult its own store.
+    SetSelfBlob {
         bytes: Vec<u8>,
-        response: oneshot::Sender<std::result::Result<[u8; 32], AvatarFetchError>>,
+        response: oneshot::Sender<std::result::Result<[u8; 32], BlobFetchError>>,
     },
-    /// TD-06: fetch `peer`'s avatar by `avatar_sha256`. The response oneshot
+    /// TD-06: fetch a blob from `peer` by `blob_sha256`. The response oneshot
     /// resolves with the raw bytes (already size-capped, hash-verified) on
-    /// success, or a typed `AvatarFetchError` on failure.
-    FetchAvatar {
+    /// success, or a typed `BlobFetchError` on failure. Avatar fetch is the
+    /// first handler-level policy on top of this primitive.
+    FetchBlob {
         peer: PeerId,
-        avatar_sha256: [u8; 32],
-        response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
+        blob_sha256: [u8; 32],
+        response: oneshot::Sender<std::result::Result<Vec<u8>, BlobFetchError>>,
     },
     /// Shut the manager down gracefully.
     Shutdown,
 }
 
-/// Errors surfaced by TD-06 avatar-fetch helpers. Mirrors the discovery /
+/// Errors surfaced by TD-06 blob-fetch helpers. Mirrors the discovery /
 /// DHT error split: a typed enum at the Rust layer, which the FFI layer maps
-/// onto `CABI_STATUS_*` codes for Android.
+/// onto `CABI_STATUS_*` codes for Android. The avatar-specific FFI
+/// (`cabi_node_{set_self,fetch}_avatar`) maps these onto `CABI_STATUS_AVATAR_*`
+/// codes; future blob-fetch consumers pick their own policy-specific codes.
 #[derive(Debug, Clone)]
-pub enum AvatarFetchError {
-    /// The avatar payload is larger than [`MAX_AVATAR_SIZE_BYTES`], or would
-    /// be after echoing it across the wire. Applies both to the local "set
-    /// your own avatar" path and the incoming-response validation path.
+pub enum BlobFetchError {
+    /// The blob payload is larger than the handler-level cap (for the avatar
+    /// policy that is [`MAX_AVATAR_SIZE_BYTES`]), or would be after echoing it
+    /// across the wire. Applies both to the local "set your own blob" path
+    /// and the incoming-response validation path.
     TooLarge { size: usize },
-    /// The requested `avatar_sha256` is not 32 bytes, or contains a malformed
+    /// The requested `blob_sha256` is not 32 bytes, or contains a malformed
     /// peer_id argument.
     InvalidArgument(String),
-    /// Remote peer returned `NotFound` or the local node has no self-avatar
-    /// matching the requested sha256 (server-side case).
+    /// Remote peer returned `NotFound`, or the local node has no blob
+    /// matching the requested sha256 under the active handler policy
+    /// (server-side case).
     NotFound,
     /// Remote peer returned bytes whose SHA-256 does not match the request.
     HashMismatch,
@@ -158,23 +166,23 @@ pub enum AvatarFetchError {
     Internal(String),
 }
 
-impl std::fmt::Display for AvatarFetchError {
+impl std::fmt::Display for BlobFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooLarge { size } => write!(
                 f,
-                "avatar payload too large: {size} > {MAX_AVATAR_SIZE_BYTES}"
+                "blob payload too large: {size} > {MAX_AVATAR_SIZE_BYTES}"
             ),
-            Self::InvalidArgument(msg) => write!(f, "invalid avatar argument: {msg}"),
-            Self::NotFound => write!(f, "avatar not found"),
-            Self::HashMismatch => write!(f, "avatar hash mismatch"),
-            Self::Transport(msg) => write!(f, "avatar transport error: {msg}"),
-            Self::Internal(msg) => write!(f, "avatar internal error: {msg}"),
+            Self::InvalidArgument(msg) => write!(f, "invalid blob argument: {msg}"),
+            Self::NotFound => write!(f, "blob not found"),
+            Self::HashMismatch => write!(f, "blob hash mismatch"),
+            Self::Transport(msg) => write!(f, "blob transport error: {msg}"),
+            Self::Internal(msg) => write!(f, "blob internal error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for AvatarFetchError {}
+impl std::error::Error for BlobFetchError {}
 
 #[derive(Debug, Clone)]
 pub enum DhtQueryError {
@@ -324,50 +332,55 @@ impl PeerManagerHandle {
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
 
-    /// TD-06: stash the local avatar bytes for future serving. Returns the
-    /// 32-byte SHA-256 that callers should advertise in their profile record
-    /// (TD-05 `avatar_sha256` field).
+    /// TD-06: stash the local avatar bytes for future serving via the blob-
+    /// fetch protocol under the avatar handler policy. Returns the 32-byte
+    /// SHA-256 that callers should advertise in their profile record
+    /// (TD-05 `avatar_sha256` field). Method keeps the `set_self_avatar`
+    /// name to preserve the avatar-semantics entry point used by the C-ABI;
+    /// internally it drives the generic `PeerCommand::SetSelfBlob`.
     pub async fn set_self_avatar(
         &self,
         bytes: Vec<u8>,
-    ) -> std::result::Result<[u8; 32], AvatarFetchError> {
+    ) -> std::result::Result<[u8; 32], BlobFetchError> {
         let (tx, rx) = oneshot::channel();
         self.command_sender
-            .send(PeerCommand::SetSelfAvatar {
+            .send(PeerCommand::SetSelfBlob {
                 bytes,
                 response: tx,
             })
             .await
             .map_err(|err| {
-                AvatarFetchError::Internal(format!("peer manager command channel closed: {err}"))
+                BlobFetchError::Internal(format!("peer manager command channel closed: {err}"))
             })?;
         rx.await.map_err(|_| {
-            AvatarFetchError::Internal("set_self_avatar response channel closed".to_string())
+            BlobFetchError::Internal("set_self_avatar response channel closed".to_string())
         })?
     }
 
     /// TD-06: fetch `peer`'s avatar bytes by `avatar_sha256`. Size is capped
     /// at [`MAX_AVATAR_SIZE_BYTES`]; the returned bytes are guaranteed to
     /// hash to the requested sha256 (re-verification happens before the
-    /// value is returned).
+    /// value is returned). Method keeps the `fetch_avatar` name to preserve
+    /// the avatar-semantics entry point used by the C-ABI; internally it
+    /// drives the generic `PeerCommand::FetchBlob`.
     pub async fn fetch_avatar(
         &self,
         peer: PeerId,
         avatar_sha256: [u8; 32],
-    ) -> std::result::Result<Vec<u8>, AvatarFetchError> {
+    ) -> std::result::Result<Vec<u8>, BlobFetchError> {
         let (tx, rx) = oneshot::channel();
         self.command_sender
-            .send(PeerCommand::FetchAvatar {
+            .send(PeerCommand::FetchBlob {
                 peer,
-                avatar_sha256,
+                blob_sha256: avatar_sha256,
                 response: tx,
             })
             .await
             .map_err(|err| {
-                AvatarFetchError::Internal(format!("peer manager command channel closed: {err}"))
+                BlobFetchError::Internal(format!("peer manager command channel closed: {err}"))
             })?;
         rx.await.map_err(|_| {
-            AvatarFetchError::Internal("fetch_avatar response channel closed".to_string())
+            BlobFetchError::Internal("fetch_avatar response channel closed".to_string())
         })?
     }
 }
@@ -439,23 +452,28 @@ pub struct PeerManager {
     mailbox_queues: HashMap<PeerId, VecDeque<StoredEnvelope>>,
     next_mailbox_fetch_at: Instant,
     delivery_sequence: u64,
-    // TD-06 avatar-fetch state.
+    // TD-06 avatar-fetch handler state (rides the generic blob-fetch
+    // protocol; avatar is the first handler-level policy).
     /// SHA-256 of the avatar bytes we are currently willing to serve. `None`
-    /// until the host explicitly calls `set_self_avatar`.
+    /// until the host explicitly calls `set_self_avatar`. Only consulted by
+    /// the avatar handler policy; other blob-fetch policies carry their own
+    /// state.
     self_avatar_sha256: Option<[u8; 32]>,
     /// Raw avatar bytes. Kept in memory (<=64 KiB). Guarded by size cap on
     /// the setter, so this vec is safe to clone per inbound request.
     self_avatar_bytes: Option<Vec<u8>>,
-    /// Outstanding outbound avatar-fetch requests, keyed by `OutboundRequestId`.
+    /// Outstanding outbound blob-fetch requests, keyed by `OutboundRequestId`.
     /// Each entry carries the expected sha256 (for re-verification of the
-    /// response payload) and the oneshot the caller is awaiting on.
-    pending_avatar_fetches: HashMap<request_response::OutboundRequestId, PendingAvatarFetch>,
+    /// response payload) and the oneshot the caller is awaiting on. Today
+    /// only the avatar-fetch path populates this map; M6.1 and later
+    /// content-addressed fetches will share it.
+    pending_blob_fetches: HashMap<request_response::OutboundRequestId, PendingBlobFetch>,
 }
 
 #[derive(Debug)]
-struct PendingAvatarFetch {
+struct PendingBlobFetch {
     expected_sha256: [u8; 32],
-    response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
+    response: oneshot::Sender<std::result::Result<Vec<u8>, BlobFetchError>>,
 }
 
 impl PeerManager {
@@ -542,7 +560,7 @@ impl PeerManager {
             delivery_sequence: 0,
             self_avatar_sha256: None,
             self_avatar_bytes: None,
-            pending_avatar_fetches: HashMap::new(),
+            pending_blob_fetches: HashMap::new(),
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -781,17 +799,20 @@ impl PeerManager {
                 self.handle_start_file_transfer(recipient, metadata, data, chunk_size);
                 Ok(false)
             }
-            PeerCommand::SetSelfAvatar { bytes, response } => {
+            PeerCommand::SetSelfBlob { bytes, response } => {
+                // Today only the avatar handler writes self-blob state; when
+                // M6.1 adds a channel-event handler, that handler will grow
+                // its own setter variant.
                 let result = self.handle_set_self_avatar(bytes);
                 let _ = response.send(result);
                 Ok(false)
             }
-            PeerCommand::FetchAvatar {
+            PeerCommand::FetchBlob {
                 peer,
-                avatar_sha256,
+                blob_sha256,
                 response,
             } => {
-                self.handle_fetch_avatar(peer, avatar_sha256, response);
+                self.handle_fetch_blob(peer, blob_sha256, response);
                 Ok(false)
             }
             PeerCommand::Shutdown => {
@@ -804,7 +825,7 @@ impl PeerManager {
     fn handle_set_self_avatar(
         &mut self,
         bytes: Vec<u8>,
-    ) -> std::result::Result<[u8; 32], AvatarFetchError> {
+    ) -> std::result::Result<[u8; 32], BlobFetchError> {
         use sha2::{Digest, Sha256};
         if bytes.is_empty() {
             // Clear the avatar.
@@ -813,7 +834,7 @@ impl PeerManager {
             return Ok([0u8; 32]);
         }
         if bytes.len() > MAX_AVATAR_SIZE_BYTES {
-            return Err(AvatarFetchError::TooLarge { size: bytes.len() });
+            return Err(BlobFetchError::TooLarge { size: bytes.len() });
         }
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
@@ -825,36 +846,36 @@ impl PeerManager {
         tracing::info!(
             target: "peer",
             avatar_sha256 = %hex::encode(sha256),
-            "self avatar stored; will serve on /fidonext/avatar-fetch/1.0.0",
+            "self avatar stored; will serve on /fidonext/blob-fetch/1.0.0",
         );
         Ok(sha256)
     }
 
-    fn handle_fetch_avatar(
+    fn handle_fetch_blob(
         &mut self,
         peer: PeerId,
-        avatar_sha256: [u8; 32],
-        response: oneshot::Sender<std::result::Result<Vec<u8>, AvatarFetchError>>,
+        blob_sha256: [u8; 32],
+        response: oneshot::Sender<std::result::Result<Vec<u8>, BlobFetchError>>,
     ) {
-        let request_id = self.swarm.behaviour_mut().avatar_fetch.send_request(
+        let request_id = self.swarm.behaviour_mut().blob_fetch.send_request(
             &peer,
-            AvatarFetchRequest {
-                avatar_sha256: avatar_sha256.to_vec(),
+            BlobFetchRequest {
+                avatar_sha256: blob_sha256.to_vec(),
             },
         );
-        self.pending_avatar_fetches.insert(
+        self.pending_blob_fetches.insert(
             request_id,
-            PendingAvatarFetch {
-                expected_sha256: avatar_sha256,
+            PendingBlobFetch {
+                expected_sha256: blob_sha256,
                 response,
             },
         );
         tracing::debug!(
             target: "peer",
             %peer,
-            avatar_sha256 = %hex::encode(avatar_sha256),
+            blob_sha256 = %hex::encode(blob_sha256),
             ?request_id,
-            "dispatched avatar fetch request",
+            "dispatched blob fetch request",
         );
     }
 
@@ -1865,8 +1886,8 @@ impl PeerManager {
                 self.handle_file_transfer_event(event);
             }
 
-            BehaviourEvent::AvatarFetch(event) => {
-                self.handle_avatar_fetch_event(event);
+            BehaviourEvent::BlobFetch(event) => {
+                self.handle_blob_fetch_event(event);
             }
 
             BehaviourEvent::Autonat(event) => {
@@ -2097,15 +2118,20 @@ impl PeerManager {
         }
     }
 
-    /// TD-06 avatar-fetch event handler. Mirrors the `handle_file_transfer_event`
-    /// shape but is much smaller — the protocol is a single round-trip. On the
-    /// inbound side we compare the requested sha256 against `self_avatar_sha256`
-    /// and either echo the bytes back (hash match, size under cap) or reply
-    /// `NotFound`. On the outbound side we re-hash the response bytes and check
-    /// against the expected sha256 before delivering to the waiting oneshot.
-    fn handle_avatar_fetch_event(
+    /// TD-06 / §15 blob-fetch event handler. Mirrors the
+    /// `handle_file_transfer_event` shape but is much smaller — the protocol
+    /// is a single round-trip. On the inbound side we run the handler-level
+    /// policy (today: avatar-only, "I only serve my own self-avatar by the
+    /// matching sha256"), either echoing the bytes back or replying
+    /// `NotFound`. Future handlers (M6.1 channel-event-by-CID, sticker packs)
+    /// plug in additional match arms before the final `NotFound` fallback.
+    /// On the outbound side we re-hash the response bytes and check against
+    /// the expected sha256 before delivering to the waiting oneshot —
+    /// content-addressed integrity is enforced uniformly for every blob
+    /// handler.
+    fn handle_blob_fetch_event(
         &mut self,
-        event: request_response::Event<AvatarFetchRequest, AvatarFetchResponse>,
+        event: request_response::Event<BlobFetchRequest, BlobFetchResponse>,
     ) {
         use sha2::{Digest, Sha256};
         match event {
@@ -2117,15 +2143,20 @@ impl PeerManager {
                 } => {
                     let response = match <[u8; 32]>::try_from(request.avatar_sha256.as_slice()) {
                         Ok(requested) => {
+                            // Avatar handler policy: only serve our own
+                            // self-avatar, matched by sha256, under the
+                            // MAX_AVATAR_SIZE_BYTES cap. Additional handler
+                            // policies will be inserted as sibling match
+                            // arms before the `NotFound` fallback.
                             match (self.self_avatar_sha256, self.self_avatar_bytes.as_ref()) {
                                 (Some(own), Some(bytes))
                                     if own == requested && bytes.len() <= MAX_AVATAR_SIZE_BYTES =>
                                 {
-                                    AvatarFetchResponse::Ok {
+                                    BlobFetchResponse::Ok {
                                         data: bytes.clone(),
                                     }
                                 }
-                                _ => AvatarFetchResponse::NotFound,
+                                _ => BlobFetchResponse::NotFound,
                             }
                         }
                         Err(_) => {
@@ -2134,40 +2165,40 @@ impl PeerManager {
                                 %peer,
                                 ?request_id,
                                 len = request.avatar_sha256.len(),
-                                "avatar fetch request carried malformed sha256",
+                                "blob fetch request carried malformed sha256",
                             );
-                            AvatarFetchResponse::NotFound
+                            BlobFetchResponse::NotFound
                         }
                     };
                     if self
                         .swarm
                         .behaviour_mut()
-                        .avatar_fetch
+                        .blob_fetch
                         .send_response(channel, response)
                         .is_err()
                     {
-                        tracing::debug!(target: "peer", %peer, ?request_id, "failed to send avatar fetch response");
+                        tracing::debug!(target: "peer", %peer, ?request_id, "failed to send blob fetch response");
                     }
                 }
                 request_response::Message::Response {
                     request_id,
                     response,
                 } => {
-                    let Some(pending) = self.pending_avatar_fetches.remove(&request_id) else {
-                        tracing::debug!(target: "peer", %peer, ?request_id, "avatar fetch response for unknown request");
+                    let Some(pending) = self.pending_blob_fetches.remove(&request_id) else {
+                        tracing::debug!(target: "peer", %peer, ?request_id, "blob fetch response for unknown request");
                         return;
                     };
                     let result = match response {
-                        AvatarFetchResponse::NotFound => Err(AvatarFetchError::NotFound),
-                        AvatarFetchResponse::Ok { data } => {
+                        BlobFetchResponse::NotFound => Err(BlobFetchError::NotFound),
+                        BlobFetchResponse::Ok { data } => {
                             if data.len() > MAX_AVATAR_SIZE_BYTES {
-                                Err(AvatarFetchError::TooLarge { size: data.len() })
+                                Err(BlobFetchError::TooLarge { size: data.len() })
                             } else {
                                 let mut hasher = Sha256::new();
                                 hasher.update(&data);
                                 let digest = hasher.finalize();
                                 if digest.as_slice() != pending.expected_sha256.as_slice() {
-                                    Err(AvatarFetchError::HashMismatch)
+                                    Err(BlobFetchError::HashMismatch)
                                 } else {
                                     Ok(data)
                                 }
@@ -2183,11 +2214,11 @@ impl PeerManager {
                 error,
                 ..
             } => {
-                tracing::warn!(target: "peer", %peer, ?request_id, %error, "avatar fetch outbound request failed");
-                if let Some(pending) = self.pending_avatar_fetches.remove(&request_id) {
+                tracing::warn!(target: "peer", %peer, ?request_id, %error, "blob fetch outbound request failed");
+                if let Some(pending) = self.pending_blob_fetches.remove(&request_id) {
                     let _ = pending
                         .response
-                        .send(Err(AvatarFetchError::Transport(error.to_string())));
+                        .send(Err(BlobFetchError::Transport(error.to_string())));
                 }
             }
             request_response::Event::InboundFailure {
@@ -2196,12 +2227,12 @@ impl PeerManager {
                 error,
                 ..
             } => {
-                tracing::debug!(target: "peer", %peer, ?request_id, %error, "avatar fetch inbound request failed");
+                tracing::debug!(target: "peer", %peer, ?request_id, %error, "blob fetch inbound request failed");
             }
             request_response::Event::ResponseSent {
                 peer, request_id, ..
             } => {
-                tracing::trace!(target: "peer", %peer, ?request_id, "avatar fetch response sent");
+                tracing::trace!(target: "peer", %peer, ?request_id, "blob fetch response sent");
             }
         }
     }
@@ -2965,7 +2996,7 @@ mod avatar_fetch_tests {
             .fetch_avatar(alice_peer, bogus)
             .await
             .expect_err("expect NotFound");
-        assert!(matches!(err, AvatarFetchError::NotFound), "got {err:?}");
+        assert!(matches!(err, BlobFetchError::NotFound), "got {err:?}");
 
         shutdown(alice).await;
         shutdown(bob).await;
@@ -2997,7 +3028,7 @@ mod avatar_fetch_tests {
             .fetch_avatar(alice_peer, wrong_hash)
             .await
             .expect_err("expect NotFound on non-matching hash");
-        assert!(matches!(err, AvatarFetchError::NotFound), "got {err:?}");
+        assert!(matches!(err, BlobFetchError::NotFound), "got {err:?}");
 
         shutdown(alice).await;
         shutdown(bob).await;
@@ -3015,7 +3046,7 @@ mod avatar_fetch_tests {
             .await
             .expect_err("must reject");
         assert!(
-            matches!(err, AvatarFetchError::TooLarge { size } if size == MAX_AVATAR_SIZE_BYTES + 1),
+            matches!(err, BlobFetchError::TooLarge { size } if size == MAX_AVATAR_SIZE_BYTES + 1),
             "got {err:?}"
         );
 
@@ -3026,7 +3057,7 @@ mod avatar_fetch_tests {
     fn avatar_response_verification_catches_hash_mismatch() {
         // This is the pure-logic twin of the integration test: it exercises
         // the same response-verification branch used in
-        // `handle_avatar_fetch_event` without needing a live swarm. If an
+        // `handle_blob_fetch_event` without needing a live swarm. If an
         // attacker returned bytes that don't hash to the requested sha256,
         // the requester must reject them.
         use sha2::{Digest, Sha256};
@@ -3034,9 +3065,9 @@ mod avatar_fetch_tests {
         let malicious = b"bytes that do not match the hash".to_vec();
 
         // Mirror the branch inline.
-        let result: std::result::Result<Vec<u8>, AvatarFetchError> = {
+        let result: std::result::Result<Vec<u8>, BlobFetchError> = {
             if malicious.len() > MAX_AVATAR_SIZE_BYTES {
-                Err(AvatarFetchError::TooLarge {
+                Err(BlobFetchError::TooLarge {
                     size: malicious.len(),
                 })
             } else {
@@ -3044,13 +3075,13 @@ mod avatar_fetch_tests {
                 hasher.update(&malicious);
                 let digest = hasher.finalize();
                 if digest.as_slice() != expected.as_slice() {
-                    Err(AvatarFetchError::HashMismatch)
+                    Err(BlobFetchError::HashMismatch)
                 } else {
                     Ok(malicious)
                 }
             }
         };
-        assert!(matches!(result, Err(AvatarFetchError::HashMismatch)));
+        assert!(matches!(result, Err(BlobFetchError::HashMismatch)));
     }
 
     #[test]
@@ -3059,15 +3090,15 @@ mod avatar_fetch_tests {
         // 64 KiB cap must be rejected before we even hash it.
         let expected = [0u8; 32];
         let huge = vec![0u8; MAX_AVATAR_SIZE_BYTES + 1];
-        let result: std::result::Result<Vec<u8>, AvatarFetchError> = {
+        let result: std::result::Result<Vec<u8>, BlobFetchError> = {
             if huge.len() > MAX_AVATAR_SIZE_BYTES {
-                Err(AvatarFetchError::TooLarge { size: huge.len() })
+                Err(BlobFetchError::TooLarge { size: huge.len() })
             } else {
                 use sha2::{Digest, Sha256};
                 let mut h = Sha256::new();
                 h.update(&huge);
                 if h.finalize().as_slice() != expected.as_slice() {
-                    Err(AvatarFetchError::HashMismatch)
+                    Err(BlobFetchError::HashMismatch)
                 } else {
                     Ok(huge)
                 }
@@ -3075,7 +3106,7 @@ mod avatar_fetch_tests {
         };
         assert!(matches!(
             result,
-            Err(AvatarFetchError::TooLarge { size }) if size == MAX_AVATAR_SIZE_BYTES + 1
+            Err(BlobFetchError::TooLarge { size }) if size == MAX_AVATAR_SIZE_BYTES + 1
         ));
     }
 

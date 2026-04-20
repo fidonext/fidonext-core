@@ -11,7 +11,7 @@ pub use discovery::{
     DEFAULT_DISCOVERY_QUEUE_CAPACITY,
 };
 pub use manager::{
-    AvatarFetchError, DhtQueryError, PeerCommand, PeerManager, PeerManagerHandle,
+    BlobFetchError, DhtQueryError, PeerCommand, PeerManager, PeerManagerHandle,
     MAX_AVATAR_SIZE_BYTES,
 };
 

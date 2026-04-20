@@ -3,7 +3,7 @@
 pub mod libp2p;
 
 pub use libp2p::{
-    AvatarFetchRequest, AvatarFetchResponse, BehaviourEvent, DeliveryDirectRequest,
+    BehaviourEvent, BlobFetchRequest, BlobFetchResponse, DeliveryDirectRequest,
     DeliveryDirectResponse, FileTransferRequest, FileTransferResponse, NetworkBehaviour,
     TransportConfig,
 };
