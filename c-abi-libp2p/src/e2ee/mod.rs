@@ -309,10 +309,13 @@ fn persist_profile(path: &Path, stored: &StoredIdentityProfile) -> Result<()> {
 
     let json =
         serde_json::to_string_pretty(stored).context("failed to serialize identity profile")?;
+    // TD-20(b): randomize the temp-file suffix (pid + nanos + u32 random) and open it
+    // with create_new so two concurrent persist_profile flushes never share a scratch
+    // file. Defense-in-depth on top of the Android-side Mutex (TD-20(a)).
     let temp_path = temporary_path(path);
 
     let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         options.mode(0o600);
@@ -328,14 +331,41 @@ fn persist_profile(path: &Path, stored: &StoredIdentityProfile) -> Result<()> {
         .context("failed to write identity profile data")?;
     file.sync_all()
         .context("failed to fsync identity profile data")?;
+    drop(file);
 
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to move identity profile into place: {} -> {}",
+    // TD-20(b): commit via hard_link so a concurrent writer that already produced
+    // the final profile makes us fail loudly with AlreadyExists instead of silently
+    // clobbering the winner's file. fs::rename on Unix is replace-by-default and
+    // would swallow the race. persist_profile is only called from create_profile,
+    // which is gated by `path.exists()` in load_or_create_profile -- the final path
+    // MUST NOT exist at this point, so AlreadyExists is a legitimate error.
+    let link_result = fs::hard_link(&temp_path, path);
+    if let Err(err) = link_result {
+        // Best-effort cleanup of our scratch file before bubbling the error.
+        let _ = fs::remove_file(&temp_path);
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(anyhow!(
+                "identity profile already exists at {} (concurrent persist_profile race?): {}",
+                path.display(),
+                err
+            ));
+        }
+        return Err(anyhow::Error::new(err).context(format!(
+            "failed to publish identity profile into place: {} -> {}",
             temp_path.display(),
             path.display()
-        )
-    })?;
+        )));
+    }
+    // Remove the temp hardlink source; the final path now owns the inode.
+    if let Err(err) = fs::remove_file(&temp_path) {
+        // Non-fatal: final file is in place. Log-worthy via context, but don't fail.
+        tracing::warn!(
+            target = "fidonext::e2ee",
+            temp = %temp_path.display(),
+            error = %err,
+            "failed to remove temporary identity profile scratch file"
+        );
+    }
 
     #[cfg(unix)]
     {
@@ -380,11 +410,23 @@ fn current_unix_seconds() -> u64 {
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
+    // TD-20(b): suffix with pid + high-resolution timestamp + u32 random so two
+    // concurrent persist_profile / persist_signal_state flushes never collide
+    // on the same scratch file. The final rename/hard_link step is still what
+    // guarantees atomicity; the randomness only ensures each writer has its
+    // own private scratch.
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let rand_component: u32 = rand::random();
+    let suffix = format!("{pid}.{nanos}.{rand_component:08x}.tmp");
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| format!("{value}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
+        .map(|value| format!("{value}.{suffix}"))
+        .unwrap_or_else(|| suffix.clone());
     path.with_extension(extension)
 }
 
@@ -3707,5 +3749,93 @@ mod tests {
             build_file_integrity_manifest("f", 1, &digest, Some(&sig)).expect("manifest");
         let pubkey = public_key_from_seed(&seed).expect("pubkey");
         verify_file_integrity_manifest(&manifest, "f", 1, &digest, Some(&pubkey)).expect("verify");
+    }
+
+    // TD-20(b): defense-in-depth check that persist_profile cannot silently
+    // clobber an existing identity file. The Android-side Mutex (TD-20(a))
+    // should already serialize init, but this guards against a future binding
+    // that forgets to do so. Invariants:
+    //   (a) exactly one persist_profile succeeds when two writers race on the
+    //       same final path,
+    //   (b) the losing writer returns a descriptive error (AlreadyExists),
+    //   (c) the on-disk file parses back as a valid StoredIdentityProfile
+    //       belonging to the winning writer (not a torn mash of both).
+    #[test]
+    fn persist_profile_refuses_to_clobber_existing_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("identity.profile.json");
+
+        let profile_a = StoredIdentityProfile {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            account_seed_b64: encode_seed([1u8; IDENTITY_SEED_LEN]),
+            device_id: "dev-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            libp2p_seed_b64: encode_seed([2u8; IDENTITY_SEED_LEN]),
+            signal_identity_seed_b64: encode_seed([3u8; IDENTITY_SEED_LEN]),
+            created_at_unix: 1000,
+        };
+        let profile_b = StoredIdentityProfile {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            account_seed_b64: encode_seed([9u8; IDENTITY_SEED_LEN]),
+            device_id: "dev-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            libp2p_seed_b64: encode_seed([8u8; IDENTITY_SEED_LEN]),
+            signal_identity_seed_b64: encode_seed([7u8; IDENTITY_SEED_LEN]),
+            created_at_unix: 2000,
+        };
+
+        // Writer A lands first; simulates the Mutex winner in TD-20(a).
+        persist_profile(&path, &profile_a).expect("first persist_profile should succeed");
+        assert!(path.exists(), "profile file must exist after first write");
+
+        // Writer B races in without the Mutex (simulated); must NOT overwrite.
+        let err = persist_profile(&path, &profile_b)
+            .expect_err("second persist_profile must fail loudly, not clobber");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already exists") || msg.to_lowercase().contains("alreadyexists"),
+            "error must describe the AlreadyExists collision, got: {msg}"
+        );
+
+        // Invariant (c): the surviving file is profile A, intact and parseable.
+        let raw = fs::read_to_string(&path).expect("read final profile");
+        let parsed: StoredIdentityProfile =
+            serde_json::from_str(&raw).expect("final file must parse as StoredIdentityProfile");
+        assert_eq!(parsed.device_id, profile_a.device_id);
+        assert_eq!(parsed.account_seed_b64, profile_a.account_seed_b64);
+        assert_eq!(parsed.libp2p_seed_b64, profile_a.libp2p_seed_b64);
+        assert_eq!(parsed.created_at_unix, profile_a.created_at_unix);
+
+        // Invariant: no scratch .tmp files left behind in the parent dir.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "persist_profile must not leave scratch tmp files: {leftovers:?}"
+        );
+    }
+
+    // TD-20(b): two sequential temporary_path calls must return distinct paths
+    // so concurrent writers can never share a scratch file.
+    #[test]
+    fn temporary_path_is_unique_per_call() {
+        let base = Path::new("/tmp/fidonext-td20b-uniqueness-check.json");
+        let a = temporary_path(base);
+        let b = temporary_path(base);
+        assert_ne!(
+            a, b,
+            "temporary_path must produce a unique suffix per call (got {a:?} twice)"
+        );
+        // Structural check: randomized suffix ends in `.tmp` and carries the pid.
+        let a_str = a.to_string_lossy();
+        assert!(a_str.ends_with(".tmp"), "suffix must end in .tmp: {a_str}");
+        assert!(
+            a_str.contains(&std::process::id().to_string()),
+            "suffix must contain pid: {a_str}"
+        );
     }
 }
