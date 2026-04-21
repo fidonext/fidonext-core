@@ -79,6 +79,41 @@ pub const CABI_DISCOVERY_EVENT_ADDRESS: c_int = 0;
 /// Discovery query has finished.
 pub const CABI_DISCOVERY_EVENT_FINISHED: c_int = 1;
 
+// ---------------------------------------------------------------------------
+// TD-15 · Nickname-registry lookup/claim error codes (`NickLookupErr`).
+//
+// These are returned from the dedicated `cabi_nickname_*` functions and form
+// their own enum space — they are NOT mixed with `CABI_STATUS_*`. The
+// numeric values intentionally mirror the `NickLookupErr` variants in
+// `e2ee::nickname` so a caller can round-trip a raw `c_int` through
+// `NickLookupErr::from_int` without a translation table. Sign-off:
+// `security-crypto-engineer` design §13.C (shape) + prompt-level allocation.
+// ---------------------------------------------------------------------------
+
+/// Nickname operation succeeded.
+pub const CABI_NICK_OK: c_int = 0;
+/// No claim record found for the requested nickname.
+pub const CABI_NICK_NOT_FOUND: c_int = 1;
+/// Signature on the retrieved claim failed Ed25519 verification under the
+/// embedded `account_public_key` and the `fidonext-nick-claim-v1\x00` domain.
+pub const CABI_NICK_BAD_SIGNATURE: c_int = 2;
+/// Proof-of-work check failed (leading-zero bits < 22 or length-prefix
+/// manipulation detected).
+pub const CABI_NICK_BAD_POW: c_int = 3;
+/// `claim_ts` is outside the accepted ±120 s window, or more than 24 h in
+/// the past (stale-replay reject).
+pub const CABI_NICK_STALE_CLAIM: c_int = 4;
+/// Schema reject: oversize, non-canonical CBOR, unknown map key, reserved
+/// key 10 (TD-17 `recovery_pubkey`) present, or wrong schema version.
+pub const CABI_NICK_SCHEMA_REJECT: c_int = 5;
+/// DHT query exceeded the caller-provided timeout.
+pub const CABI_NICK_NETWORK_TIMEOUT: c_int = 6;
+/// Caller-provided nickname fails charset / size (`^[a-z0-9_-]{3,32}$`) or
+/// another input is malformed.
+pub const CABI_NICK_INVALID_INPUT: c_int = 7;
+/// Nickname is already claimed by a different peer. Claim path only.
+pub const CABI_NICK_TAKEN: c_int = 8;
+
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
 pub struct CabiNodeHandle {
@@ -1485,6 +1520,347 @@ pub extern "C" fn cabi_e2ee_fetch_profile_record(
         FetchFreshness::ReturnRecord => {
             write_bytes(&payload, out_buffer, out_buffer_len, written_len)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TD-15 · Nickname registry FFIs
+//
+// Three synchronous entry points — claim, resolve, release — built on top of
+// the existing `dht_put_record` / `dht_get_record` pair. No new queues, no
+// new callbacks; the polling-only FFI discipline is preserved.
+//
+// Validation (signature + PoW + domain separator + field lengths + charset
+// + ±120 s skew + 24 h stale-replay + reserved-key-10 reject) runs inside
+// `e2ee::nickname::validate_claim` BEFORE raw record bytes cross the FFI
+// boundary. Android sees a peer_id or a typed `CABI_NICK_*` code, never
+// a raw CBOR record.
+//
+// The gossipsub registry topic (`/fidonext/nickname-registry/v1`) for
+// anti-entropy is defined as a constant in `e2ee::nickname::consts` but is
+// NOT yet wired through the PeerManager event loop — TD-15 MVP is DHT-only.
+// A follow-up will subscribe the PeerManager, publish claim bytes on the
+// topic directly (not via `PeerCommand::Publish`), and apply the same
+// validation on inbound frames. Ticketed inline.
+// ---------------------------------------------------------------------------
+
+fn nick_err_to_code(err: e2ee::nickname::NickLookupErr) -> c_int {
+    use e2ee::nickname::NickLookupErr::*;
+    match err {
+        NotFound => CABI_NICK_NOT_FOUND,
+        BadSignature => CABI_NICK_BAD_SIGNATURE,
+        BadPoW => CABI_NICK_BAD_POW,
+        StaleClaim => CABI_NICK_STALE_CLAIM,
+        SchemaReject => CABI_NICK_SCHEMA_REJECT,
+        NetworkTimeout => CABI_NICK_NETWORK_TIMEOUT,
+        InvalidInput => CABI_NICK_INVALID_INPUT,
+        Taken => CABI_NICK_TAKEN,
+    }
+}
+
+fn dht_error_to_nick_code(err: peer::DhtQueryError) -> c_int {
+    match err {
+        peer::DhtQueryError::NotFound => CABI_NICK_NOT_FOUND,
+        peer::DhtQueryError::Timeout => CABI_NICK_NETWORK_TIMEOUT,
+        peer::DhtQueryError::Internal(message) => {
+            tracing::warn!(target: "ffi", %message, "nickname dht query failed");
+            CABI_NICK_NETWORK_TIMEOUT
+        }
+    }
+}
+
+#[no_mangle]
+/// C-ABI. TD-15 · Claim a globally-unique nickname. Builds a signed +
+/// PoW'd `NickClaim` bound to the local `account_seed` + `peer_id`,
+/// publishes to the Kademlia DHT under
+/// `SHA-256("fidonext/nick/v1/" || nickname)`.
+///
+/// Synchronous: returns only after the DHT put completes (or fails).
+/// Uses `Quorum::Majority` transitively via `dht_put_record`, which was
+/// upgraded to `Quorum::Majority` in TD-26.
+///
+/// # Arguments
+/// - `profile_path`: path to the local identity profile JSON. The
+///   `account_seed` in that profile signs the claim.
+/// - `peer_id`: the local peer_id as string — must match the profile's
+///   derived peer_id; embedded in the claim record as map key 2.
+/// - `nickname`: Latin-only charset for v0.0.7 (`^[a-z0-9_-]{3,32}$`).
+/// - `display_name`: 1..=40 UTF-8 chars, no control chars.
+/// - `avatar_sha256_ptr`, `avatar_sha256_len`: optional 32-byte SHA-256 of
+///   the caller's avatar. `len = 0` means "no avatar".
+/// - `ttl_seconds`: DHT record TTL. `0` → [`e2ee::nickname::DEFAULT_CLAIM_TTL_SECONDS`] (30 d).
+/// - `revision`: caller-managed monotonic counter. Starts at 1.
+///
+/// # Returns
+/// `CABI_NICK_OK` on success, or one of:
+/// - `CABI_NICK_INVALID_INPUT` — nickname / display_name fails validation.
+/// - `CABI_NICK_NETWORK_TIMEOUT` — DHT put timed out or failed.
+/// - `CABI_STATUS_NULL_POINTER` / `CABI_STATUS_INVALID_ARGUMENT` —
+///   malformed pointer inputs (reuses the existing FFI-level codes for
+///   caller-bug signalling, per the `cabi_e2ee_*` precedent).
+///
+/// **Note**: this function does NOT currently check for a pre-existing
+/// claim under the same key before publishing. Android layer is expected
+/// to call `cabi_nickname_resolve` first and surface `CABI_NICK_TAKEN`
+/// in the UI before ever hitting this path. A server-side first-writer-
+/// wins enforcement is the design §1.4 tiebreak rule; bookkeeping lands
+/// with the gossipsub-registry-topic follow-up.
+pub extern "C" fn cabi_nickname_claim(
+    handle: *mut CabiNodeHandle,
+    profile_path: *const c_char,
+    peer_id: *const c_char,
+    nickname: *const c_char,
+    display_name: *const c_char,
+    avatar_sha256_ptr: *const u8,
+    avatar_sha256_len: usize,
+    ttl_seconds: u64,
+    revision: u32,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let peer_id_parsed = match parse_peer_id(peer_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let nickname = match parse_required_c_string(nickname) {
+        Ok(value) => value,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+    let display_name = match parse_required_c_string(display_name) {
+        Ok(value) => value,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+    if e2ee::nickname::validate_nickname_charset(&nickname).is_err() {
+        return CABI_NICK_INVALID_INPUT;
+    }
+    let avatar_sha256 = match parse_optional_avatar_sha256(avatar_sha256_ptr, avatar_sha256_len) {
+        Ok(value) => value,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load profile for nickname claim"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let claim_ts = unix_seconds_now();
+    let payload = match e2ee::nickname::build_claim(
+        &profile,
+        &peer_id_parsed,
+        &nickname,
+        &display_name,
+        avatar_sha256.as_ref(),
+        claim_ts,
+        0, // default TTL (claim_ts + 30 d)
+        revision,
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build nickname claim");
+            return CABI_NICK_INVALID_INPUT;
+        }
+    };
+
+    let key = e2ee::nickname::claim_dht_key(&nickname);
+    let effective_ttl = if ttl_seconds == 0 {
+        e2ee::nickname::DEFAULT_CLAIM_TTL_SECONDS
+    } else {
+        ttl_seconds
+    };
+
+    match node.dht_put_record(key, payload, effective_ttl) {
+        Ok(_) => CABI_NICK_OK,
+        Err(err) => dht_error_to_nick_code(err),
+    }
+}
+
+#[no_mangle]
+/// C-ABI. TD-15 · Resolve a nickname to a peer_id. Kademlia `get_record`
+/// at the hashed key, full validation (sig + PoW + domain separator +
+/// ±120 s skew + 24 h stale-replay + reserved-key-10 reject + canonical
+/// CBOR round-trip) runs inside the Rust module before the peer_id
+/// bytes cross the FFI boundary.
+///
+/// # Arguments
+/// - `nickname`: Latin-only `^[a-z0-9_-]{3,32}$`.
+/// - `timeout_ms`: caller-side hard deadline on the whole DHT+validate
+///   pipeline. `0` means "no extra deadline beyond the internal Kademlia
+///   query timeout (currently 15 s, see `transport/libp2p.rs`)".
+/// - `out_buffer`, `out_buffer_len`, `written_len`: peer_id bytes
+///   (libp2p multihash encoding, typically 38 bytes). Caller should
+///   provide a 64-byte buffer. On `CABI_STATUS_BUFFER_TOO_SMALL`,
+///   `*written_len` is set to the required length.
+///
+/// # Returns
+/// `CABI_NICK_OK` with peer_id bytes written, or one of the
+/// `CABI_NICK_*` codes enumerating the failure mode.
+pub extern "C" fn cabi_nickname_resolve(
+    handle: *mut CabiNodeHandle,
+    nickname: *const c_char,
+    timeout_ms: u64,
+    out_buffer: *mut u8,
+    out_buffer_len: usize,
+    written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+    if out_buffer.is_null() || written_len.is_null() {
+        return CABI_NICK_INVALID_INPUT;
+    }
+    let nickname = match parse_required_c_string(nickname) {
+        Ok(value) => value,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+    if e2ee::nickname::validate_nickname_charset(&nickname).is_err() {
+        return CABI_NICK_INVALID_INPUT;
+    }
+
+    // `timeout_ms` is currently informational — the Kademlia layer has its
+    // own query timeout (15 s in `transport/libp2p.rs`). A follow-up
+    // wrapping `dht_get_record` in `tokio::time::timeout(timeout_ms, ...)`
+    // would give tighter UX control; not strictly required for the MVP
+    // because Android already wraps the whole call in its own coroutine
+    // timeout. Kept in the FFI signature so we can wire it without
+    // a header break.
+    let _ = timeout_ms;
+
+    let key = e2ee::nickname::claim_dht_key(&nickname);
+    let payload = match node.dht_get_record(key) {
+        Ok(value) => value,
+        Err(err) => return dht_error_to_nick_code(err),
+    };
+
+    let observer_now = unix_seconds_now();
+    let claim = match e2ee::nickname::validate_claim(&payload, observer_now) {
+        Ok(claim) => claim,
+        Err(err) => {
+            tracing::warn!(
+                target: "ffi",
+                ?err,
+                "nickname resolve: validation failed before peer_id surface",
+            );
+            return nick_err_to_code(err);
+        }
+    };
+
+    // Defense-in-depth: re-check the wire-carried nickname matches the
+    // requested nickname. `claim_dht_key` is a hash collision domain —
+    // under infeasibly low probability a valid claim for a different
+    // nickname could land at the same key; without this check the caller
+    // would get the wrong peer_id. validate_claim already enforces charset.
+    if claim.nickname != nickname {
+        tracing::warn!(
+            target: "ffi",
+            requested = %nickname,
+            got = %claim.nickname,
+            "nickname resolve: record nickname mismatch",
+        );
+        return CABI_NICK_SCHEMA_REJECT;
+    }
+
+    let peer_id_bytes = claim.peer_id.to_bytes();
+    unsafe {
+        *written_len = peer_id_bytes.len();
+    }
+    if peer_id_bytes.len() > out_buffer_len {
+        return CABI_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(peer_id_bytes.as_ptr(), out_buffer, peer_id_bytes.len());
+    }
+    CABI_NICK_OK
+}
+
+#[no_mangle]
+/// C-ABI. TD-15 · Release an owned nickname. Builds a signed vacate
+/// tombstone and overwrites the DHT record at the nickname's hashed key.
+/// Tombstone TTL is [`e2ee::nickname::MIN_VACATE_TTL_SECONDS`] (30 d) so
+/// a stale replica cannot flip the name back before the tombstone
+/// expires (design §6).
+///
+/// # Arguments
+/// - `revision`: MUST be strictly greater than the last claim's
+///   `revision`. Caller is responsible for tracking this (TD-15 MVP
+///   does not persist per-nickname revision state in core).
+///
+/// # Returns
+/// `CABI_NICK_OK` on successful tombstone publish, or a `CABI_NICK_*` /
+/// `CABI_STATUS_*` failure code.
+pub extern "C" fn cabi_nickname_release(
+    handle: *mut CabiNodeHandle,
+    profile_path: *const c_char,
+    peer_id: *const c_char,
+    nickname: *const c_char,
+    revision: u32,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    let profile_path = match parse_path(profile_path) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let peer_id_parsed = match parse_peer_id(peer_id) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let nickname = match parse_required_c_string(nickname) {
+        Ok(value) => value,
+        Err(_) => return CABI_NICK_INVALID_INPUT,
+    };
+    if e2ee::nickname::validate_nickname_charset(&nickname).is_err() {
+        return CABI_NICK_INVALID_INPUT;
+    }
+
+    let profile = match e2ee::load_or_create_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                path = %profile_path.display(),
+                %err,
+                "failed to load profile for nickname release"
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let vacate_ts = unix_seconds_now();
+    let payload = match e2ee::nickname::build_vacate(
+        &profile,
+        &peer_id_parsed,
+        &nickname,
+        vacate_ts,
+        revision,
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(target: "ffi", %err, "failed to build nickname vacate");
+            return CABI_NICK_INVALID_INPUT;
+        }
+    };
+
+    let key = e2ee::nickname::claim_dht_key(&nickname);
+    match node.dht_put_record(key, payload, e2ee::nickname::MIN_VACATE_TTL_SECONDS) {
+        Ok(_) => CABI_NICK_OK,
+        Err(err) => dht_error_to_nick_code(err),
     }
 }
 

@@ -39,6 +39,12 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 // PreKeyBundleRecord, which is why the profile_record module is the template.
 pub mod profile_record;
 
+// TD-15 globally-unique nickname registry. Built on the same CBOR + canonical-
+// encoding + domain-separator discipline as `profile_record`, plus a 22-bit
+// SHA-256 proof-of-work on the signed bytes for squatting resistance.
+// See `fidonext-core/docs/nickname-registry-design.md` for the locked spec.
+pub mod nickname;
+
 pub(crate) const IDENTITY_SEED_LEN: usize = 32;
 const PROFILE_SCHEMA_VERSION: u32 = 1;
 const E2EE_SCHEMA_VERSION: u32 = 1;
@@ -1836,19 +1842,27 @@ fn load_or_create_signal_state(
     create_signal_state(&path, profile, one_time_prekey_count)
 }
 
-fn signal_state_matches_profile(state: &StoredSignalState, profile: &IdentityProfile) -> Result<bool> {
-    let identity_private = decode_base64_fixed_32(&state.identity_private_b64, "identity_private_b64")?;
+fn signal_state_matches_profile(
+    state: &StoredSignalState,
+    profile: &IdentityProfile,
+) -> Result<bool> {
+    let identity_private =
+        decode_base64_fixed_32(&state.identity_private_b64, "identity_private_b64")?;
     if identity_private != profile.signal_identity_seed {
         return Ok(false);
     }
     let expected_public = x25519_public_from_private(&profile.signal_identity_seed);
-    let identity_public = decode_base64_fixed_32(&state.identity_public_b64, "identity_public_b64")?;
+    let identity_public =
+        decode_base64_fixed_32(&state.identity_public_b64, "identity_public_b64")?;
     if identity_public != expected_public {
         return Ok(false);
     }
 
     let account_keypair = keypair_from_seed(&profile.account_seed)?;
-    let signed_public = decode_base64_fixed_32(&state.signed_pre_key.public_b64, "signed_pre_key.public_b64")?;
+    let signed_public = decode_base64_fixed_32(
+        &state.signed_pre_key.public_b64,
+        "signed_pre_key.public_b64",
+    )?;
     let signed_signature = decode_base64(
         &state.signed_pre_key_signature_b64,
         "signed_pre_key_signature_b64",
