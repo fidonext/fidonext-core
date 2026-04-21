@@ -19,6 +19,7 @@ use libp2p::{
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -96,7 +97,13 @@ fn mailbox_fetch_next_interval() -> Duration {
 }
 
 use crate::{
-    e2ee::nickname::{tiebreak_winner, validate_claim, NickClaim, NICKNAME_REGISTRY_TOPIC},
+    e2ee::{
+        load_or_create_profile,
+        nickname::{
+            build_vacate, claim_dht_key, tiebreak_winner, validate_claim, NickClaim,
+            MIN_VACATE_TTL_SECONDS, NICKNAME_REGISTRY_TOPIC,
+        },
+    },
     messaging::{
         build_ack, build_envelope_from_payload, build_mailbox_fetch, build_nack,
         chunk_size_or_default, encode_frame, is_addressed_payload, now_unix_seconds, parse_frame,
@@ -192,7 +199,19 @@ pub enum PeerCommand {
     /// was already validated by the caller before this command was sent.
     /// The manager also records the bytes locally so the anti-entropy
     /// tiebreak (§5) has a `first_seen_ts` baseline for our own claim.
-    PublishNicknameClaim(Vec<u8>),
+    ///
+    /// TD-42: the optional `profile_path` is stashed on the cached own-claim
+    /// entry so that if a later inbound claim wins the deterministic
+    /// tiebreak and revokes this nickname, the manager can re-load the
+    /// identity profile, build a signed vacate tombstone, and put it to the
+    /// DHT to converge the split-brain state observed in
+    /// `qa-artifacts/2026-04-21T1919Z-td40-convergence/`. `None` disables
+    /// the auto-tombstone path (used by test fixtures that don't persist a
+    /// profile).
+    PublishNicknameClaim {
+        payload: Vec<u8>,
+        profile_path: Option<PathBuf>,
+    },
     /// TD-37 Layer A: query the manager's in-memory observation map for a
     /// nickname. Returns the currently-observed claim bytes + observer
     /// first-seen timestamp, or `None` if the nickname is unknown. Used
@@ -358,9 +377,22 @@ impl PeerManagerHandle {
     /// in `handle_publish_command` (the CBOR payload isn't an addressed
     /// libsignal envelope). Used exclusively by `cabi_nickname_claim` to
     /// announce ownership for the gossipsub anti-entropy pass (§1.4 / §5).
-    pub async fn publish_nickname_claim(&self, payload: Vec<u8>) -> Result<()> {
+    ///
+    /// TD-42: `profile_path` is stashed on the cached own-claim entry so
+    /// the manager can auto-publish a vacate tombstone if a later inbound
+    /// claim wins the tiebreak and revokes this nickname. Pass the same
+    /// profile path `cabi_nickname_claim` used to sign the claim; `None`
+    /// disables the auto-tombstone path.
+    pub async fn publish_nickname_claim(
+        &self,
+        payload: Vec<u8>,
+        profile_path: Option<PathBuf>,
+    ) -> Result<()> {
         self.command_sender
-            .send(PeerCommand::PublishNicknameClaim(payload))
+            .send(PeerCommand::PublishNicknameClaim {
+                payload,
+                profile_path,
+            })
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
     }
@@ -733,10 +765,18 @@ struct NicknameObservation {
 /// `cabi_nickname_claim` published the first time — re-publishing them
 /// verbatim skips the PoW grind entirely and keeps the signature intact.
 /// `claim` is the parsed view used for TTL expiry checks.
+///
+/// TD-42: `profile_path` is retained so that on a Layer-B tiebreak loss
+/// (`we_lost_our_own` in `handle_nickname_registry_message`) the manager
+/// can re-load the identity profile, build a signed vacate tombstone at
+/// `claim.revision + 1`, and push it to the DHT to converge the stale
+/// claim record. `None` disables the auto-tombstone path (used by unit
+/// tests that don't persist a real profile).
 #[derive(Debug, Clone)]
 struct OwnClaimCacheEntry {
     claim: NickClaim,
     encoded: Vec<u8>,
+    profile_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1025,8 +1065,11 @@ impl PeerManager {
                 self.handle_publish_command(payload);
                 Ok(false)
             }
-            PeerCommand::PublishNicknameClaim(payload) => {
-                self.handle_publish_nickname_claim(payload);
+            PeerCommand::PublishNicknameClaim {
+                payload,
+                profile_path,
+            } => {
+                self.handle_publish_nickname_claim(payload, profile_path);
                 Ok(false)
             }
             PeerCommand::LookupNicknameObservation { nickname, response } => {
@@ -1499,7 +1542,7 @@ impl PeerManager {
     /// — if the caller somehow enqueued garbage the claim is still published
     /// to match "what was successfully put in the DHT" but the local
     /// observation is only recorded on validation success.
-    fn handle_publish_nickname_claim(&mut self, payload: Vec<u8>) {
+    fn handle_publish_nickname_claim(&mut self, payload: Vec<u8>, profile_path: Option<PathBuf>) {
         // Record our own claim in the observation map BEFORE publishing so
         // that any inbound echo we might receive from a remote replica
         // finds an existing entry and skips the "first-time seen → store"
@@ -1528,11 +1571,15 @@ impl PeerManager {
                 // same bytes without re-signing / re-grinding PoW. Every
                 // successful publish refreshes the cache (e.g. after a
                 // revision bump the latest bytes are what gets re-broadcast).
+                // TD-42: stash the profile_path so a subsequent Layer-B
+                // tiebreak loss can build a signed vacate tombstone
+                // without re-asking the FFI host for the path.
                 self.own_nickname_claims.insert(
                     nickname.clone(),
                     OwnClaimCacheEntry {
                         claim,
                         encoded: payload.clone(),
+                        profile_path,
                     },
                 );
                 tracing::debug!(
@@ -1852,7 +1899,18 @@ impl PeerManager {
                 // thread races a tick between now and the host's
                 // `cabi_nickname_release`, the losing bytes are already
                 // gone from the cache.
-                if self.own_nickname_claims.remove(&nickname).is_some() {
+                //
+                // TD-42: before evicting, snapshot the cached entry so we
+                // can synthesize a signed vacate tombstone at
+                // `revision + 1` and push it to the DHT. This is the
+                // missing piece from the TD-40 convergence QA run:
+                // local observation maps agreed on the winner but the
+                // loser's stale DHT PUT was still authoritative on its
+                // own replica, so third-party `get_record` hits a split
+                // answer depending on which replica the querier reached.
+                // See `qa-artifacts/2026-04-21T1919Z-td40-convergence/`.
+                let losing_entry = self.own_nickname_claims.remove(&nickname);
+                if losing_entry.is_some() {
                     tracing::debug!(
                         target: "peer",
                         %nickname,
@@ -1860,18 +1918,20 @@ impl PeerManager {
                     );
                 }
                 self.emit_nickname_ownership_revoked(nickname.clone());
-                // Note: publishing a vacate tombstone requires access to
-                // the local identity profile (account_seed) which is not
-                // available inside the PeerManager loop by design
-                // (profile lives at the FFI layer). The host-side Android
-                // flow receives the OwnershipRevoked callback and is
-                // expected to either (a) leave the cached DHT claim to
-                // expire naturally within 30 d, or (b) explicitly call
-                // `cabi_nickname_release` if the user wants an immediate
-                // tombstone. Cached readers resolving via DHT will still
-                // get the winner's record on the next Quorum::Majority
-                // `get_record`, because the winner already ran their own
-                // `put_record` with a fresher revision.
+                if let Some(entry) = losing_entry {
+                    self.try_publish_auto_vacate_tombstone(&nickname, &entry);
+                } else {
+                    // No cached own claim — this means either (a) the
+                    // observation was injected via a test harness, or
+                    // (b) a `cabi_nickname_release` raced us and already
+                    // drained the cache. Either way, no tombstone to
+                    // sign here.
+                    tracing::debug!(
+                        target: "peer",
+                        %nickname,
+                        "TD-42: no cached own-claim entry at loss time; skipping auto-tombstone",
+                    );
+                }
             }
         } else {
             // Fresh observation.
@@ -1905,6 +1965,86 @@ impl PeerManager {
                 "TD-37: no nickname event sender wired; OwnershipRevoked surfaced to logs only",
             );
         }
+    }
+
+    /// TD-42: best-effort vacate-tombstone publisher fired from the Layer-B
+    /// tiebreak-loss path in [`Self::handle_nickname_registry_message`].
+    /// Loads the identity profile from `entry.profile_path`, builds a
+    /// signed vacate record at `entry.claim.revision + 1`, and kicks off a
+    /// DHT `put_record` at the hashed nickname key. The publish is
+    /// fire-and-forget — we pass `None` for the oneshot response to
+    /// [`Self::start_dht_put`], so failure is surfaced via `warn!` only.
+    ///
+    /// Failure modes and policy:
+    /// - `profile_path == None`: test fixture or legacy publish path
+    ///   (before TD-42 threaded the path through). We skip with a debug
+    ///   log — the DHT stays split until the loser's claim TTL (30 d) or
+    ///   a manual `cabi_nickname_release`.
+    /// - `load_or_create_profile` error: log `warn!` with context and
+    ///   skip. Same DHT-stays-split fallback.
+    /// - `build_vacate` error (e.g. revision hard-cap): log `warn!` and
+    ///   skip. Cannot recover from here — the host would have to call
+    ///   `cabi_nickname_release` with a lower revision to converge.
+    /// - `start_dht_put` network error: surfaced inside `start_dht_put`
+    ///   via its own warn log. We do not retry; anti-entropy is already
+    ///   evicted, so we won't re-broadcast the losing claim. This matches
+    ///   the best-effort policy in the TD-42 plan.
+    fn try_publish_auto_vacate_tombstone(&mut self, nickname: &str, entry: &OwnClaimCacheEntry) {
+        let Some(profile_path) = entry.profile_path.as_ref() else {
+            tracing::debug!(
+                target: "peer",
+                %nickname,
+                "TD-42: cached own-claim has no profile_path; skipping auto-vacate tombstone",
+            );
+            return;
+        };
+
+        let profile = match load_or_create_profile(profile_path) {
+            Ok(profile) => profile,
+            Err(err) => {
+                tracing::warn!(
+                    target: "peer",
+                    %nickname,
+                    path = %profile_path.display(),
+                    %err,
+                    "TD-42: failed to load profile for auto-vacate tombstone; DHT will stay split until loser claim TTL expires",
+                );
+                return;
+            }
+        };
+
+        let next_revision = entry.claim.revision.saturating_add(1);
+        let vacate_ts = now_unix_seconds();
+        let payload = match build_vacate(
+            &profile,
+            &entry.claim.peer_id,
+            nickname,
+            vacate_ts,
+            next_revision,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    target: "peer",
+                    %nickname,
+                    %err,
+                    "TD-42: failed to build auto-vacate tombstone; DHT will stay split until loser claim TTL expires",
+                );
+                return;
+            }
+        };
+
+        let key = claim_dht_key(nickname);
+        tracing::info!(
+            target: "peer",
+            %nickname,
+            revision = next_revision,
+            "TD-42: auto-publishing vacate tombstone after Layer-B ownership revocation",
+        );
+        // Fire-and-forget: no oneshot. `start_dht_put` logs on network /
+        // store-fallback failure. The losing claim is already evicted
+        // from the anti-entropy cache so we will not re-broadcast it.
+        self.start_dht_put(key, payload, MIN_VACATE_TTL_SECONDS, None);
     }
 
     fn send_addressed_frame(
@@ -4844,7 +4984,7 @@ mod nickname_registry_tests {
         let claim_ts = now_unix_seconds();
         let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
 
-        manager.handle_publish_nickname_claim(encoded.clone());
+        manager.handle_publish_nickname_claim(encoded.clone(), None);
 
         let obs = manager
             .nickname_observations
@@ -4987,7 +5127,7 @@ mod nickname_registry_tests {
         let claim_ts = now_unix_seconds();
         let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
 
-        manager.handle_publish_nickname_claim(encoded.clone());
+        manager.handle_publish_nickname_claim(encoded.clone(), None);
         let after_publish = manager
             .own_nickname_claims
             .get("alice")
@@ -5040,7 +5180,7 @@ mod nickname_registry_tests {
         let claim_ts = now_unix_seconds();
         let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
 
-        manager.handle_publish_nickname_claim(encoded);
+        manager.handle_publish_nickname_claim(encoded, None);
         assert!(
             manager.own_nickname_claims.contains_key("alice"),
             "cache populated before release",
@@ -5102,6 +5242,7 @@ mod nickname_registry_tests {
                     account_public_key_protobuf: vec![],
                 },
                 encoded: vec![0xA0],
+                profile_path: None,
             },
         );
         // Also insert a fresh entry so we can assert the tick is
@@ -5109,7 +5250,7 @@ mod nickname_registry_tests {
         let fresh_claim_ts = now;
         let (fresh_encoded, _fresh_peer, _fresh_dir) =
             build_owned_claim("fresh_nick", fresh_claim_ts);
-        manager.handle_publish_nickname_claim(fresh_encoded);
+        manager.handle_publish_nickname_claim(fresh_encoded, None);
         assert_eq!(
             manager.own_nickname_claims.len(),
             2,
@@ -5148,7 +5289,7 @@ mod nickname_registry_tests {
         let claim_ts = now_unix_seconds();
         let (encoded, _peer, _dir) = build_owned_claim("alice_td40_1", claim_ts);
 
-        manager.handle_publish_nickname_claim(encoded.clone());
+        manager.handle_publish_nickname_claim(encoded.clone(), None);
         let before = manager
             .own_nickname_claims
             .get("alice_td40_1")
@@ -5197,6 +5338,246 @@ mod nickname_registry_tests {
         assert!(
             !manager.own_nickname_claims.contains_key("never_existed"),
             "early rebroadcast for an unknown nickname is a no-op",
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // TD-42 · auto-tombstone on Layer B OwnershipRevoked.
+    //
+    // Bridges the QA gap from `qa-artifacts/2026-04-21T1919Z-td40-convergence/`:
+    // after a Layer-B tiebreak loss, the losing node's stale DHT `PUT` was
+    // still authoritative on its own replica, so third-party
+    // `get_record` queries got split answers. The manager now synthesizes
+    // a signed vacate tombstone at `claim.revision + 1` and pushes it to
+    // the DHT, so every replica — including the loser's — converges onto
+    // the winner once the tombstone has propagated (or the 30-day TTL
+    // expires, whichever comes first).
+    //
+    // Both tests drive the manager with its identity seeded from a real
+    // profile's libp2p seed so that `local_peer_id == peer_id` on the
+    // cached own claim, which is the condition the
+    // `we_lost_our_own` branch gates on. Without this the tiebreak-loss
+    // branch would not trigger even when we inject a synthetic
+    // observation.
+    //
+    // Observation path: the test drives
+    // `handle_nickname_registry_message` synchronously and reads
+    // Kademlia's local record store. `start_dht_put` writes the record
+    // locally before replication (libp2p-kad semantics), so on an
+    // unconnected test node the record lands in `store_mut()` — same
+    // pattern as the TD-18 profile-reannounce tests.
+    // -------------------------------------------------------------------
+
+    fn build_manager_for_profile(
+        profile: &crate::e2ee::IdentityProfile,
+    ) -> (PeerManager, NicknameEventQueue) {
+        let config = TransportConfig::new(false, false).with_identity_seed(profile.libp2p_seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let nickname_event_queue = NicknameEventQueue::new(DEFAULT_NICKNAME_EVENT_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, _handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            Some(nickname_event_queue.sender()),
+            addr_state,
+            Vec::new(),
+        )
+        .expect("peer manager");
+        std::mem::forget(message_queue);
+        std::mem::forget(file_transfer_queue);
+        std::mem::forget(discovery_queue);
+        std::mem::forget(_handle);
+        (manager, nickname_event_queue)
+    }
+
+    #[test]
+    fn td42_autotombstone_on_loss() {
+        use crate::e2ee::nickname::{claim_dht_key, validate_vacate};
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        // Build a real profile on disk. Manager will be seeded with its
+        // libp2p_seed so `local_peer_id` matches the profile's peer_id,
+        // which is what the `we_lost_our_own` branch compares against.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let local_peer = PeerId::from(libp2p_kp.public());
+
+        let (mut manager, mut events) = build_manager_for_profile(&profile);
+        assert_eq!(
+            manager.local_peer_id, local_peer,
+            "test sanity: manager local_peer_id must match profile peer_id",
+        );
+
+        // Publish our claim through the normal path — this populates
+        // `own_nickname_claims` with the profile_path stashed. Use
+        // `handle_publish_nickname_claim` directly with Some(path) to
+        // drive the TD-42 cache-threading invariant without involving the
+        // async handle.
+        let claim_ts = now_unix_seconds();
+        let own_encoded = build_claim(
+            &profile,
+            &local_peer,
+            "race_td42",
+            "Me",
+            None,
+            claim_ts,
+            0,
+            1,
+        )
+        .expect("build own claim");
+        manager.handle_publish_nickname_claim(own_encoded.clone(), Some(path.clone()));
+        assert!(
+            manager.own_nickname_claims.contains_key("race_td42"),
+            "precondition: cache populated with own claim",
+        );
+
+        // Backdate our observation entry so `first_seen_ts_at_observer`
+        // is strictly GREATER than the remote's (which will be stamped
+        // with `now_unix_seconds()` by the handler). The remote therefore
+        // wins the deterministic tiebreak.
+        let far_future = claim_ts + 3_600;
+        if let Some(obs) = manager.nickname_observations.get_mut("race_td42") {
+            obs.first_seen_ts_at_observer = far_future;
+        } else {
+            panic!("observation entry missing after publish");
+        }
+
+        // Remote claim for the same nickname, different peer_id.
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("race_td42", claim_ts);
+        assert_ne!(remote_peer, local_peer);
+
+        manager.handle_nickname_registry_message(remote_bytes);
+
+        // (a) cache is evicted.
+        assert!(
+            !manager.own_nickname_claims.contains_key("race_td42"),
+            "TD-40 post-condition: losing own claim must be evicted from anti-entropy cache",
+        );
+
+        // (b) OwnershipRevoked fires.
+        let event = events.try_dequeue().expect("OwnershipRevoked must fire");
+        match event {
+            NicknameEvent::OwnershipRevoked { nickname } => {
+                assert_eq!(nickname, "race_td42")
+            }
+        }
+
+        // (c) a vacate tombstone was written to the DHT local store at
+        //     the hashed nickname key, at revision + 1.
+        let key = claim_dht_key("race_td42");
+        let record = manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad_lib::RecordKey::new(&key))
+            .expect("TD-42: vacate tombstone must have landed in local DHT store");
+        let vacate = validate_vacate(&record.value).expect("TD-42: record must be a valid vacate");
+        assert_eq!(
+            vacate.nickname, "race_td42",
+            "TD-42: tombstone carries the same nickname",
+        );
+        assert_eq!(
+            vacate.peer_id, local_peer,
+            "TD-42: tombstone is signed by the losing peer (us)",
+        );
+        assert_eq!(
+            vacate.revision, 2,
+            "TD-42: tombstone revision must be claim.revision + 1 (1 + 1 = 2)",
+        );
+    }
+
+    #[test]
+    fn td42_no_tombstone_on_win() {
+        use crate::e2ee::nickname::claim_dht_key;
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        // Same setup as the loss test — real profile on disk, manager
+        // seeded to it — but this time we pre-populate the observation
+        // map with a timestamp FAR IN THE PAST so our own claim wins the
+        // tiebreak against the incoming remote. The auto-tombstone path
+        // must NOT fire.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let local_peer = PeerId::from(libp2p_kp.public());
+
+        let (mut manager, mut events) = build_manager_for_profile(&profile);
+        assert_eq!(manager.local_peer_id, local_peer);
+
+        let claim_ts = now_unix_seconds();
+        let own_encoded = build_claim(
+            &profile,
+            &local_peer,
+            "winning_nick",
+            "Me",
+            None,
+            claim_ts,
+            0,
+            1,
+        )
+        .expect("build own claim");
+        manager.handle_publish_nickname_claim(own_encoded.clone(), Some(path.clone()));
+
+        // Backdate our observation so we are STRICTLY EARLIER — we win.
+        let far_past = claim_ts.saturating_sub(3_600);
+        if let Some(obs) = manager.nickname_observations.get_mut("winning_nick") {
+            obs.first_seen_ts_at_observer = far_past;
+        } else {
+            panic!("observation entry missing after publish");
+        }
+
+        // Capture the DHT store state for the nickname key BEFORE
+        // delivering the remote claim. With only our claim published and
+        // no `put_record` driven from the test (we used
+        // `handle_publish_nickname_claim`, which does the gossipsub
+        // publish only — not the DHT put), the store should be empty.
+        let key = claim_dht_key("winning_nick");
+        assert!(
+            manager
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&kad_lib::RecordKey::new(&key))
+                .is_none(),
+            "TD-42 baseline: no DHT record before remote claim arrives",
+        );
+
+        // Remote claim arrives — we win the tiebreak.
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("winning_nick", claim_ts);
+        assert_ne!(remote_peer, local_peer);
+        manager.handle_nickname_registry_message(remote_bytes);
+
+        // No OwnershipRevoked event.
+        assert!(
+            events.try_dequeue().is_none(),
+            "TD-42: winning claim must NOT surface OwnershipRevoked",
+        );
+
+        // Cache still populated (we did not lose).
+        assert!(
+            manager.own_nickname_claims.contains_key("winning_nick"),
+            "TD-42: winning claim must remain in anti-entropy cache",
+        );
+
+        // No vacate tombstone written.
+        assert!(
+            manager
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&kad_lib::RecordKey::new(&key))
+                .is_none(),
+            "TD-42 post-condition: winning node must NOT publish a vacate tombstone",
         );
     }
 }

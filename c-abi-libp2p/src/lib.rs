@@ -224,9 +224,17 @@ impl ManagedNode {
     /// after the DHT `put_record` completes so the anti-entropy pass can
     /// detect concurrent claims from peers we haven't yet received via
     /// DHT replication.
-    fn publish_nickname_claim(&self, payload: Vec<u8>) -> Result<()> {
+    ///
+    /// TD-42: `profile_path` is stashed on the manager's cached own-claim
+    /// entry so that if a later inbound claim wins the deterministic
+    /// tiebreak the manager can auto-publish a signed vacate tombstone
+    /// and converge the DHT record.
+    fn publish_nickname_claim(&self, payload: Vec<u8>, profile_path: PathBuf) -> Result<()> {
         self.runtime
-            .block_on(self.handle.publish_nickname_claim(payload))
+            .block_on(
+                self.handle
+                    .publish_nickname_claim(payload, Some(profile_path)),
+            )
             .context("failed to publish nickname claim on registry topic")
     }
 
@@ -1802,7 +1810,7 @@ pub extern "C" fn cabi_nickname_claim(
             // NOT fatal — the DHT put already succeeded and peers will
             // eventually converge via their own gossipsub subscription +
             // periodic DHT fetches. Log + continue.
-            if let Err(err) = node.publish_nickname_claim(payload) {
+            if let Err(err) = node.publish_nickname_claim(payload, profile_path.clone()) {
                 tracing::warn!(
                     target: "ffi",
                     %err,
