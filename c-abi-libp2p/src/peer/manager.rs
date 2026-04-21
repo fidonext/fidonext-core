@@ -1973,15 +1973,35 @@ impl PeerManager {
                 // `cabi_nickname_release`, the losing bytes are already
                 // gone from the cache.
                 //
-                // TD-42: before evicting, snapshot the cached entry so we
-                // can synthesize a signed vacate tombstone at
-                // `revision + 1` and push it to the DHT. This is the
-                // missing piece from the TD-40 convergence QA run:
-                // local observation maps agreed on the winner but the
-                // loser's stale DHT PUT was still authoritative on its
-                // own replica, so third-party `get_record` hits a split
-                // answer depending on which replica the querier reached.
-                // See `qa-artifacts/2026-04-21T1919Z-td40-convergence/`.
+                // TD-44: REVERT TD-42. TD-42 attempted to publish a signed
+                // vacate tombstone at `revision + 1` to the same hashed
+                // nickname DHT key. Kademlia's revision-based LWW then
+                // ranked the tombstone (rev=2) above the winner's claim
+                // (rev=1) AT THE SAME KEY — so `resolveNickname` on that
+                // key read back the tombstone, the claim-validator rejected
+                // it as not a claim shape, and the FFI returned
+                // `NICK_SCHEMA_REJECT=5`. See ship-gate fail in
+                // `qa-artifacts/2026-04-21T2222Z-ship-v007/` where BOTH
+                // winner and loser got SchemaReject (the tombstone
+                // propagated through Kademlia replication back to the
+                // winner's local replica too).
+                //
+                // The helper `try_publish_auto_vacate_tombstone` is kept
+                // in place because `cabi_nickname_release` still wants the
+                // explicit-release tombstone path. It is just no longer
+                // auto-fired on Layer-B loss.
+                //
+                // Instead (Step 3 of TD-44): evict the losing record from
+                // OUR local Kademlia store. `remove_record` is local-only;
+                // it does not propagate. This is enough because:
+                //   (a) our own `dht_get_record` will no longer return the
+                //       stale losing claim from our own replica, and
+                //   (b) the winner's TD-40/40.1 anti-entropy continues to
+                //       re-broadcast the winning claim on gossipsub AND
+                //       the winner's periodic DHT re-announce (TD-18) keeps
+                //       its record fresh, so remote replicas converge onto
+                //       the winner by freshness / natural TTL aging of our
+                //       losing record.
                 let losing_entry = self.own_nickname_claims.remove(&nickname);
                 if losing_entry.is_some() {
                     tracing::debug!(
@@ -1990,21 +2010,31 @@ impl PeerManager {
                         "TD-40: evicted losing own claim from anti-entropy cache",
                     );
                 }
+                // TD-44: scrub the losing record from our local Kademlia
+                // store so that a local `dht_get_record` on the hashed
+                // nickname key does not resurrect the stale claim. Use
+                // `store_mut().remove(&key)` (not `remove_record(&key)`):
+                // the behaviour-level helper is publisher-gated, and in
+                // test harnesses (no `put_record` ran) the record may
+                // have been injected via `store_mut().put(...)` without a
+                // publisher field. The unconditional store-level remove
+                // matches our intent: drop OUR local copy.
+                let key = claim_dht_key(&nickname);
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .remove(&kad::RecordKey::new(&key));
+                tracing::info!(
+                    target: "peer",
+                    %nickname,
+                    "TD-44: evicted local Kademlia record for losing nickname",
+                );
                 self.emit_nickname_ownership_revoked(nickname.clone());
-                if let Some(entry) = losing_entry {
-                    self.try_publish_auto_vacate_tombstone(&nickname, &entry);
-                } else {
-                    // No cached own claim — this means either (a) the
-                    // observation was injected via a test harness, or
-                    // (b) a `cabi_nickname_release` raced us and already
-                    // drained the cache. Either way, no tombstone to
-                    // sign here.
-                    tracing::debug!(
-                        target: "peer",
-                        %nickname,
-                        "TD-42: no cached own-claim entry at loss time; skipping auto-tombstone",
-                    );
-                }
+                // The `losing_entry` snapshot is intentionally unused —
+                // kept as an early-drain of the cache above. No auto
+                // tombstone.
+                let _ = losing_entry;
             }
         } else {
             // Fresh observation.
@@ -2062,6 +2092,15 @@ impl PeerManager {
     ///   via its own warn log. We do not retry; anti-entropy is already
     ///   evicted, so we won't re-broadcast the losing claim. This matches
     ///   the best-effort policy in the TD-42 plan.
+    ///
+    /// TD-44: the auto-invocation from `handle_nickname_registry_message`
+    /// was reverted because the tombstone's `revision + 1` beat the
+    /// winner's claim at the same Kademlia key under revision-LWW,
+    /// turning resolves into `SchemaReject` failures (see ship-gate fail
+    /// `qa-artifacts/2026-04-21T2222Z-ship-v007/`). The helper is kept
+    /// in the codebase as the building block for an explicit-release
+    /// path; `#[allow(dead_code)]` until a caller is reintroduced.
+    #[allow(dead_code)]
     fn try_publish_auto_vacate_tombstone(&mut self, nickname: &str, entry: &OwnClaimCacheEntry) {
         let Some(profile_path) = entry.profile_path.as_ref() else {
             tracing::debug!(
@@ -5533,7 +5572,17 @@ mod nickname_registry_tests {
         (manager, nickname_event_queue)
     }
 
+    // TD-44: TD-42's auto-tombstone behaviour was reverted. Keeping the
+    // test body for archival intent but marking `#[ignore]` so it does
+    // not run as a regression assertion on behaviour we deliberately
+    // removed. Rationale: the tombstone at `revision + 1` dominated the
+    // winner's `revision = 1` claim at the same Kademlia key under
+    // revision-LWW, making `resolveNickname` return `SchemaReject`. See
+    // the TD-44 branch comments in `handle_nickname_registry_message`
+    // and the ship-gate fail at
+    // `qa-artifacts/2026-04-21T2222Z-ship-v007/`.
     #[test]
+    #[ignore = "TD-44: reverted; auto-tombstone is no longer published on Layer B loss"]
     fn td42_autotombstone_on_loss() {
         use crate::e2ee::nickname::{claim_dht_key, validate_vacate};
         use libp2p::kad::{self as kad_lib, store::RecordStore};
@@ -5553,11 +5602,6 @@ mod nickname_registry_tests {
             "test sanity: manager local_peer_id must match profile peer_id",
         );
 
-        // Publish our claim through the normal path — this populates
-        // `own_nickname_claims` with the profile_path stashed. Use
-        // `handle_publish_nickname_claim` directly with Some(path) to
-        // drive the TD-42 cache-threading invariant without involving the
-        // async handle.
         let claim_ts = now_unix_seconds();
         let own_encoded = build_claim(
             &profile,
@@ -5576,10 +5620,6 @@ mod nickname_registry_tests {
             "precondition: cache populated with own claim",
         );
 
-        // Backdate our observation entry so `first_seen_ts_at_observer`
-        // is strictly GREATER than the remote's (which will be stamped
-        // with `now_unix_seconds()` by the handler). The remote therefore
-        // wins the deterministic tiebreak.
         let far_future = claim_ts + 3_600;
         if let Some(obs) = manager.nickname_observations.get_mut("race_td42") {
             obs.first_seen_ts_at_observer = far_future;
@@ -5587,28 +5627,21 @@ mod nickname_registry_tests {
             panic!("observation entry missing after publish");
         }
 
-        // Remote claim for the same nickname, different peer_id.
         let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("race_td42", claim_ts);
         assert_ne!(remote_peer, local_peer);
 
         manager.handle_nickname_registry_message(remote_bytes);
 
-        // (a) cache is evicted.
         assert!(
             !manager.own_nickname_claims.contains_key("race_td42"),
-            "TD-40 post-condition: losing own claim must be evicted from anti-entropy cache",
+            "TD-40 post-condition still holds: losing own claim evicted from anti-entropy cache",
         );
-
-        // (b) OwnershipRevoked fires.
         let event = events.try_dequeue().expect("OwnershipRevoked must fire");
         match event {
             NicknameEvent::OwnershipRevoked { nickname } => {
                 assert_eq!(nickname, "race_td42")
             }
         }
-
-        // (c) a vacate tombstone was written to the DHT local store at
-        //     the hashed nickname key, at revision + 1.
         let key = claim_dht_key("race_td42");
         let record = manager
             .swarm
@@ -5616,20 +5649,184 @@ mod nickname_registry_tests {
             .kademlia
             .store_mut()
             .get(&kad_lib::RecordKey::new(&key))
-            .expect("TD-42: vacate tombstone must have landed in local DHT store");
-        let vacate = validate_vacate(&record.value).expect("TD-42: record must be a valid vacate");
-        assert_eq!(
-            vacate.nickname, "race_td42",
-            "TD-42: tombstone carries the same nickname",
+            .expect("TD-42 (archived): vacate tombstone must have landed in local DHT store");
+        let vacate = validate_vacate(&record.value)
+            .expect("TD-42 (archived): record must be a valid vacate");
+        assert_eq!(vacate.nickname, "race_td42");
+        assert_eq!(vacate.peer_id, local_peer);
+        assert_eq!(vacate.revision, 2);
+    }
+
+    // TD-44: On Layer-B tiebreak loss, the loser must scrub its own
+    // losing claim from the LOCAL Kademlia store so a subsequent local
+    // `dht_get_record` does not resurrect the stale claim. The anti-
+    // entropy cache + OwnershipRevoked assertions from TD-40/42 still
+    // hold; the delta is the local DHT store eviction and the absence of
+    // a freshly-written tombstone at the nickname key.
+    #[test]
+    fn td44_local_eviction_on_loss() {
+        use crate::e2ee::nickname::claim_dht_key;
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let local_peer = PeerId::from(libp2p_kp.public());
+
+        let (mut manager, mut events) = build_manager_for_profile(&profile);
+        assert_eq!(manager.local_peer_id, local_peer);
+
+        // Publish our claim through the normal cache-populating path.
+        let claim_ts = now_unix_seconds();
+        let own_encoded = build_claim(
+            &profile,
+            &local_peer,
+            "race_td44",
+            "Me",
+            None,
+            claim_ts,
+            0,
+            1,
+        )
+        .expect("build own claim");
+        manager.handle_publish_nickname_claim(own_encoded.clone(), Some(path.clone()));
+
+        // Simulate the DHT put that `cabi_nickname_claim` would have
+        // performed: seed the local Kademlia store with the SAME bytes
+        // under the hashed nickname key. This is what the TD-44 branch is
+        // going to scrub.
+        let key = claim_dht_key("race_td44");
+        let record = kad_lib::Record {
+            key: kad_lib::RecordKey::new(&key),
+            value: own_encoded.clone(),
+            publisher: Some(local_peer),
+            expires: None,
+        };
+        manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .put(record)
+            .expect("seed local Kademlia store with own claim");
+        assert!(
+            manager
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&kad_lib::RecordKey::new(&key))
+                .is_some(),
+            "precondition: own claim is in local Kademlia store before the loss",
         );
-        assert_eq!(
-            vacate.peer_id, local_peer,
-            "TD-42: tombstone is signed by the losing peer (us)",
+
+        // Backdate our observation so the remote's `observer_now`-stamped
+        // arrival wins the tiebreak.
+        let far_future = claim_ts + 3_600;
+        if let Some(obs) = manager.nickname_observations.get_mut("race_td44") {
+            obs.first_seen_ts_at_observer = far_future;
+        } else {
+            panic!("observation entry missing after publish");
+        }
+
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("race_td44", claim_ts);
+        assert_ne!(remote_peer, local_peer);
+
+        manager.handle_nickname_registry_message(remote_bytes);
+
+        // (a) anti-entropy cache is evicted (TD-40 invariant still holds).
+        assert!(
+            !manager.own_nickname_claims.contains_key("race_td44"),
+            "TD-40 post-condition: losing own claim must be evicted from anti-entropy cache",
         );
-        assert_eq!(
-            vacate.revision, 2,
-            "TD-42: tombstone revision must be claim.revision + 1 (1 + 1 = 2)",
+
+        // (b) OwnershipRevoked fires (TD-37 invariant still holds).
+        let event = events.try_dequeue().expect("OwnershipRevoked must fire");
+        match event {
+            NicknameEvent::OwnershipRevoked { nickname } => assert_eq!(nickname, "race_td44"),
+        }
+
+        // (c) TD-44 new invariant: local Kademlia store no longer
+        //     contains OUR losing claim at the hashed nickname key.
+        assert!(
+            manager
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&kad_lib::RecordKey::new(&key))
+                .is_none(),
+            "TD-44 post-condition: local Kademlia record for losing nickname must be evicted",
         );
+    }
+
+    // TD-44 pre-flight probe: validator-level solo claim round trip.
+    // Single peer, no racer — claim our own nickname, seed it into the
+    // local Kademlia store exactly how a successful `cabi_nickname_claim`
+    // would (via `store_mut().put(...)` + the same bytes we just signed),
+    // then `validate_claim` on those bytes must yield OUR peer_id. This
+    // pins the claim encode + validate path so a future regression surfaces
+    // here rather than hiding behind a full e2e run.
+    #[test]
+    fn td44_solo_claim_resolve_roundtrip() {
+        use crate::e2ee::nickname::{claim_dht_key, validate_claim};
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let local_peer = PeerId::from(libp2p_kp.public());
+
+        let (mut manager, _events) = build_manager_for_profile(&profile);
+        assert_eq!(manager.local_peer_id, local_peer);
+
+        let claim_ts = now_unix_seconds();
+        let encoded = build_claim(
+            &profile,
+            &local_peer,
+            "solo_test",
+            "Solo",
+            None,
+            claim_ts,
+            0,
+            1,
+        )
+        .expect("build solo claim");
+
+        // Seed the local Kademlia store with our claim bytes at the hashed
+        // nickname key — same shape as `start_dht_put`.
+        let key = claim_dht_key("solo_test");
+        let record = kad_lib::Record {
+            key: kad_lib::RecordKey::new(&key),
+            value: encoded.clone(),
+            publisher: Some(local_peer),
+            expires: None,
+        };
+        manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .put(record)
+            .expect("seed local Kademlia store");
+
+        // Read it back and validate like `cabi_nickname_resolve` does.
+        let round_tripped = manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad_lib::RecordKey::new(&key))
+            .expect("record present after put");
+        let claim = validate_claim(&round_tripped.value, now_unix_seconds())
+            .expect("validator accepts our own claim bytes");
+        assert_eq!(
+            claim.peer_id, local_peer,
+            "solo round-trip must return our own peer_id, not SchemaReject",
+        );
+        assert_eq!(claim.nickname, "solo_test");
     }
 
     #[test]
