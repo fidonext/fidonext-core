@@ -1018,11 +1018,23 @@ impl PeerManager {
             expires,
         };
         let local_fallback_record = record.clone();
+        // TD-26: use `Quorum::Majority` so the client waits for a majority of
+        // replicas to confirm the PUT_VALUE before treating the publish as
+        // successful. With `Quorum::One` the query completed as soon as the
+        // local store accepted the record, which short-circuited replication
+        // to the real relay fleet (TD-25a observed 0 `Record stored` events on
+        // relay-02 over 3 days while relay-01 held 787). The replication
+        // factor is tuned to 3 in `transport/libp2p.rs` so `Majority = 2` on
+        // our current test fleet. Partial-success handling lives in
+        // `handle_put_record_result` so that when fewer than a majority of
+        // peers ack we still keep the record in the local store and surface
+        // success to the caller — matching (and not regressing from) the old
+        // Timeout-fallback semantics.
         match self
             .swarm
             .behaviour_mut()
             .kademlia
-            .put_record(record, kad::Quorum::One)
+            .put_record(record, kad::Quorum::Majority)
         {
             Ok(query_id) => {
                 if let Some(tx) = response {
@@ -2491,9 +2503,41 @@ impl PeerManager {
                     "dht put_record timed out and local fallback failed: {err}"
                 ))),
             },
-            Err(err) => Err(DhtQueryError::Internal(format!(
-                "dht put_record failed: {err}"
-            ))),
+            // TD-26: `Quorum::Majority` in `start_dht_put` means any put with
+            // fewer than a majority of remote acks (including zero) lands
+            // here. Rather than bubbling an error up to the host — which
+            // would regress vs. the pre-TD-26 `Quorum::One` behaviour that
+            // always reported success — mirror the Timeout branch: whatever
+            // successful peers did accept the record already hold a replica,
+            // we additionally keep a local copy as fallback, and the periodic
+            // TD-18 re-announce tick will keep re-publishing the profile
+            // record on its own cadence. The `success` list is logged so
+            // operators can see the actual replication fan-out.
+            Err(kad::PutRecordError::QuorumFailed {
+                success, quorum, ..
+            }) => match self
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .put(fallback_record)
+            {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "peer",
+                        ?query_id,
+                        needed = quorum.get(),
+                        acked = success.len(),
+                        "dht put_record quorum not met, stored record locally as fallback",
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(DhtQueryError::Internal(format!(
+                    "dht put_record quorum failed (needed {} peers, got {}) and local fallback failed: {err}",
+                    quorum.get(),
+                    success.len(),
+                ))),
+            },
         };
         if response.send(outcome).is_err() {
             tracing::debug!(target: "peer", ?query_id, "dht put response receiver dropped");

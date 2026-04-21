@@ -17,6 +17,7 @@ use libp2p::{
     tcp, websocket, PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::messaging::FileTransferFrame;
@@ -298,6 +299,18 @@ impl TransportConfig {
         // once the fleet grows or once we add peer-count-aware adaptive
         // timeouts.
         kad_config.set_query_timeout(Duration::from_secs(15));
+        // TD-26: right-size Kademlia replication factor to the realistic fleet
+        // size. Default K=20 combined with `Quorum::Majority` in
+        // `start_dht_put` would demand 11 confirmations — impossible on our
+        // current 2–3-super-peer test fleet (TD-25a observed 2 relays plus 1
+        // off-inventory peer), which would force every publish into the
+        // QuorumFailed branch and regress worse than the pre-TD-26
+        // single-replica reality. K=3 matches the observed swarm size and
+        // yields `Majority = 2` — i.e. two replicas must confirm the put. When
+        // the fleet grows past 3 super-peers, bump this to match and/or move
+        // to an adaptive value; libp2p's default K=20 assumes a large public
+        // DHT that we are not (yet) running.
+        kad_config.set_replication_factor(NonZeroUsize::new(3).expect("3 != 0"));
         let store = MemoryStore::new(peer_id);
 
         let ping_config = ping::Config::new();
