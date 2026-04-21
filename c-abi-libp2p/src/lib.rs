@@ -1370,12 +1370,53 @@ pub extern "C" fn cabi_e2ee_publish_profile_record(
     }
 }
 
+/// Freshness decision for [`cabi_e2ee_fetch_profile_record`]. Extracted as a
+/// pure helper so the `previous_updated_at` contract is independently unit
+/// testable without needing a live DHT. See TD-28.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchFreshness {
+    /// Caller has no cached copy (prev == 0) OR record is strictly newer than
+    /// the caller's cached revision → return the record bytes.
+    ReturnRecord,
+    /// Record is same-or-older than caller's cached revision → return SUCCESS
+    /// with `*written_len = 0` to signal "no change / up to date."
+    NoChange,
+}
+
+fn fetch_profile_record_freshness(
+    record_updated_at_unix: u64,
+    previous_updated_at_unix: u64,
+) -> FetchFreshness {
+    // prev == 0           → caller has nothing, always ship the record.
+    // record > prev        → strictly newer than caller's cached copy, ship.
+    // record <= prev       → up-to-date or older replica, no change.
+    if previous_updated_at_unix == 0 || record_updated_at_unix > previous_updated_at_unix {
+        FetchFreshness::ReturnRecord
+    } else {
+        FetchFreshness::NoChange
+    }
+}
+
 #[no_mangle]
 /// C-ABI. Fetches and validates a signed profile record for `peer_id` from the
 /// DHT. Signature + schema validation runs **inside** the Rust module before
 /// the record bytes are copied into `out_buffer`; callers never see an
-/// unvalidated record. Returns `CABI_STATUS_INVALID_ARGUMENT` on validation
-/// failure, `CABI_STATUS_NOT_FOUND` on DHT miss.
+/// unvalidated record.
+///
+/// Semantics of `previous_updated_at_unix`:
+/// - `0` → "I have nothing cached, give me whatever exists." Record bytes are
+///   written when a valid record is found.
+/// - `V > 0` → "I already hold a copy with `updated_at == V`. Give me only
+///   something strictly newer." When `record.updated_at > V`, bytes are
+///   written. When `record.updated_at <= V` (same revision or older),
+///   `*written_len` is set to `0` and `CABI_STATUS_SUCCESS` is returned to
+///   signal "up to date / no change."
+///
+/// Returns `CABI_STATUS_INVALID_ARGUMENT` only for **malformed input**
+/// (null pointer, bad peer id, schema / signature failure). A legitimate
+/// "give me newer than V" query must never surface as INVALID_ARGUMENT.
+///
+/// Returns `CABI_STATUS_NOT_FOUND` on DHT miss.
 pub extern "C" fn cabi_e2ee_fetch_profile_record(
     handle: *mut CabiNodeHandle,
     peer_id: *const c_char,
@@ -1398,12 +1439,14 @@ pub extern "C" fn cabi_e2ee_fetch_profile_record(
         Err(err) => return dht_error_to_status(err),
     };
 
-    let previous = if previous_updated_at_unix == 0 {
-        None
-    } else {
-        Some(previous_updated_at_unix)
-    };
-    let record = match e2ee::profile_record::validate_profile_record(&payload, previous) {
+    // TD-28: run schema/signature validation **without** passing the caller's
+    // `previous_updated_at` into the validator. The validator's anti-replay
+    // rule rejects `updated_at <= previous` as an error, which previously
+    // leaked out as CABI_STATUS_INVALID_ARGUMENT and broke the refetch path
+    // (every silent-update tick with the last-known timestamp returned
+    // status=2 in ~0.4 s). The "is this record newer than what the caller
+    // holds?" comparison belongs at the FFI boundary, not in validation.
+    let record = match e2ee::profile_record::validate_profile_record(&payload, None) {
         Ok(record) => record,
         Err(err) => {
             tracing::warn!(target: "ffi", %err, "fetched profile record validation failed");
@@ -1424,7 +1467,25 @@ pub extern "C" fn cabi_e2ee_fetch_profile_record(
         return CABI_STATUS_INVALID_ARGUMENT;
     }
 
-    write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+    // "Up to date / no change" signal: caller already has a copy with
+    // `updated_at == previous`, or the DHT reply is older than what the
+    // caller holds. Either way there is nothing new to ship. Return SUCCESS
+    // with `*written_len = 0` — the caller treats an empty write as
+    // "no-change" (see ProfileRecordCodec on the Android side).
+    match fetch_profile_record_freshness(record.updated_at, previous_updated_at_unix) {
+        FetchFreshness::NoChange => {
+            if written_len.is_null() {
+                return CABI_STATUS_NULL_POINTER;
+            }
+            unsafe {
+                *written_len = 0;
+            }
+            CABI_STATUS_SUCCESS
+        }
+        FetchFreshness::ReturnRecord => {
+            write_bytes(&payload, out_buffer, out_buffer_len, written_len)
+        }
+    }
 }
 
 #[no_mangle]
@@ -2954,4 +3015,83 @@ fn avatar_error_to_status(err: peer::BlobFetchError) -> c_int {
             CABI_STATUS_INTERNAL_ERROR
         }
     }
+}
+
+#[cfg(test)]
+mod fetch_profile_record_tests {
+    //! TD-28 regression tests.
+    //!
+    //! These cover the pure freshness-decision function used by
+    //! [`cabi_e2ee_fetch_profile_record`]. The full FFI path additionally
+    //! runs schema / signature validation and a peer-id-binding check; those
+    //! are already covered in `e2ee::profile_record` tests.
+    //!
+    //! The bug that motivated TD-28 was the FFI forwarding an anti-replay
+    //! rejection ("stale") from `validate_profile_record` as
+    //! `CABI_STATUS_INVALID_ARGUMENT`, which broke the Android refetch pump:
+    //! *every* refetch call with `previous_updated_at_unix > 0` returned
+    //! status=2 in ~0.4 s. The fix moves the freshness comparison to the
+    //! FFI boundary and treats "not newer than previous" as SUCCESS with
+    //! `*written_len = 0`.
+
+    use super::{fetch_profile_record_freshness, FetchFreshness};
+
+    #[test]
+    fn td28_a_prev_zero_returns_record_bytes() {
+        // Test A: prev = 0, record exists → return bytes.
+        assert_eq!(
+            fetch_profile_record_freshness(1_700_000_100, 0),
+            FetchFreshness::ReturnRecord,
+        );
+    }
+
+    #[test]
+    fn td28_b_prev_older_than_record_returns_bytes() {
+        // Test B: prev < record.updated_at → return bytes.
+        assert_eq!(
+            fetch_profile_record_freshness(1_700_000_200, 1_700_000_100),
+            FetchFreshness::ReturnRecord,
+        );
+    }
+
+    #[test]
+    fn td28_c_prev_equal_to_record_is_no_change_not_invalid() {
+        // Test C: prev == record.updated_at → no change. This is the exact
+        // case that used to surface as INVALID_ARGUMENT and broke silent
+        // update.
+        assert_eq!(
+            fetch_profile_record_freshness(1_700_000_100, 1_700_000_100),
+            FetchFreshness::NoChange,
+        );
+    }
+
+    #[test]
+    fn td28_d_prev_newer_than_record_is_no_change() {
+        // Test D: prev > record.updated_at (caller holds something newer
+        // than what the DHT is currently serving — likely stale replica).
+        // Keep the contract consistent with C: NoChange.
+        assert_eq!(
+            fetch_profile_record_freshness(1_700_000_099, 1_700_000_100),
+            FetchFreshness::NoChange,
+        );
+    }
+
+    #[test]
+    fn td28_b_edge_one_second_newer_is_return() {
+        // Boundary: strictly-greater comparison is `>`, not `>=`.
+        assert_eq!(
+            fetch_profile_record_freshness(1_700_000_101, 1_700_000_100),
+            FetchFreshness::ReturnRecord,
+        );
+    }
+
+    // Tests E (prev=0, no record → NOT_FOUND) and F (malformed input →
+    // INVALID_ARGUMENT) live on the FFI surface itself and would require a
+    // live peer manager + DHT harness (or a mocked node) to exercise. The
+    // freshness helper above is the only piece that used to wrongly
+    // surface INVALID_ARGUMENT, and it is fully covered here. The
+    // NOT_FOUND / INVALID_ARGUMENT return paths in
+    // `cabi_e2ee_fetch_profile_record` are unchanged from pre-TD-28 code
+    // and are already exercised end-to-end by the Android silent-update
+    // integration flow.
 }
