@@ -41,6 +41,9 @@ __pycache__/
 
 *.patch
 
+# Triage / investigation raw evidence (committed summaries live under docs/)
+.triage-*/
+
 # Secrets / local agent state — never commit
 .claude/
 secrets/
