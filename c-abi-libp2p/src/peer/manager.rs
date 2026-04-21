@@ -491,6 +491,22 @@ pub struct PeerManager {
     relay_peer_id: Option<PeerId>,
     addr_state: Arc<RwLock<AddrState>>,
     bootstrap_peer_ids: Vec<PeerId>,
+    // TD-30: base multiaddr (no `/p2p-circuit`, *with* the trailing
+    // `/p2p/<relay>`) of each configured bootstrap peer. Populated in
+    // `add_bootstrap_peers`. On `SwarmEvent::ConnectionEstablished` for one of
+    // these peers, the manager auto-reserves a relay slot against it so the
+    // request-response fallback path has a cached reservation to build
+    // `/p2p-circuit/p2p/<target>` multiaddrs from. Without this we never
+    // populate `relay_base_address`, and TD-06 avatar blob-fetch silently
+    // fails between NATed peers — see TD-30 diagnosis doc
+    // (`fidonext-core/docs/td30-avatar-blob-fetch-diagnosis-2026-04-21.md`).
+    bootstrap_relay_addrs: HashMap<PeerId, Multiaddr>,
+    // TD-30: bootstrap peers on which we have already *attempted* relay
+    // reservation in this process's lifetime. Prevents re-issuing
+    // `listen_on(.../p2p-circuit)` every time the same bootstrap peer
+    // flaps. Cleared for a peer when its connection fully closes so the
+    // next reconnect re-tries.
+    relay_reservation_attempted: HashSet<PeerId>,
     connected_peers: HashSet<PeerId>,
     mailbox_enabled: bool,
     mailbox_store: Option<PersistentMailboxStore>,
@@ -533,6 +549,17 @@ pub struct PeerManager {
 struct PendingBlobFetch {
     expected_sha256: [u8; 32],
     response: oneshot::Sender<std::result::Result<Vec<u8>, BlobFetchError>>,
+    /// TD-30: the target peer this request was originally dispatched to. Kept
+    /// so that on `OutboundFailure` with a dial-level error we can re-issue
+    /// the request via a relay-circuit multiaddr without the outer caller
+    /// having to know what went wrong.
+    target_peer: PeerId,
+    /// TD-30: `true` once this request has already been retried via the
+    /// relay-circuit fallback. Bounds the retry chain at a single extra
+    /// attempt — if the relay-circuit dial also fails we report the error
+    /// to the caller and let the higher-level retry ladder (e.g. Android
+    /// `ProfileSyncCoordinator`'s 0/5/15/30s schedule) take over.
+    circuit_retry_attempted: bool,
 }
 
 impl PeerManager {
@@ -607,6 +634,8 @@ impl PeerManager {
             relay_peer_id: None,
             addr_state,
             bootstrap_peer_ids: Vec::new(),
+            bootstrap_relay_addrs: HashMap::new(),
+            relay_reservation_attempted: HashSet::new(),
             connected_peers: HashSet::new(),
             mailbox_enabled,
             mailbox_store,
@@ -696,30 +725,8 @@ impl PeerManager {
                 }
                 Ok(false)
             }
-            PeerCommand::ReserveRelay(mut address) => {
-                // This one should contain relay peerId
-                if let Some(peer_id) = extract_peer_id(&address) {
-                    self.relay_peer_id = Some(peer_id);
-                }
-
-                // ensure /p2p-circuit is present
-                let has_circuit = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
-                if !has_circuit {
-                    // Force it be a p2p-circuit (relay)
-                    address.push(Protocol::P2pCircuit);
-                }
-
-                // This one is a reservation itself
-                match self.swarm.listen_on(address.clone()) {
-                    Ok(_) => tracing::info!(target: "peer", %address, "listening via relay"),
-                    Err(err) => tracing::error!(
-                        target: "peer",
-                        %address,
-                        %err,
-                        "failed to start relay reservation"
-                    ),
-                }
-
+            PeerCommand::ReserveRelay(address) => {
+                self.start_relay_reservation(address, "explicit-command");
                 Ok(false)
             }
             PeerCommand::FindPeer {
@@ -911,6 +918,8 @@ impl PeerManager {
             PendingBlobFetch {
                 expected_sha256: blob_sha256,
                 response,
+                target_peer: peer,
+                circuit_retry_attempted: false,
             },
         );
         tracing::debug!(
@@ -1904,6 +1913,13 @@ impl PeerManager {
                         "started kademlia bootstrap after connection established",
                     );
                 }
+                // TD-30: kick off a relay reservation against the first
+                // bootstrap relay we successfully connect to. Without this
+                // no peer-to-peer request-response dial ever reaches
+                // `try_dial_via_relay` with a non-None `relay_base_address`,
+                // so blob-fetch (TD-06 avatar, and any future content-
+                // addressed fetch) silently fails between NATed peers.
+                self.maybe_auto_reserve_relay(&peer_id);
             }
 
             SwarmEvent::ConnectionClosed {
@@ -1914,6 +1930,26 @@ impl PeerManager {
             } => {
                 if num_established == 0 {
                     self.connected_peers.remove(&peer_id);
+                    // TD-30: if the peer we lost contact with is our active
+                    // relay, clear the cached reservation so the next
+                    // bootstrap reconnect re-runs `maybe_auto_reserve_relay`
+                    // against a live relay. `relay_base_address` is normally
+                    // cleared via `ExternalAddrExpired`/`clear_relay_address`
+                    // when the reservation expires, but that path fires only
+                    // if the relay peer explicitly revokes — a hard TCP
+                    // close does not always deliver it.
+                    if self.relay_peer_id.as_ref() == Some(&peer_id) {
+                        tracing::info!(
+                            target: "peer",
+                            %peer_id,
+                            "active relay peer connection lost; clearing cached reservation",
+                        );
+                        self.relay_peer_id = None;
+                        self.relay_base_address = None;
+                    }
+                    // Allow the next reconnect of this bootstrap peer to
+                    // retry reservation.
+                    self.relay_reservation_attempted.remove(&peer_id);
                 }
                 if let Some(error) = cause {
                     tracing::warn!(target: "peer", %peer_id, %error, "connection closed with error");
@@ -2382,7 +2418,57 @@ impl PeerManager {
                 ..
             } => {
                 tracing::warn!(target: "peer", %peer, ?request_id, %error, "blob fetch outbound request failed");
+                // TD-30: if the failure was a dial-level error (no route to
+                // the direct LAN/WAN addresses libp2p had on file) and we
+                // do hold a relay reservation, re-issue the request once,
+                // this time feeding request-response an explicit
+                // `/p2p/<relay>/p2p-circuit/p2p/<target>` multiaddr. This
+                // is the recovery path described in TD-30 for the
+                // "no relay reservation available for fallback dialing"
+                // symptom when the reservation actually exists.
                 if let Some(pending) = self.pending_blob_fetches.remove(&request_id) {
+                    if !pending.circuit_retry_attempted && blob_fetch_error_is_dial_failure(&error)
+                    {
+                        if let Some(circuit_addr) =
+                            self.relay_circuit_addr_for(&pending.target_peer)
+                        {
+                            let new_request_id = self
+                                .swarm
+                                .behaviour_mut()
+                                .blob_fetch
+                                .send_request_with_addresses(
+                                    &pending.target_peer,
+                                    BlobFetchRequest {
+                                        avatar_sha256: pending.expected_sha256.to_vec(),
+                                    },
+                                    vec![circuit_addr.clone()],
+                                );
+                            tracing::info!(
+                                target: "peer",
+                                target_peer = %pending.target_peer,
+                                original_request_id = ?request_id,
+                                new_request_id = ?new_request_id,
+                                %circuit_addr,
+                                "retrying blob fetch via relay circuit",
+                            );
+                            self.pending_blob_fetches.insert(
+                                new_request_id,
+                                PendingBlobFetch {
+                                    expected_sha256: pending.expected_sha256,
+                                    response: pending.response,
+                                    target_peer: pending.target_peer,
+                                    circuit_retry_attempted: true,
+                                },
+                            );
+                            return;
+                        } else {
+                            tracing::debug!(
+                                target: "peer",
+                                target_peer = %pending.target_peer,
+                                "no relay reservation available for blob fetch circuit retry",
+                            );
+                        }
+                    }
                     let _ = pending
                         .response
                         .send(Err(BlobFetchError::Transport(error.to_string())));
@@ -2817,13 +2903,28 @@ impl PeerManager {
     fn add_bootstrap_peers(&mut self, peers: Vec<Multiaddr>) {
         let mut added = 0usize;
 
-        for mut addr in peers {
+        for original_addr in peers {
+            // Preserve a copy of the full `.../p2p/<peer_id>` multiaddr for
+            // the auto-reserve path (TD-30). The inner matching block pops
+            // the p2p component off `addr` for the Kademlia address table,
+            // but the relay reservation logic wants the full form to build
+            // `.../p2p/<peer_id>/p2p-circuit` from.
+            let full_addr = original_addr.clone();
+            let mut addr = original_addr;
             let peer_component = addr.pop();
             match peer_component {
                 Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => {
                     if !self.bootstrap_peer_ids.contains(&peer_id) {
                         self.bootstrap_peer_ids.push(peer_id.clone());
                     }
+                    // TD-30: remember the full bootstrap multiaddr so the
+                    // `ConnectionEstablished` auto-reserve path can reach it
+                    // without having to re-discover the public transport
+                    // address. Only the first address seen per bootstrap
+                    // peer is kept; subsequent duplicates are no-ops.
+                    self.bootstrap_relay_addrs
+                        .entry(peer_id.clone())
+                        .or_insert_with(|| full_addr.clone());
                     tracing::info!(
                         target: "peer",
                         %peer_id,
@@ -2855,6 +2956,106 @@ impl PeerManager {
                 tracing::warn!(target: "peer", %err, added, "failed to start kademlia bootstrap");
             }
         }
+    }
+
+    /// TD-30: shared implementation of "reserve a relay slot on `address`",
+    /// used by both the explicit `PeerCommand::ReserveRelay` entry point and
+    /// the auto-reserve-on-bootstrap-connect path in `handle_swarm_event`.
+    ///
+    /// `address` may optionally already carry `/p2p-circuit`; if it does not,
+    /// this helper appends it before calling `listen_on`. The peer_id embedded
+    /// in the address (if any) is recorded as `self.relay_peer_id` so the
+    /// circuit-fallback dial path (`try_dial_via_relay`) and the
+    /// request-response retry path know which relay to build circuits
+    /// through. `source` is a short human-readable label used only in the
+    /// emitted trace so operators can tell explicit and auto reservations
+    /// apart.
+    fn start_relay_reservation(&mut self, mut address: Multiaddr, source: &str) {
+        // Record the relay peer_id the caller is asking us to reserve
+        // against. This is consulted by `try_dial_via_relay` and the blob
+        // fetch retry path; leaving it set across a failed reservation is
+        // harmless because `relay_base_address` is gated separately.
+        if let Some(peer_id) = extract_peer_id(&address) {
+            self.relay_peer_id = Some(peer_id);
+        }
+
+        // Ensure `/p2p-circuit` is present so `listen_on` triggers the
+        // relay::client behaviour's reservation request.
+        let has_circuit = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+        if !has_circuit {
+            address.push(Protocol::P2pCircuit);
+        }
+
+        match self.swarm.listen_on(address.clone()) {
+            Ok(_) => tracing::info!(
+                target: "peer",
+                %address,
+                source,
+                "listening via relay (reservation in flight)",
+            ),
+            Err(err) => tracing::error!(
+                target: "peer",
+                %address,
+                source,
+                %err,
+                "failed to start relay reservation",
+            ),
+        }
+    }
+
+    /// TD-30: auto-reserve a relay slot on a bootstrap peer that has just
+    /// connected, if we do not yet have an active reservation. Called from
+    /// `SwarmEvent::ConnectionEstablished`. No-op when:
+    /// - the just-connected peer is not one of our configured bootstrap
+    ///   relays,
+    /// - we already have a `relay_base_address` (another bootstrap
+    ///   completed the reservation first), or
+    /// - we already tried to reserve against this peer in this process
+    ///   (tracked by `relay_reservation_attempted`).
+    ///
+    /// The per-bootstrap gate is cleared when the connection to that peer
+    /// fully closes (see `ConnectionClosed`), so a subsequent reconnect
+    /// re-tries the reservation cleanly.
+    fn maybe_auto_reserve_relay(&mut self, peer_id: &PeerId) {
+        if self.relay_base_address.is_some() {
+            return;
+        }
+        if !self.bootstrap_relay_addrs.contains_key(peer_id) {
+            return;
+        }
+        if !self.relay_reservation_attempted.insert(peer_id.clone()) {
+            // already attempted against this bootstrap peer
+            return;
+        }
+
+        let Some(address) = self.bootstrap_relay_addrs.get(peer_id).cloned() else {
+            return;
+        };
+
+        tracing::info!(
+            target: "peer",
+            %peer_id,
+            %address,
+            "auto-reserving relay on bootstrap peer",
+        );
+        self.start_relay_reservation(address, "bootstrap-auto");
+    }
+
+    /// TD-30: build the full circuit multiaddr
+    /// `<relay_base>/p2p-circuit/p2p/<target>` for the current active relay
+    /// reservation, or `None` if we have no cached reservation.
+    ///
+    /// Refuses to build one when `target` is itself the relay peer — that
+    /// would ask the relay to tunnel back to itself.
+    fn relay_circuit_addr_for(&self, target: &PeerId) -> Option<Multiaddr> {
+        let base = self.relay_base_address.as_ref()?;
+        if self.relay_peer_id.as_ref() == Some(target) {
+            return None;
+        }
+        let mut circuit = base.clone();
+        circuit.push(Protocol::P2pCircuit);
+        circuit.push(Protocol::P2p(target.clone()));
+        Some(circuit)
     }
 
     fn try_dial_via_relay(&mut self, target_peer_id: &PeerId, error: &DialError) {
@@ -2973,6 +3174,16 @@ fn extract_peer_id(address: &Multiaddr) -> Option<PeerId> {
             _ => None,
         })
         .last()
+}
+
+/// TD-30: classify a request-response `OutboundFailure` as "retryable over
+/// a relay circuit". Only dial-level failures qualify; timeouts and
+/// connection-closed mid-stream mean the peer was reachable but the
+/// exchange did not complete, so replaying over a new circuit would not
+/// help. Unsupported-protocols and IO errors are likewise not transport-
+/// reachability problems.
+fn blob_fetch_error_is_dial_failure(error: &request_response::OutboundFailure) -> bool {
+    matches!(error, request_response::OutboundFailure::DialFailure)
 }
 
 fn dial_error_involves_circuit(error: &DialError) -> bool {
@@ -3468,6 +3679,211 @@ mod profile_reannounce_tests {
         assert_eq!(
             manager.self_profile_record_bytes.as_deref(),
             Some(&value[..]),
+        );
+    }
+}
+
+#[cfg(test)]
+mod relay_circuit_fallback_tests {
+    //! TD-30 · auto-reserve-relay + circuit-dial fallback for
+    //! request-response. These tests exercise the pure-logic primitives of
+    //! the fix without needing two live swarms joined through a real relay:
+    //!
+    //! * `relay_circuit_addr_for` — composing `<relay>/p2p-circuit/p2p/<target>`
+    //!   from the cached reservation.
+    //! * `blob_fetch_error_is_dial_failure` — classifying OutboundFailures
+    //!   that are retryable via circuit.
+    //! * bootstrap-address bookkeeping in `add_bootstrap_peers` — the
+    //!   auto-reserve path depends on `bootstrap_relay_addrs` being
+    //!   populated for every configured bootstrap peer.
+    use super::*;
+    use crate::messaging::{
+        FileTransferQueue, MessageQueue, DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY,
+        DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    };
+    use crate::peer::addr_events::AddrState;
+    use crate::peer::discovery::{DiscoveryQueue, DEFAULT_DISCOVERY_QUEUE_CAPACITY};
+    use crate::transport::TransportConfig;
+    use std::str::FromStr;
+    use std::sync::{Arc, RwLock};
+
+    fn build_manager(seed: [u8; 32], bootstrap: Vec<Multiaddr>) -> PeerManager {
+        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, _handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            addr_state,
+            bootstrap,
+        )
+        .expect("peer manager");
+        // Deliberately leak so senders don't close mid-test.
+        std::mem::forget(message_queue);
+        std::mem::forget(file_transfer_queue);
+        std::mem::forget(discovery_queue);
+        std::mem::forget(_handle);
+        manager
+    }
+
+    #[test]
+    fn relay_circuit_addr_for_composes_expected_multiaddr() {
+        // Given a cached relay reservation
+        // (`/ip4/217.65.5.134/tcp/41000/p2p/<relay>`), asking for the
+        // circuit address to reach `<target>` must produce the exact
+        // libp2p form `<relay>/p2p-circuit/p2p/<target>`.
+        let mut manager = build_manager([201u8; 32], vec![]);
+        let relay_base = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .expect("relay base");
+        let relay_peer = extract_peer_id(&relay_base).expect("relay peer_id");
+        manager.relay_base_address = Some(relay_base.clone());
+        manager.relay_peer_id = Some(relay_peer);
+
+        let target =
+            PeerId::from_str("12D3KooWFUBpUgGywZPur3ayuX1XrTi1xX1WZT5ighvvRKuxfEX4").unwrap();
+        let circuit = manager
+            .relay_circuit_addr_for(&target)
+            .expect("circuit addr");
+
+        let expected = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k/p2p-circuit/p2p/12D3KooWFUBpUgGywZPur3ayuX1XrTi1xX1WZT5ighvvRKuxfEX4",
+        )
+        .unwrap();
+        assert_eq!(circuit, expected);
+    }
+
+    #[test]
+    fn relay_circuit_addr_for_returns_none_without_reservation() {
+        // Without a cached reservation, we must refuse to fabricate a
+        // circuit address — the caller needs to hear that fallback is not
+        // possible.
+        let manager = build_manager([202u8; 32], vec![]);
+        let target =
+            PeerId::from_str("12D3KooWFUBpUgGywZPur3ayuX1XrTi1xX1WZT5ighvvRKuxfEX4").unwrap();
+        assert!(manager.relay_circuit_addr_for(&target).is_none());
+    }
+
+    #[test]
+    fn relay_circuit_addr_for_refuses_to_tunnel_back_to_relay() {
+        // Asking for a circuit to the relay peer itself is nonsensical —
+        // we'd be asking the relay to open a circuit back to itself. The
+        // helper must reject this so the request-response retry path
+        // doesn't waste a dial.
+        let mut manager = build_manager([203u8; 32], vec![]);
+        let relay_base = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .expect("relay base");
+        let relay_peer = extract_peer_id(&relay_base).expect("relay peer_id");
+        manager.relay_base_address = Some(relay_base);
+        manager.relay_peer_id = Some(relay_peer.clone());
+
+        assert!(manager.relay_circuit_addr_for(&relay_peer).is_none());
+    }
+
+    #[test]
+    fn blob_fetch_error_is_dial_failure_only_matches_dialfailure() {
+        // Only DialFailure is retryable over a circuit. Timeouts and
+        // connection-closed-mid-stream mean the peer was reachable and
+        // something at a higher layer stumbled, so replaying would not
+        // help; unsupported-protocols means the remote does not speak
+        // blob-fetch at all.
+        assert!(blob_fetch_error_is_dial_failure(
+            &request_response::OutboundFailure::DialFailure
+        ));
+        assert!(!blob_fetch_error_is_dial_failure(
+            &request_response::OutboundFailure::Timeout
+        ));
+        assert!(!blob_fetch_error_is_dial_failure(
+            &request_response::OutboundFailure::ConnectionClosed
+        ));
+        assert!(!blob_fetch_error_is_dial_failure(
+            &request_response::OutboundFailure::UnsupportedProtocols
+        ));
+    }
+
+    #[test]
+    fn add_bootstrap_peers_populates_relay_addr_map() {
+        // Auto-reserve-on-connect depends on `bootstrap_relay_addrs` being
+        // populated by construction. Regression guard: if a future change
+        // stops capturing the full multiaddr in `add_bootstrap_peers`, the
+        // auto-reserve path is silently dead.
+        let bootstrap_addr = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .unwrap();
+        let bootstrap_peer = extract_peer_id(&bootstrap_addr).unwrap();
+
+        let manager = build_manager([204u8; 32], vec![bootstrap_addr.clone()]);
+
+        assert!(manager.bootstrap_peer_ids.contains(&bootstrap_peer));
+        assert_eq!(
+            manager.bootstrap_relay_addrs.get(&bootstrap_peer),
+            Some(&bootstrap_addr),
+            "bootstrap_relay_addrs must carry the full multiaddr (including /p2p)",
+        );
+    }
+
+    #[test]
+    fn maybe_auto_reserve_relay_is_gated_on_bootstrap_membership() {
+        // A peer that is NOT in `bootstrap_relay_addrs` must never trigger
+        // an auto-reservation, even if it connects — we only trust
+        // explicitly configured relays.
+        let mut manager = build_manager([205u8; 32], vec![]);
+        let random_peer =
+            PeerId::from_str("12D3KooWFUBpUgGywZPur3ayuX1XrTi1xX1WZT5ighvvRKuxfEX4").unwrap();
+        manager.maybe_auto_reserve_relay(&random_peer);
+        assert!(manager.relay_reservation_attempted.is_empty());
+        assert!(manager.relay_peer_id.is_none());
+    }
+
+    #[test]
+    fn maybe_auto_reserve_relay_records_attempt_once() {
+        // Two rapid `ConnectionEstablished` events for the same bootstrap
+        // peer must only trigger one `listen_on` — otherwise every flap
+        // would stack a new reservation.
+        let bootstrap_addr = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .unwrap();
+        let bootstrap_peer = extract_peer_id(&bootstrap_addr).unwrap();
+        let mut manager = build_manager([206u8; 32], vec![bootstrap_addr]);
+
+        manager.maybe_auto_reserve_relay(&bootstrap_peer);
+        manager.maybe_auto_reserve_relay(&bootstrap_peer);
+        assert_eq!(manager.relay_reservation_attempted.len(), 1);
+        assert!(manager
+            .relay_reservation_attempted
+            .contains(&bootstrap_peer));
+        // `start_relay_reservation` stashes the relay peer_id.
+        assert_eq!(manager.relay_peer_id.as_ref(), Some(&bootstrap_peer));
+    }
+
+    #[test]
+    fn maybe_auto_reserve_relay_is_skipped_when_reservation_active() {
+        // If we already hold a reservation, we must not issue a second
+        // one for another bootstrap that happens to connect.
+        let bootstrap_addr = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .unwrap();
+        let bootstrap_peer = extract_peer_id(&bootstrap_addr).unwrap();
+        let mut manager = build_manager([207u8; 32], vec![bootstrap_addr.clone()]);
+
+        // Simulate an already-active reservation established by a prior
+        // bootstrap peer.
+        manager.relay_base_address = Some(bootstrap_addr.clone());
+
+        manager.maybe_auto_reserve_relay(&bootstrap_peer);
+        assert!(
+            manager.relay_reservation_attempted.is_empty(),
+            "must short-circuit without touching attempted set when a reservation already exists",
         );
     }
 }
