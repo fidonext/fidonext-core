@@ -37,6 +37,25 @@ const MAILBOX_FETCH_JITTER_SECONDS: u64 = 3;
 /// `cabi_e2ee_publish_profile_record` at least once in this process's
 /// lifetime; nothing is published if no profile has been set yet.
 const PROFILE_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// TD-40: cadence for the nickname-registry anti-entropy re-broadcast. The
+/// QA race in `qa-artifacts/2026-04-21T1825Z-td39-race/` proved gossipsub
+/// meshes can be asymmetric right at claim time — one side delivers the
+/// racer's claim in <1 s, the other never receives it within the 30-40 s
+/// observation window. Re-broadcasting the cached signed bytes every 30 s
+/// guarantees convergence inside the window so the loser's
+/// `handle_nickname_registry_message` can fire the deterministic tiebreak
+/// and emit `OwnershipRevoked`.
+///
+/// The re-broadcast reuses the cached signed+PoW'd CBOR bytes (see
+/// `own_nickname_claims` on [`PeerManager`]) — no re-sign, no re-grind.
+/// Design §5 — anti-entropy on the nickname-registry gossipsub topic.
+const NICKNAME_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(30);
+/// TD-40: hard TTL on a cached own-claim before anti-entropy evicts it.
+/// Matches `DEFAULT_CLAIM_TTL_SECONDS` from `e2ee::nickname::consts`;
+/// kept as a local constant so the manager does not need to import
+/// design-doc-level TTL values that could drift. Keep in lockstep with
+/// `DEFAULT_CLAIM_TTL_SECONDS` or add a debug assert if they diverge.
+const NICKNAME_CLAIM_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const RELAY_PLACEMENT_N: usize = 5;
 const RELAY_PLACEMENT_W: usize = 3;
 const RELAY_READ_N: usize = 5;
@@ -173,6 +192,19 @@ pub enum PeerCommand {
     LookupNicknameObservation {
         nickname: String,
         response: oneshot::Sender<Option<(Vec<u8>, u64)>>,
+    },
+    /// TD-40: evict a nickname from the anti-entropy cache of own claims.
+    /// Called from `cabi_nickname_release` after the DHT vacate-tombstone
+    /// put succeeds, so the periodic re-broadcast tick stops emitting that
+    /// nickname. The local observation-map entry is left alone — the host
+    /// is expected to call `cabi_nickname_release` voluntarily, meaning
+    /// the observation is already stale; it will be evicted naturally by
+    /// the next inbound registry message that contradicts it (or by the
+    /// vacate tombstone landing on DHT). Intentional split: anti-entropy
+    /// is for own claims; observations are the network-level view.
+    EvictOwnNicknameClaim {
+        nickname: String,
+        response: oneshot::Sender<()>,
     },
     /// Shut the manager down gracefully.
     Shutdown,
@@ -335,6 +367,25 @@ impl PeerManagerHandle {
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))?;
         rx.await
             .map_err(|err| anyhow!("lookup_nickname_observation response channel closed: {err}"))
+    }
+
+    /// TD-40: evict an entry from the anti-entropy cache of own claims.
+    /// Called by `cabi_nickname_release` after the vacate-tombstone DHT
+    /// put succeeds so the periodic re-broadcast tick stops re-publishing
+    /// that nickname. The oneshot response is used purely as a barrier
+    /// (no payload) so the caller can be sure the eviction landed before
+    /// returning a `CABI_NICK_OK` to the host.
+    pub async fn evict_own_nickname_claim(&self, nickname: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::EvictOwnNicknameClaim {
+                nickname,
+                response: tx,
+            })
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))?;
+        rx.await
+            .map_err(|err| anyhow!("evict_own_nickname_claim response channel closed: {err}"))
     }
 
     /// Stores a key/value record in the DHT and waits for the query outcome.
@@ -554,6 +605,23 @@ pub struct PeerManager {
     /// path in `handle_nickname_registry_message` and for the Layer-A
     /// "do we already know someone holds this nickname?" pre-check.
     nickname_observations: HashMap<String, NicknameObservation>,
+    /// TD-40: per-nickname cache of OWN signed+PoW'd claim bytes driven
+    /// by the periodic anti-entropy re-broadcast tick.
+    ///
+    /// - Populated on every successful `handle_publish_nickname_claim`
+    ///   (i.e. every call from `cabi_nickname_claim` that passed the
+    ///   validate-before-broadcast gate).
+    /// - Evicted on `cabi_nickname_release` (via `EvictOwnNicknameClaim`)
+    ///   and on `handle_nickname_registry_message` when the local claim
+    ///   loses the deterministic tiebreak (§5).
+    /// - Evicted passively by the anti-entropy tick itself when the
+    ///   claim's `claim_ts + NICKNAME_CLAIM_TTL_SECONDS` is in the past.
+    ///
+    /// Crucially, the `encoded` bytes here are the EXACT bytes broadcast
+    /// at first claim — re-broadcast reuses them verbatim, so the
+    /// expensive PoW grind (~8-15 s on a 2020-era Android) is never
+    /// repeated.
+    own_nickname_claims: HashMap<String, OwnClaimCacheEntry>,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
     dht_put_queries: HashMap<kad::QueryId, PendingDhtPutQuery>,
     dht_get_queries:
@@ -634,6 +702,17 @@ struct NicknameObservation {
     /// Observer-local wall-clock second when this claim was first
     /// observed. Primary tiebreak key.
     first_seen_ts_at_observer: u64,
+}
+
+/// TD-40: per-nickname cached entry for the anti-entropy re-broadcast
+/// tick. The `encoded` bytes are the exact signed+PoW'd CBOR that
+/// `cabi_nickname_claim` published the first time — re-publishing them
+/// verbatim skips the PoW grind entirely and keeps the signature intact.
+/// `claim` is the parsed view used for TTL expiry checks.
+#[derive(Debug, Clone)]
+struct OwnClaimCacheEntry {
+    claim: NickClaim,
+    encoded: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -743,6 +822,7 @@ impl PeerManager {
             discovery_sender,
             nickname_event_sender,
             nickname_observations: HashMap::new(),
+            own_nickname_claims: HashMap::new(),
             discovery_queries: HashMap::new(),
             dht_put_queries: HashMap::new(),
             dht_get_queries: HashMap::new(),
@@ -804,6 +884,15 @@ impl PeerManager {
             PROFILE_REANNOUNCE_INTERVAL,
         );
         profile_reannounce_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // TD-40: anti-entropy periodic re-broadcast. First tick fires after
+        // the full interval so the initial claim publish is not
+        // duplicated on boot. No-op until at least one own claim has been
+        // cached via `handle_publish_nickname_claim`.
+        let mut nickname_anti_entropy_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + NICKNAME_ANTI_ENTROPY_INTERVAL,
+            NICKNAME_ANTI_ENTROPY_INTERVAL,
+        );
+        nickname_anti_entropy_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(command) = self.command_receiver.recv() => {
@@ -816,6 +905,9 @@ impl PeerManager {
                 }
                 _ = profile_reannounce_tick.tick() => {
                     self.handle_profile_reannounce_tick();
+                }
+                _ = nickname_anti_entropy_tick.tick() => {
+                    self.handle_nickname_anti_entropy_tick();
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
@@ -918,6 +1010,24 @@ impl PeerManager {
                     .get(&nickname)
                     .map(|obs| (obs.encoded.clone(), obs.first_seen_ts_at_observer));
                 let _ = response.send(result);
+                Ok(false)
+            }
+            PeerCommand::EvictOwnNicknameClaim { nickname, response } => {
+                let removed = self.own_nickname_claims.remove(&nickname).is_some();
+                if removed {
+                    tracing::debug!(
+                        target: "peer",
+                        %nickname,
+                        "TD-40: evicted own nickname claim from anti-entropy cache",
+                    );
+                } else {
+                    tracing::trace!(
+                        target: "peer",
+                        %nickname,
+                        "TD-40: evict requested but nickname not cached (no-op)",
+                    );
+                }
+                let _ = response.send(());
                 Ok(false)
             }
             PeerCommand::PutDhtRecord {
@@ -1377,13 +1487,25 @@ impl PeerManager {
                 // the network-level retry simple — the remote tiebreak
                 // winner stays authoritative.
                 let entry = NicknameObservation {
-                    claim,
+                    claim: claim.clone(),
                     encoded: payload.clone(),
                     first_seen_ts_at_observer: observer_now,
                 };
                 self.nickname_observations
                     .entry(nickname.clone())
                     .or_insert(entry);
+                // TD-40: also cache under `own_nickname_claims` so the
+                // periodic anti-entropy tick can re-broadcast the exact
+                // same bytes without re-signing / re-grinding PoW. Every
+                // successful publish refreshes the cache (e.g. after a
+                // revision bump the latest bytes are what gets re-broadcast).
+                self.own_nickname_claims.insert(
+                    nickname.clone(),
+                    OwnClaimCacheEntry {
+                        claim,
+                        encoded: payload.clone(),
+                    },
+                );
                 tracing::debug!(
                     target: "peer",
                     %nickname,
@@ -1415,6 +1537,89 @@ impl PeerManager {
                 %err,
                 "TD-37: failed to publish own nickname claim on registry topic",
             ),
+        }
+    }
+
+    /// TD-40: anti-entropy re-broadcast tick.
+    ///
+    /// Iterates `own_nickname_claims` and re-publishes each entry's cached
+    /// signed+PoW'd CBOR bytes on [`NICKNAME_REGISTRY_TOPIC`]. No
+    /// re-signing, no re-grinding — the bytes in the cache are the exact
+    /// bytes that went out on the wire at `cabi_nickname_claim` time.
+    ///
+    /// Entries whose claim has passed its TTL (`claim_ts +
+    /// NICKNAME_CLAIM_TTL_SECONDS` in the past) are evicted before
+    /// re-broadcast. Gossipsub publish failures (typically
+    /// `InsufficientPeers` on a sparse mesh) are logged at `warn` and
+    /// swallowed — the next tick retries.
+    fn handle_nickname_anti_entropy_tick(&mut self) {
+        if self.own_nickname_claims.is_empty() {
+            tracing::trace!(
+                target: "peer",
+                "TD-40: anti-entropy tick — no cached own claims (no-op)",
+            );
+            return;
+        }
+        let now = now_unix_seconds();
+        // Step 1: evict expired entries. Done in two passes to avoid
+        // mutating while iterating.
+        let expired_nicknames: Vec<String> = self
+            .own_nickname_claims
+            .iter()
+            .filter_map(|(nickname, entry)| {
+                if now
+                    > entry
+                        .claim
+                        .claim_ts
+                        .saturating_add(NICKNAME_CLAIM_TTL_SECONDS)
+                {
+                    Some(nickname.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for nickname in expired_nicknames {
+            tracing::info!(
+                target: "peer",
+                %nickname,
+                "TD-40: evicting expired own nickname claim from anti-entropy cache (>30d old)",
+            );
+            self.own_nickname_claims.remove(&nickname);
+        }
+
+        if self.own_nickname_claims.is_empty() {
+            return;
+        }
+
+        // Step 2: re-broadcast every surviving entry. Collect bytes +
+        // names first so we can publish without holding an immutable
+        // borrow on `self.own_nickname_claims` across `self.swarm` calls.
+        let payloads: Vec<(String, Vec<u8>)> = self
+            .own_nickname_claims
+            .iter()
+            .map(|(nickname, entry)| (nickname.clone(), entry.encoded.clone()))
+            .collect();
+
+        for (nickname, bytes) in payloads {
+            match self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(self.nickname_registry_topic.clone(), bytes)
+            {
+                Ok(_) => tracing::debug!(
+                    target: "peer",
+                    %nickname,
+                    "TD-40: anti-entropy re-broadcast nickname",
+                ),
+                Err(err) => tracing::warn!(
+                    target: "peer",
+                    %nickname,
+                    %err,
+                    "TD-40: anti-entropy re-broadcast failed (gossipsub publish error); will retry next tick",
+                ),
+            }
         }
     }
 
@@ -1514,6 +1719,20 @@ impl PeerManager {
                     winner_peer = %incoming_peer_id,
                     "TD-37: local claim lost tiebreak; emitting OwnershipRevoked",
                 );
+                // TD-40: evict the cached own claim so the next
+                // anti-entropy tick does not keep re-broadcasting a
+                // losing record. Ordering: evict BEFORE the event is
+                // surfaced to the host queue so that even if a separate
+                // thread races a tick between now and the host's
+                // `cabi_nickname_release`, the losing bytes are already
+                // gone from the cache.
+                if self.own_nickname_claims.remove(&nickname).is_some() {
+                    tracing::debug!(
+                        target: "peer",
+                        %nickname,
+                        "TD-40: evicted losing own claim from anti-entropy cache",
+                    );
+                }
                 self.emit_nickname_ownership_revoked(nickname.clone());
                 // Note: publishing a vacate tombstone requires access to
                 // the local identity profile (account_seed) which is not
@@ -4614,5 +4833,172 @@ mod nickname_registry_tests {
         let peer_b = PeerId::random();
         assert!(tiebreak_winner(10, &peer_a, 20, &peer_b));
         assert!(!tiebreak_winner(20, &peer_a, 10, &peer_b));
+    }
+
+    // -------------------------------------------------------------------
+    // TD-40 · anti-entropy periodic re-broadcast tests.
+    //
+    // These exercise the *cache management* side of the tick (populate,
+    // TTL-evict, release-evict, byte-identity across ticks). The
+    // actual gossipsub publish is a side effect on the in-process swarm
+    // — we can't inspect what the mock swarm would send without running
+    // the event loop, so we assert on the observable state: cache
+    // contents BEFORE and AFTER the tick, and the exact bytes that
+    // `handle_nickname_anti_entropy_tick` would have handed to gossipsub
+    // (by asserting on the cache entries themselves, which are what the
+    // publish path reads verbatim).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn td40_antientropy_cached_bytes_reused() {
+        // After `handle_publish_nickname_claim`, the cache entry holds the
+        // exact bytes published. Running the tick twice must NOT mutate
+        // those bytes — proving no re-sign / re-grind happens. A mutation
+        // here would indicate we re-derived bytes inside the tick, which
+        // on Android would re-trigger the 8-15 s PoW grind every 30 s
+        // and burn battery.
+        let (mut manager, _events) = build_manager_with_queue([140u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
+
+        manager.handle_publish_nickname_claim(encoded.clone());
+        let after_publish = manager
+            .own_nickname_claims
+            .get("alice")
+            .expect("cache populated on publish")
+            .encoded
+            .clone();
+        assert_eq!(
+            after_publish, encoded,
+            "cached bytes must equal the published payload verbatim",
+        );
+
+        manager.handle_nickname_anti_entropy_tick();
+        let after_first_tick = manager
+            .own_nickname_claims
+            .get("alice")
+            .expect("cache survives first tick")
+            .encoded
+            .clone();
+        assert_eq!(
+            after_first_tick, encoded,
+            "tick #1 must not mutate cached bytes",
+        );
+
+        manager.handle_nickname_anti_entropy_tick();
+        let after_second_tick = manager
+            .own_nickname_claims
+            .get("alice")
+            .expect("cache survives second tick")
+            .encoded
+            .clone();
+        assert_eq!(
+            after_second_tick, encoded,
+            "tick #2 must not mutate cached bytes — byte-identity proves no PoW re-grind",
+        );
+        // And the two tick outputs must match each other byte-for-byte.
+        assert_eq!(
+            after_first_tick, after_second_tick,
+            "consecutive ticks must publish identical bytes",
+        );
+    }
+
+    #[test]
+    fn td40_antientropy_evicts_on_release() {
+        // Simulate the full release flow at the manager level: publish a
+        // claim (populates cache), then call the evict command handler
+        // directly (what `cabi_nickname_release` triggers after a
+        // successful DHT put). The tick after release must find an empty
+        // cache.
+        let (mut manager, _events) = build_manager_with_queue([141u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
+
+        manager.handle_publish_nickname_claim(encoded);
+        assert!(
+            manager.own_nickname_claims.contains_key("alice"),
+            "cache populated before release",
+        );
+
+        // Drive the evict command through `handle_command` the same way
+        // the event loop would. Use a oneshot to mirror the FFI path.
+        let (tx, _rx) = oneshot::channel();
+        let shutdown = manager
+            .handle_command(PeerCommand::EvictOwnNicknameClaim {
+                nickname: "alice".to_string(),
+                response: tx,
+            })
+            .expect("handle_command ok");
+        assert!(!shutdown, "evict must not request shutdown");
+        assert!(
+            !manager.own_nickname_claims.contains_key("alice"),
+            "cache must be empty after release-triggered eviction",
+        );
+
+        // Running the tick now is a no-op — the critical post-condition
+        // is that no panic occurs and the cache stays empty.
+        manager.handle_nickname_anti_entropy_tick();
+        assert!(
+            manager.own_nickname_claims.is_empty(),
+            "anti-entropy tick after release must not resurrect the entry",
+        );
+    }
+
+    #[test]
+    fn td40_antientropy_evicts_on_ttl_expiry() {
+        // Fabricate an entry whose claim_ts is 31 days in the past
+        // (outside the 30-day claim TTL). The tick must evict it and not
+        // re-broadcast. We bypass `handle_publish_nickname_claim` because
+        // the validator there would reject an ancient claim as stale.
+        let (mut manager, _events) = build_manager_with_queue([142u8; 32]);
+        let now = now_unix_seconds();
+        let thirty_one_days = 31 * 24 * 60 * 60u64;
+        let ancient_claim_ts = now.saturating_sub(thirty_one_days);
+
+        // The validator would reject this — that's fine. The anti-entropy
+        // tick reads only `claim.claim_ts` for the TTL check and the
+        // cached `encoded` bytes for publish, so a synthetic entry is
+        // sufficient to drive the eviction branch.
+        manager.own_nickname_claims.insert(
+            "old_nick".to_string(),
+            OwnClaimCacheEntry {
+                claim: NickClaim {
+                    schema_version: 1,
+                    nickname: "old_nick".to_string(),
+                    peer_id: manager.local_peer_id,
+                    display_name: "Old".to_string(),
+                    avatar_sha256: None,
+                    claim_ts: ancient_claim_ts,
+                    valid_until: ancient_claim_ts + 30,
+                    revision: 1,
+                    pow_nonce: Some(0),
+                    signature: vec![0u8; 64],
+                    account_public_key_protobuf: vec![],
+                },
+                encoded: vec![0xA0],
+            },
+        );
+        // Also insert a fresh entry so we can assert the tick is
+        // selective (evicts the ancient one, keeps the fresh one).
+        let fresh_claim_ts = now;
+        let (fresh_encoded, _fresh_peer, _fresh_dir) =
+            build_owned_claim("fresh_nick", fresh_claim_ts);
+        manager.handle_publish_nickname_claim(fresh_encoded);
+        assert_eq!(
+            manager.own_nickname_claims.len(),
+            2,
+            "pre-tick: both entries cached",
+        );
+
+        manager.handle_nickname_anti_entropy_tick();
+
+        assert!(
+            !manager.own_nickname_claims.contains_key("old_nick"),
+            "ancient claim (>30d) must be evicted by the tick",
+        );
+        assert!(
+            manager.own_nickname_claims.contains_key("fresh_nick"),
+            "fresh claim must survive TTL check and remain in cache",
+        );
     }
 }

@@ -239,6 +239,16 @@ impl ManagedNode {
             .context("failed to query nickname observation map")
     }
 
+    /// TD-40: evict a nickname from the anti-entropy re-broadcast cache.
+    /// Called from `cabi_nickname_release` after the vacate-tombstone DHT
+    /// put succeeds so the periodic re-broadcast tick stops emitting the
+    /// released nickname.
+    fn evict_own_nickname_claim(&self, nickname: String) -> Result<()> {
+        self.runtime
+            .block_on(self.handle.evict_own_nickname_claim(nickname))
+            .context("failed to evict own nickname claim from anti-entropy cache")
+    }
+
     /// Initiates a Kademlia find_peer query and returns the request identifier.
     fn find_peer(&self, peer_id: PeerId) -> Result<u64> {
         let request_id = self.next_discovery_request_id();
@@ -2095,7 +2105,27 @@ pub extern "C" fn cabi_nickname_release(
 
     let key = e2ee::nickname::claim_dht_key(&nickname);
     match node.dht_put_record(key, payload, e2ee::nickname::MIN_VACATE_TTL_SECONDS) {
-        Ok(_) => CABI_NICK_OK,
+        Ok(_) => {
+            // TD-40: drop the nickname from the anti-entropy re-broadcast
+            // cache so the periodic tick stops publishing a record the
+            // host just explicitly released. Failure here is purely
+            // observational — the cache is in-memory on this process and
+            // worst case the tick would republish the claim for up to 30
+            // s before we exit, which is still correct behaviour: the
+            // DHT already carries the tombstone, so any receiver resolves
+            // to "vacated" rather than the stale claim. Still, we log at
+            // warn if the eviction path fails so an infra regression is
+            // visible.
+            if let Err(err) = node.evict_own_nickname_claim(nickname.clone()) {
+                tracing::warn!(
+                    target: "ffi",
+                    %nickname,
+                    %err,
+                    "TD-40: failed to evict own claim from anti-entropy cache after release; tick will self-expire on TTL",
+                );
+            }
+            CABI_NICK_OK
+        }
         Err(err) => dht_error_to_nick_code(err),
     }
 }
