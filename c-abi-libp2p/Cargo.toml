@@ -33,6 +33,14 @@ tempfile = "3.25.0"
 # a hand-sorted integer-keyed map gives us reproducible signatures.
 ciborium = "0.2"
 
+# TD-29: on Android, the default `tracing-subscriber` fmt layer writes to
+# stdout/stderr, which never appears in `logcat`. `tracing-android` installs
+# a layer that forwards spans/events to `__android_log_write`, so
+# `RUST_LOG=peer=info,libp2p_kad=debug` finally shows up under
+# `adb logcat -s fidonext`. Desktop/CI targets keep the existing fmt layer.
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
 [build-dependencies]
 cbindgen = "0.26"   # generate .h
 
