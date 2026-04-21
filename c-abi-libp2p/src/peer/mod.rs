@@ -4,6 +4,7 @@ pub mod addr_events;
 pub mod discovery;
 mod mailbox_store;
 pub mod manager;
+pub mod nickname_events;
 
 pub use addr_events::{AddrEvent, AddrState};
 pub use discovery::{
@@ -13,6 +14,9 @@ pub use discovery::{
 pub use manager::{
     BlobFetchError, DhtQueryError, PeerCommand, PeerManager, PeerManagerHandle,
     MAX_AVATAR_SIZE_BYTES,
+};
+pub use nickname_events::{
+    NicknameEvent, NicknameEventQueue, NicknameEventSender, DEFAULT_NICKNAME_EVENT_QUEUE_CAPACITY,
 };
 
 /// Represents the local peer identity and metadata.

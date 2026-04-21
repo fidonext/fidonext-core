@@ -221,6 +221,18 @@ pub struct IdentityProfile {
     pub signal_identity_seed: [u8; IDENTITY_SEED_LEN],
 }
 
+impl IdentityProfile {
+    /// TD-37: protobuf-encoded account public key. Used by
+    /// `cabi_nickname_claim` to detect "is the pre-existing claim holder
+    /// ME?" without leaking the account seed. Comparable byte-for-byte
+    /// against `NickClaim::account_public_key_protobuf` returned by
+    /// `validate_claim`.
+    pub fn account_public_key_protobuf(&self) -> Result<Vec<u8>> {
+        let keypair = keypair_from_seed(&self.account_seed)?;
+        Ok(keypair.public().encode_protobuf())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredIdentityProfile {
     schema_version: u32,
@@ -1264,7 +1276,7 @@ pub fn decrypt_message_auto(profile_path: &Path, payload: &[u8]) -> Result<Decry
     decrypt_libsignal_message_auto(profile_path, payload)
 }
 
-fn keypair_from_seed(seed: &[u8; IDENTITY_SEED_LEN]) -> Result<identity::Keypair> {
+pub(crate) fn keypair_from_seed(seed: &[u8; IDENTITY_SEED_LEN]) -> Result<identity::Keypair> {
     let secret = identity::ed25519::SecretKey::try_from_bytes(*seed)
         .map_err(|err| anyhow!("invalid key seed: {err}"))?;
     let keypair = identity::ed25519::Keypair::from(secret);

@@ -904,6 +904,18 @@ pub fn tiebreak_winner(
     }
 }
 
+/// TD-37 Layer-A verdict: given an already-validated pre-existing holder
+/// of a nickname (from DHT or local gossip observation) and our own
+/// account public key, return `true` if we should short-circuit with
+/// `CABI_NICK_TAKEN`. Returns `false` when the pre-existing holder is
+/// ourselves (renewal proceeds).
+///
+/// Pure function, extracted so the pre-check logic can be unit-tested
+/// without spinning up a full `PeerManager` + DHT.
+pub fn layer_a_should_short_circuit(existing: &NickClaim, my_account_public_key_pb: &[u8]) -> bool {
+    existing.account_public_key_protobuf != my_account_public_key_pb
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1490,6 +1502,62 @@ mod tests {
         .expect("build");
         let parsed = validate_claim(&encoded, claim_ts + 5).expect("validate");
         assert_eq!(parsed.avatar_sha256, Some(avatar));
+    }
+
+    // -----------------------------------------------------------------
+    // TD-37 Layer-A verdict (pre-check decision logic)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn td37_layer_a_takes_nickname_when_holder_is_different_peer() {
+        // Holder's account key (some other user's protobuf pubkey) differs
+        // from our own → short-circuit with TAKEN, no PoW grind.
+        let (profile_a, _tmp_a) = fresh_profile();
+        let (profile_b, _tmp_b) = fresh_profile();
+        let peer_a = derive_peer_id(&profile_a);
+        let claim_ts = 1_700_000_000u64;
+        let encoded = build_claim(&profile_a, &peer_a, "alice", "Alice", None, claim_ts, 0, 1)
+            .expect("build");
+        let existing = validate_claim(&encoded, claim_ts + 5).expect("validate");
+
+        let b_keypair = keypair_from_seed(&profile_b.account_seed).expect("kp");
+        let b_pubkey_pb = b_keypair.public().encode_protobuf();
+        assert!(layer_a_should_short_circuit(&existing, &b_pubkey_pb));
+    }
+
+    #[test]
+    fn td37_layer_a_passes_through_when_holder_is_self() {
+        // Holder's account key matches ours → treat as renewal, proceed.
+        let (profile, _tmp) = fresh_profile();
+        let peer = derive_peer_id(&profile);
+        let claim_ts = 1_700_000_000u64;
+        let encoded =
+            build_claim(&profile, &peer, "alice", "Alice", None, claim_ts, 0, 1).expect("build");
+        let existing = validate_claim(&encoded, claim_ts + 5).expect("validate");
+
+        let keypair = keypair_from_seed(&profile.account_seed).expect("kp");
+        let my_pubkey_pb = keypair.public().encode_protobuf();
+        assert!(!layer_a_should_short_circuit(&existing, &my_pubkey_pb));
+    }
+
+    #[test]
+    fn td37_layer_a_short_circuit_is_exact_byte_comparison() {
+        // Flipping one byte of a held account_public_key_pb must cause a
+        // mismatch → short-circuit. (Defense-in-depth against a
+        // partial-equality bug sneaking in.)
+        let (profile, _tmp) = fresh_profile();
+        let peer = derive_peer_id(&profile);
+        let claim_ts = 1_700_000_000u64;
+        let encoded =
+            build_claim(&profile, &peer, "alice", "Alice", None, claim_ts, 0, 1).expect("build");
+        let existing = validate_claim(&encoded, claim_ts + 5).expect("validate");
+
+        let keypair = keypair_from_seed(&profile.account_seed).expect("kp");
+        let mut my_pubkey_pb = keypair.public().encode_protobuf();
+        // Flip the last byte.
+        let last = my_pubkey_pb.len() - 1;
+        my_pubkey_pb[last] ^= 0x01;
+        assert!(layer_a_should_short_circuit(&existing, &my_pubkey_pb));
     }
 
     #[test]

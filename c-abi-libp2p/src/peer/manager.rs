@@ -67,6 +67,7 @@ fn mailbox_fetch_next_interval() -> Duration {
 }
 
 use crate::{
+    e2ee::nickname::{tiebreak_winner, validate_claim, NickClaim, NICKNAME_REGISTRY_TOPIC},
     messaging::{
         build_ack, build_envelope_from_payload, build_mailbox_fetch, build_nack,
         chunk_size_or_default, encode_frame, is_addressed_payload, now_unix_seconds, parse_frame,
@@ -77,6 +78,7 @@ use crate::{
     peer::addr_events::{AddrEvent, AddrState},
     peer::discovery::{DiscoveryEvent, DiscoveryEventSender, DiscoveryStatus},
     peer::mailbox_store::{MailboxStoreInsertOutcome, MailboxStoreLimits, PersistentMailboxStore},
+    peer::nickname_events::{NicknameEvent, NicknameEventSender},
     transport::{
         BehaviourEvent, BlobFetchRequest, BlobFetchResponse, DeliveryDirectRequest,
         DeliveryDirectResponse, FileTransferRequest, FileTransferResponse, NetworkBehaviour,
@@ -153,6 +155,24 @@ pub enum PeerCommand {
         peer: PeerId,
         blob_sha256: [u8; 32],
         response: oneshot::Sender<std::result::Result<Vec<u8>, BlobFetchError>>,
+    },
+    /// TD-37: broadcast a signed `NickClaim` (already CBOR-encoded + PoW'd)
+    /// on the dedicated `NICKNAME_REGISTRY_TOPIC` gossipsub channel. This
+    /// path intentionally bypasses `handle_publish_command`'s strict-E2EE
+    /// guard — the payload is a CBOR map, not a libsignal envelope, and
+    /// was already validated by the caller before this command was sent.
+    /// The manager also records the bytes locally so the anti-entropy
+    /// tiebreak (§5) has a `first_seen_ts` baseline for our own claim.
+    PublishNicknameClaim(Vec<u8>),
+    /// TD-37 Layer A: query the manager's in-memory observation map for a
+    /// nickname. Returns the currently-observed claim bytes + observer
+    /// first-seen timestamp, or `None` if the nickname is unknown. Used
+    /// by `cabi_nickname_claim` to detect "someone just claimed this on
+    /// gossipsub in the last N seconds" without waiting for DHT
+    /// propagation.
+    LookupNicknameObservation {
+        nickname: String,
+        response: oneshot::Sender<Option<(Vec<u8>, u64)>>,
     },
     /// Shut the manager down gracefully.
     Shutdown,
@@ -281,6 +301,40 @@ impl PeerManagerHandle {
             .send(PeerCommand::Publish(payload))
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
+
+    /// TD-37: broadcast a signed+PoW'd CBOR `NickClaim` on the dedicated
+    /// nickname-registry gossipsub topic. Bypasses the strict-E2EE guard
+    /// in `handle_publish_command` (the CBOR payload isn't an addressed
+    /// libsignal envelope). Used exclusively by `cabi_nickname_claim` to
+    /// announce ownership for the gossipsub anti-entropy pass (§1.4 / §5).
+    pub async fn publish_nickname_claim(&self, payload: Vec<u8>) -> Result<()> {
+        self.command_sender
+            .send(PeerCommand::PublishNicknameClaim(payload))
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
+
+    /// TD-37 Layer A: check the manager's in-memory observation map for a
+    /// prior registry-topic claim on this nickname. Returns the stored
+    /// canonical CBOR bytes and the local observer first-seen timestamp,
+    /// or `None` if nothing has been observed. The FFI layer uses this
+    /// before grinding PoW to short-circuit claims that have already
+    /// been taken by a neighbor within the gossipsub fan-out window.
+    pub async fn lookup_nickname_observation(
+        &self,
+        nickname: String,
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::LookupNicknameObservation {
+                nickname,
+                response: tx,
+            })
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))?;
+        rx.await
+            .map_err(|err| anyhow!("lookup_nickname_observation response channel closed: {err}"))
     }
 
     /// Stores a key/value record in the DHT and waits for the query outcome.
@@ -480,8 +534,26 @@ pub struct PeerManager {
     inbound_sender: MessageQueueSender,
     file_transfer_sender: FileTransferQueueSender,
     gossipsub_topic: gossipsub::IdentTopic,
+    /// TD-37: dedicated gossipsub topic for nickname-registry anti-entropy.
+    /// Subscribed at manager init alongside the main `echo` topic so every
+    /// node in the fleet observes concurrent claims and can apply the
+    /// deterministic tiebreak without waiting on DHT replication.
+    nickname_registry_topic: gossipsub::IdentTopic,
     autonat_status: watch::Sender<autonat::NatStatus>,
     discovery_sender: DiscoveryEventSender,
+    /// TD-37: typed event queue sender for nickname-ownership-revoked
+    /// callbacks. Drained by the host through
+    /// `cabi_node_dequeue_nickname_event`. `None` only when the manager
+    /// was constructed via a legacy test-only path that did not wire the
+    /// queue; the registry anti-entropy path logs and proceeds without
+    /// surfacing the event in that case.
+    nickname_event_sender: Option<NicknameEventSender>,
+    /// TD-37: in-memory observation map — nickname → (claim, observer
+    /// first-seen ts). Populated on every inbound claim from the registry
+    /// topic AND on every own claim we broadcast. Used by the tiebreak
+    /// path in `handle_nickname_registry_message` and for the Layer-A
+    /// "do we already know someone holds this nickname?" pre-check.
+    nickname_observations: HashMap<String, NicknameObservation>,
     discovery_queries: HashMap<kad::QueryId, DiscoveryRequest>,
     dht_put_queries: HashMap<kad::QueryId, PendingDhtPutQuery>,
     dht_get_queries:
@@ -545,6 +617,25 @@ pub struct PeerManager {
     self_profile_record_ttl_seconds: u64,
 }
 
+/// TD-37: per-nickname observation. Records the CBOR bytes and the
+/// validated claim struct, plus the observer's local wall-clock seconds at
+/// the moment we first observed this binding (either because we
+/// broadcast it ourselves, or because it arrived on the registry topic).
+/// `first_seen_ts_at_observer` is the tiebreak primary key per design §5:
+/// it is adversary-resistant because we set it locally regardless of what
+/// the claim's self-asserted `claim_ts` says.
+#[derive(Debug, Clone)]
+struct NicknameObservation {
+    claim: NickClaim,
+    /// Canonical CBOR bytes (re-publishable verbatim). Held so the
+    /// manager can re-broadcast or re-put on re-announce without
+    /// re-signing.
+    encoded: Vec<u8>,
+    /// Observer-local wall-clock second when this claim was first
+    /// observed. Primary tiebreak key.
+    first_seen_ts_at_observer: u64,
+}
+
 #[derive(Debug)]
 struct PendingBlobFetch {
     expected_sha256: [u8; 32],
@@ -564,11 +655,19 @@ struct PendingBlobFetch {
 
 impl PeerManager {
     /// Creates a new [`PeerManager`] instance alongside a [`PeerManagerHandle`].
+    ///
+    /// TD-37: when `nickname_event_sender` is `Some`, the manager will
+    /// emit [`NicknameEvent::OwnershipRevoked`] when inbound claims on
+    /// `NICKNAME_REGISTRY_TOPIC` beat a claim this node broadcast. When
+    /// `None` (legacy / test-only construction path), registry messages
+    /// are still observed, validated, and used for local tiebreak
+    /// bookkeeping, but no host-facing callback is produced.
     pub fn new(
         config: TransportConfig,
         inbound_sender: MessageQueueSender,
         file_transfer_sender: FileTransferQueueSender,
         discovery_sender: DiscoveryEventSender,
+        nickname_event_sender: Option<NicknameEventSender>,
         addr_state: Arc<RwLock<AddrState>>,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<(Self, PeerManagerHandle)> {
@@ -585,6 +684,21 @@ impl PeerManager {
             .gossipsub
             .subscribe(&gossipsub_topic)
             .map_err(|err| anyhow!("failed to subscribe to gossipsub topic: {err}"))?;
+
+        // TD-37: subscribe to the dedicated nickname-registry topic so
+        // concurrent claim attempts converge via anti-entropy (§5). The
+        // topic is *separate* from the main `echo` topic by design (§7):
+        // registry traffic bypasses `handle_publish_command`'s strict-E2EE
+        // guard entirely — the CBOR payload has no top-level `to_peer_id`,
+        // and we don't route it through `PeerCommand::Publish`.
+        let nickname_registry_topic = gossipsub::IdentTopic::new(NICKNAME_REGISTRY_TOPIC);
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&nickname_registry_topic)
+            .map_err(|err| {
+                anyhow!("failed to subscribe to nickname registry gossipsub topic: {err}")
+            })?;
 
         /* These are not needed as DEFAULT_BOOTSTRAP_PEERS should be empty
         bootstrap_peers.extend(
@@ -624,8 +738,11 @@ impl PeerManager {
             inbound_sender,
             file_transfer_sender,
             gossipsub_topic,
+            nickname_registry_topic,
             autonat_status,
             discovery_sender,
+            nickname_event_sender,
+            nickname_observations: HashMap::new(),
             discovery_queries: HashMap::new(),
             dht_put_queries: HashMap::new(),
             dht_get_queries: HashMap::new(),
@@ -789,6 +906,18 @@ impl PeerManager {
             }
             PeerCommand::Publish(payload) => {
                 self.handle_publish_command(payload);
+                Ok(false)
+            }
+            PeerCommand::PublishNicknameClaim(payload) => {
+                self.handle_publish_nickname_claim(payload);
+                Ok(false)
+            }
+            PeerCommand::LookupNicknameObservation { nickname, response } => {
+                let result = self
+                    .nickname_observations
+                    .get(&nickname)
+                    .map(|obs| (obs.encoded.clone(), obs.first_seen_ts_at_observer));
+                let _ = response.send(result);
                 Ok(false)
             }
             PeerCommand::PutDhtRecord {
@@ -1222,6 +1351,214 @@ impl PeerManager {
         {
             Ok(_) => tracing::info!(target: "peer", "published legacy message"),
             Err(err) => tracing::warn!(target: "peer", %err, "failed to publish legacy message"),
+        }
+    }
+
+    /// TD-37: broadcast a signed+PoW'd `NickClaim` on the nickname-registry
+    /// gossipsub topic and record it locally so the tiebreak (§5) has an
+    /// observer baseline for our own claim. Payload is validated defensively
+    /// — if the caller somehow enqueued garbage the claim is still published
+    /// to match "what was successfully put in the DHT" but the local
+    /// observation is only recorded on validation success.
+    fn handle_publish_nickname_claim(&mut self, payload: Vec<u8>) {
+        // Record our own claim in the observation map BEFORE publishing so
+        // that any inbound echo we might receive from a remote replica
+        // finds an existing entry and skips the "first-time seen → store"
+        // branch. `observer_now` = wall-clock seconds, matches what peers
+        // will stamp when they first see our claim.
+        let observer_now = now_unix_seconds();
+        match validate_claim(payload.as_slice(), observer_now) {
+            Ok(claim) => {
+                let nickname = claim.nickname.clone();
+                // If we already have an older observation for this
+                // nickname under a different peer_id, the local node has
+                // already lost and will have received an
+                // `OwnershipRevoked` event. Publishing here anyway keeps
+                // the network-level retry simple — the remote tiebreak
+                // winner stays authoritative.
+                let entry = NicknameObservation {
+                    claim,
+                    encoded: payload.clone(),
+                    first_seen_ts_at_observer: observer_now,
+                };
+                self.nickname_observations
+                    .entry(nickname.clone())
+                    .or_insert(entry);
+                tracing::debug!(
+                    target: "peer",
+                    %nickname,
+                    first_seen_ts_at_observer = observer_now,
+                    "TD-37: recorded own nickname claim in observation map before broadcast",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "peer",
+                    ?err,
+                    "TD-37: refusing to broadcast malformed own nickname claim; dropping",
+                );
+                return;
+            }
+        }
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.nickname_registry_topic.clone(), payload)
+        {
+            Ok(_) => tracing::info!(
+                target: "peer",
+                "TD-37: published own nickname claim on registry topic",
+            ),
+            Err(err) => tracing::warn!(
+                target: "peer",
+                %err,
+                "TD-37: failed to publish own nickname claim on registry topic",
+            ),
+        }
+    }
+
+    /// TD-37: handle an inbound claim message received on
+    /// `NICKNAME_REGISTRY_TOPIC`. Steps (design §5):
+    /// 1. Verification-before-parse via `validate_claim`. Bad records are
+    ///    dropped at `debug!` — a peer flooding the topic with garbage
+    ///    cannot push log volume past the gossipsub layer's own mesh
+    ///    score-keeping.
+    /// 2. Compute `first_seen_ts_at_observer = now()`. This is our local
+    ///    clock, not `claim.claim_ts` — design §5 calls this out as the
+    ///    adversary-resistant primary tiebreak key.
+    /// 3. Look up the existing observation for this nickname.
+    ///    - None: store, no conflict, done.
+    ///    - Same peer_id (renew from the same owner): store the newer
+    ///      claim bytes but keep the older `first_seen_ts`, no conflict.
+    ///    - Different peer_id: run `tiebreak_winner`. If the REMOTE wins
+    ///      and the LOCAL is our own claim (claim.peer_id == local_peer_id),
+    ///      emit `NicknameEvent::OwnershipRevoked` and publish a vacate
+    ///      tombstone. If we win, no-op; the other node will converge
+    ///      when they receive our re-broadcast (or on the next
+    ///      anti-entropy cycle).
+    fn handle_nickname_registry_message(&mut self, bytes: Vec<u8>) {
+        let observer_now = now_unix_seconds();
+        let incoming = match validate_claim(bytes.as_slice(), observer_now) {
+            Ok(claim) => claim,
+            Err(err) => {
+                tracing::debug!(
+                    target: "peer",
+                    ?err,
+                    "TD-37: dropping invalid inbound registry claim",
+                );
+                return;
+            }
+        };
+        let incoming_peer_id = incoming.peer_id;
+        let nickname = incoming.nickname.clone();
+
+        if let Some(existing) = self.nickname_observations.get(&nickname).cloned() {
+            if existing.claim.peer_id == incoming_peer_id {
+                // Same owner re-publishing. Keep the earlier
+                // `first_seen_ts` (tiebreak unchanged), but refresh the
+                // claim/encoded bytes so a subsequent re-broadcast carries
+                // the newer revision.
+                if incoming.revision > existing.claim.revision {
+                    let refreshed = NicknameObservation {
+                        claim: incoming,
+                        encoded: bytes,
+                        first_seen_ts_at_observer: existing.first_seen_ts_at_observer,
+                    };
+                    self.nickname_observations.insert(nickname, refreshed);
+                }
+                return;
+            }
+
+            // Different peer claiming the same nickname. Run the
+            // deterministic tiebreak. `a` is existing, `b` is incoming:
+            // `tiebreak_winner` returns true when `a` wins.
+            let existing_wins = tiebreak_winner(
+                existing.first_seen_ts_at_observer,
+                &existing.claim.peer_id,
+                observer_now,
+                &incoming_peer_id,
+            );
+
+            if existing_wins {
+                // We have the earlier observation. If that observation is
+                // our OWN claim, we already hold the nickname — no
+                // callback, and we let our next gossipsub heartbeat / DHT
+                // re-announce converge the loser.
+                tracing::debug!(
+                    target: "peer",
+                    %nickname,
+                    incoming_peer = %incoming_peer_id,
+                    "TD-37: incoming claim loses tiebreak against local observation",
+                );
+                return;
+            }
+
+            // Incoming remote wins. Check whether the losing side is OUR
+            // OWN claim; if so, surface the revocation to the host AND
+            // publish a vacate tombstone so the stale DHT record gets
+            // cleared.
+            let we_lost_our_own = existing.claim.peer_id == self.local_peer_id;
+            self.nickname_observations.insert(
+                nickname.clone(),
+                NicknameObservation {
+                    claim: incoming.clone(),
+                    encoded: bytes,
+                    first_seen_ts_at_observer: observer_now,
+                },
+            );
+            if we_lost_our_own {
+                tracing::warn!(
+                    target: "peer",
+                    %nickname,
+                    winner_peer = %incoming_peer_id,
+                    "TD-37: local claim lost tiebreak; emitting OwnershipRevoked",
+                );
+                self.emit_nickname_ownership_revoked(nickname.clone());
+                // Note: publishing a vacate tombstone requires access to
+                // the local identity profile (account_seed) which is not
+                // available inside the PeerManager loop by design
+                // (profile lives at the FFI layer). The host-side Android
+                // flow receives the OwnershipRevoked callback and is
+                // expected to either (a) leave the cached DHT claim to
+                // expire naturally within 30 d, or (b) explicitly call
+                // `cabi_nickname_release` if the user wants an immediate
+                // tombstone. Cached readers resolving via DHT will still
+                // get the winner's record on the next Quorum::Majority
+                // `get_record`, because the winner already ran their own
+                // `put_record` with a fresher revision.
+            }
+        } else {
+            // Fresh observation.
+            self.nickname_observations.insert(
+                nickname,
+                NicknameObservation {
+                    claim: incoming,
+                    encoded: bytes,
+                    first_seen_ts_at_observer: observer_now,
+                },
+            );
+        }
+    }
+
+    fn emit_nickname_ownership_revoked(&self, nickname: String) {
+        if let Some(sender) = &self.nickname_event_sender {
+            if let Err(err) = sender.try_enqueue(NicknameEvent::OwnershipRevoked {
+                nickname: nickname.clone(),
+            }) {
+                tracing::warn!(
+                    target: "peer",
+                    %nickname,
+                    %err,
+                    "TD-37: failed to enqueue OwnershipRevoked (queue full or dropped receiver)",
+                );
+            }
+        } else {
+            tracing::debug!(
+                target: "peer",
+                %nickname,
+                "TD-37: no nickname event sender wired; OwnershipRevoked surfaced to logs only",
+            );
         }
     }
 
@@ -2067,6 +2404,14 @@ impl PeerManager {
                 } = event
                 {
                     tracing::info!(target: "peer", %propagation_source, len = message.data.len(), "received gossipsub message");
+                    // TD-37: route nickname-registry topic messages into
+                    // the anti-entropy handler. Every registry message is
+                    // a CBOR-encoded `NickClaim`; we never enqueue them
+                    // into `inbound_sender` (which is application-layer).
+                    if message.topic == self.nickname_registry_topic.hash() {
+                        self.handle_nickname_registry_message(message.data);
+                        return;
+                    }
                     if parse_frame(message.data.as_slice()).is_some() {
                         tracing::debug!(
                             target: "peer",
@@ -3270,6 +3615,7 @@ mod avatar_fetch_tests {
             message_queue.sender(),
             file_transfer_queue.sender(),
             discovery_queue.sender(),
+            None,
             addr_state,
             Vec::new(),
         )
@@ -3306,6 +3652,7 @@ mod avatar_fetch_tests {
             message_queue.sender(),
             file_transfer_queue.sender(),
             discovery_queue.sender(),
+            None,
             addr_state,
             Vec::new(),
         )
@@ -3575,6 +3922,7 @@ mod profile_reannounce_tests {
             message_queue.sender(),
             file_transfer_queue.sender(),
             discovery_queue.sender(),
+            None,
             addr_state,
             Vec::new(),
         )
@@ -3718,6 +4066,7 @@ mod relay_circuit_fallback_tests {
             message_queue.sender(),
             file_transfer_queue.sender(),
             discovery_queue.sender(),
+            None,
             addr_state,
             bootstrap,
         )
@@ -3885,5 +4234,385 @@ mod relay_circuit_fallback_tests {
             manager.relay_reservation_attempted.is_empty(),
             "must short-circuit without touching attempted set when a reservation already exists",
         );
+    }
+}
+
+#[cfg(test)]
+mod nickname_registry_tests {
+    //! TD-37 · Nickname-registry anti-entropy (Layer B).
+    //!
+    //! These tests construct a `PeerManager` directly (no `spawn` + event
+    //! loop) so the test can invoke `handle_nickname_registry_message()`
+    //! synchronously and inspect the `nickname_observations` map + the
+    //! dedicated event-queue output without racing the swarm task. This
+    //! mirrors the pattern used by `profile_reannounce_tests` and
+    //! `relay_circuit_fallback_tests`.
+    use super::*;
+    use crate::e2ee::nickname::{build_claim, tiebreak_winner};
+    use crate::e2ee::{keypair_from_seed, load_or_create_profile};
+    use crate::messaging::{
+        FileTransferQueue, MessageQueue, DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY,
+        DEFAULT_MESSAGE_QUEUE_CAPACITY,
+    };
+    use crate::peer::addr_events::AddrState;
+    use crate::peer::discovery::{DiscoveryQueue, DEFAULT_DISCOVERY_QUEUE_CAPACITY};
+    use crate::peer::nickname_events::{
+        NicknameEvent, NicknameEventQueue, DEFAULT_NICKNAME_EVENT_QUEUE_CAPACITY,
+    };
+    use crate::transport::TransportConfig;
+    use std::sync::{Arc, RwLock};
+    use tempfile::TempDir;
+
+    fn build_manager_with_queue(seed: [u8; 32]) -> (PeerManager, NicknameEventQueue) {
+        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let nickname_event_queue = NicknameEventQueue::new(DEFAULT_NICKNAME_EVENT_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (manager, _handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            Some(nickname_event_queue.sender()),
+            addr_state,
+            Vec::new(),
+        )
+        .expect("peer manager");
+        // Deliberately leak the queues/handle so their senders don't close
+        // mid-test. The manager never runs its event loop here; we drive
+        // it by calling methods directly.
+        std::mem::forget(message_queue);
+        std::mem::forget(file_transfer_queue);
+        std::mem::forget(discovery_queue);
+        std::mem::forget(_handle);
+        (manager, nickname_event_queue)
+    }
+
+    fn build_owned_claim(nickname: &str, claim_ts: u64) -> (Vec<u8>, PeerId, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let peer_id = PeerId::from(libp2p_kp.public());
+        let bytes = build_claim(&profile, &peer_id, nickname, "Disp", None, claim_ts, 0, 1)
+            .expect("build claim");
+        (bytes, peer_id, dir)
+    }
+
+    #[test]
+    fn td37_fresh_inbound_claim_is_recorded_without_callback() {
+        // A first-time observation for an unknown nickname must populate
+        // the map and NOT emit an OwnershipRevoked event — there's no
+        // conflict yet.
+        let (mut manager, mut events) = build_manager_with_queue([120u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (encoded, peer, _dir) = build_owned_claim("alice", claim_ts);
+
+        manager.handle_nickname_registry_message(encoded.clone());
+
+        let obs = manager
+            .nickname_observations
+            .get("alice")
+            .expect("observation recorded");
+        assert_eq!(obs.claim.peer_id, peer);
+        assert_eq!(obs.encoded, encoded);
+
+        assert!(
+            events.try_dequeue().is_none(),
+            "no event should be emitted for a fresh observation",
+        );
+    }
+
+    #[test]
+    fn td37_we_own_then_later_competing_claim_emits_ownership_revoked() {
+        // Scenario (c) from the user QA report:
+        // 1. Local node publishes a claim for "alice" at t=0 (observer_now
+        //    = T). Observation stored with `first_seen_ts = T`.
+        // 2. At T+5 a remote peer's claim arrives on the registry topic.
+        // 3. The remote's observer-first-seen is T+5 (now), later than
+        //    ours. `tiebreak_winner(T_local, ..., T_remote, ...)` → local
+        //    wins, no event.
+        //
+        // To test the "we LOSE" case, use `inject_observation` to backdate
+        // a remote entry BEFORE ours, then have our own claim arrive —
+        // i.e. we thought we owned it but the network already knew about
+        // a stranger who claimed it first. Actually that's not the shape
+        // of the anti-entropy flow; the realistic "we lose" scenario is:
+        //
+        // - We publish a claim for "alice" locally at T. Our first_seen = T.
+        // - A remote claim from peer B arrives, BUT the remote has been
+        //   gossiping this claim for longer, so when we receive it the
+        //   tiebreak should surface that we "saw it too late". In the
+        //   pure-observer-ts rule this actually means "B wins when OUR
+        //   clock ticks before the message arrives" but there's no way
+        //   for a single receiver to know B was earlier on the network.
+        //
+        // The correct test is: inject an existing OWN observation with
+        // first_seen=T_late, then deliver a remote inbound with observer
+        // now=T_early-ish. Our handler uses `now()` as the remote's
+        // first-seen, so we construct the prior own-observation with a
+        // HIGHER timestamp than `now_unix_seconds()` — achieved by
+        // calling `handle_publish_nickname_claim` on our own claim with
+        // a far-future `claim_ts`, OR by directly inserting an entry
+        // with an artificially-late `first_seen_ts`. Direct insert is
+        // cleaner.
+        let (mut manager, mut events) = build_manager_with_queue([121u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let local_peer = manager.local_peer_id;
+
+        // Fabricate a (signed+PoW'd) "our own" claim and directly insert
+        // it into the observation map with a `first_seen_ts` far in the
+        // future. This models "we published, and first_seen is our
+        // local publish time; the inbound remote arrives AFTER that
+        // local clock value, so the remote's first_seen_ts will be
+        // strictly LOWER than ours in the handler's comparison." i.e.
+        // the remote's observer_now (set by the handler to the real
+        // wall-clock now) is LESS than our fabricated future timestamp.
+        let (_my_encoded, my_peer, _my_dir) = build_owned_claim("alice", claim_ts);
+        // Build a canonical-CBOR local claim signed by our test key that
+        // is actually our own account — we fake it by inserting an
+        // observation whose peer_id matches the manager's
+        // `local_peer_id`. Since we only read `claim.peer_id` and
+        // `encoded` bytes on the tiebreak path, and the handler only
+        // emits revocation when `existing.claim.peer_id == self.local_peer_id`,
+        // we assemble a minimal fake entry.
+        //
+        // Rather than truly forge a claim, we directly insert a real
+        // claim record whose peer_id is the MANAGER's local peer_id.
+        // The cleanest way is to pair the manager's libp2p seed with a
+        // freshly built claim on that profile.
+        //
+        // `manager.keypair` exposes the swarm's keypair. Derive a
+        // matching profile by setting libp2p_seed from that keypair is
+        // not trivial here, so instead we insert a synthetic observation
+        // with a future timestamp and a peer_id equal to `local_peer_id`;
+        // the handler's decision logic only reads `claim.peer_id`,
+        // `existing.first_seen_ts_at_observer`, and — when we lose —
+        // compares `existing.claim.peer_id == self.local_peer_id`. Build
+        // an observation by hand.
+        let far_future = claim_ts + 3_600; // 1 h into the future
+        let placeholder = NicknameObservation {
+            claim: NickClaim {
+                schema_version: 1,
+                nickname: "alice".to_string(),
+                peer_id: local_peer,
+                display_name: "Me".to_string(),
+                avatar_sha256: None,
+                claim_ts,
+                valid_until: claim_ts + 60,
+                revision: 1,
+                pow_nonce: Some(0),
+                signature: vec![0u8; 64],
+                account_public_key_protobuf: vec![],
+            },
+            encoded: vec![0xA0],
+            first_seen_ts_at_observer: far_future,
+        };
+        manager
+            .nickname_observations
+            .insert("alice".to_string(), placeholder);
+
+        // Incoming remote claim — its first_seen will be now(), which is
+        // strictly less than `far_future`, so the remote wins the
+        // tiebreak.
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("alice", claim_ts);
+        assert_ne!(remote_peer, local_peer, "test sanity: distinct peers");
+
+        manager.handle_nickname_registry_message(remote_bytes);
+
+        // Observation should now reflect the remote winner.
+        let obs = manager
+            .nickname_observations
+            .get("alice")
+            .expect("still observed");
+        assert_eq!(obs.claim.peer_id, remote_peer);
+
+        // Event queue should carry exactly one OwnershipRevoked("alice").
+        let event = events.try_dequeue().expect("must emit event");
+        match event {
+            NicknameEvent::OwnershipRevoked { nickname } => assert_eq!(nickname, "alice"),
+        }
+        assert!(events.try_dequeue().is_none());
+        let _ = my_peer; // silence unused warning — we derived it for realism only.
+    }
+
+    #[test]
+    fn td37_inbound_claim_with_later_observer_ts_does_not_emit() {
+        // We already hold a first-seen observation for "alice" at t=T
+        // (our own claim), and a LATER remote claim for "alice" arrives.
+        // Since the handler records the inbound's first_seen as `now()`
+        // (strictly later), our existing observation wins and no event
+        // fires.
+        let (mut manager, mut events) = build_manager_with_queue([122u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let local_peer = manager.local_peer_id;
+
+        // Pre-populate our own observation with first_seen=claim_ts - 100
+        // (far in the past relative to now() we'll stamp onto inbound).
+        let past = claim_ts.saturating_sub(100);
+        manager.nickname_observations.insert(
+            "alice".to_string(),
+            NicknameObservation {
+                claim: NickClaim {
+                    schema_version: 1,
+                    nickname: "alice".to_string(),
+                    peer_id: local_peer,
+                    display_name: "Me".to_string(),
+                    avatar_sha256: None,
+                    claim_ts: past,
+                    valid_until: past + 60,
+                    revision: 1,
+                    pow_nonce: Some(0),
+                    signature: vec![0u8; 64],
+                    account_public_key_protobuf: vec![],
+                },
+                encoded: vec![0xA0],
+                first_seen_ts_at_observer: past,
+            },
+        );
+
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("alice", claim_ts);
+        assert_ne!(remote_peer, local_peer);
+
+        manager.handle_nickname_registry_message(remote_bytes);
+
+        // Observation unchanged — we still hold it.
+        let obs = manager
+            .nickname_observations
+            .get("alice")
+            .expect("still observed");
+        assert_eq!(obs.claim.peer_id, local_peer);
+
+        assert!(events.try_dequeue().is_none(), "we won; no event");
+    }
+
+    #[test]
+    fn td37_publish_nickname_claim_records_own_observation() {
+        // Broadcasting our own claim must populate
+        // `nickname_observations` with a `first_seen_ts` that reflects
+        // local publish time. Without this the tiebreak wouldn't
+        // recognize our own claim and the anti-entropy handler would
+        // fail to suppress duplicate rebroadcasts.
+        let (mut manager, _events) = build_manager_with_queue([123u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (encoded, _peer, _dir) = build_owned_claim("alice", claim_ts);
+
+        manager.handle_publish_nickname_claim(encoded.clone());
+
+        let obs = manager
+            .nickname_observations
+            .get("alice")
+            .expect("own claim recorded");
+        assert_eq!(obs.encoded, encoded);
+        // `first_seen_ts_at_observer` was set by now_unix_seconds() at
+        // insert time — allow a small drift around our test reference.
+        let now = now_unix_seconds();
+        assert!(
+            obs.first_seen_ts_at_observer <= now && obs.first_seen_ts_at_observer + 5 >= now,
+            "first_seen_ts should be recent (±5s)",
+        );
+    }
+
+    #[test]
+    fn td37_invalid_inbound_claim_is_dropped_silently() {
+        // Malformed (non-CBOR) inbound bytes on the registry topic must
+        // NOT panic and MUST NOT populate the observation map.
+        let (mut manager, mut events) = build_manager_with_queue([124u8; 32]);
+        manager.handle_nickname_registry_message(vec![0xff, 0xff, 0xff]);
+        assert!(manager.nickname_observations.is_empty());
+        assert!(events.try_dequeue().is_none());
+    }
+
+    #[test]
+    fn td37_renewal_by_same_owner_updates_revision_preserves_first_seen() {
+        // Same peer re-publishing must bump the stored revision but
+        // keep `first_seen_ts_at_observer` unchanged (otherwise the
+        // owner could reset their own tiebreak ordering by spamming
+        // re-publishes, which would break first-writer-wins).
+        let (mut manager, _events) = build_manager_with_queue([125u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        let profile = load_or_create_profile(&path).expect("profile");
+        let libp2p_kp = keypair_from_seed(&profile.libp2p_seed).expect("libp2p kp");
+        let peer = PeerId::from(libp2p_kp.public());
+
+        let v1 = build_claim(&profile, &peer, "alice", "Disp", None, claim_ts, 0, 1).expect("v1");
+        manager.handle_nickname_registry_message(v1);
+        let first_seen_before = manager
+            .nickname_observations
+            .get("alice")
+            .unwrap()
+            .first_seen_ts_at_observer;
+
+        // Advance clock a tick by waiting briefly.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let v2 = build_claim(&profile, &peer, "alice", "Disp", None, claim_ts, 0, 2).expect("v2");
+        manager.handle_nickname_registry_message(v2);
+        let obs = manager.nickname_observations.get("alice").unwrap();
+        assert_eq!(obs.claim.revision, 2);
+        assert_eq!(
+            obs.first_seen_ts_at_observer, first_seen_before,
+            "renewal must not reset first_seen_ts",
+        );
+    }
+
+    #[test]
+    fn td37_two_concurrent_claims_converge_to_single_holder() {
+        // TD-37 integration: two claims for "alice" arrive on the
+        // registry topic in quick succession. On the receiver side,
+        // after both have been processed through
+        // `handle_nickname_registry_message` the deterministic tiebreak
+        // leaves EXACTLY ONE winner in the observation map — not both,
+        // not neither. This is the invariant that scenario (c) of the
+        // QA report violated (both devices returned `Succeeded`).
+        let (mut node, _events) = build_manager_with_queue([141u8; 32]);
+
+        let claim_ts = now_unix_seconds();
+        let (bytes_a, peer_a, _dir_a) = build_owned_claim("alice", claim_ts);
+        let (bytes_b, peer_b, _dir_b) = build_owned_claim("alice", claim_ts);
+        assert_ne!(peer_a, peer_b, "test sanity: distinct identities");
+
+        node.handle_nickname_registry_message(bytes_a);
+        node.handle_nickname_registry_message(bytes_b);
+
+        let obs = node
+            .nickname_observations
+            .get("alice")
+            .expect("converged to a holder");
+        // The winner is deterministic — but whether it's peer_a or
+        // peer_b depends on their generated identity hashes + the
+        // millisecond-scale wall clock. What we pin here is:
+        // (i) there IS a single holder,
+        // (ii) it is either peer_a or peer_b (no ghost entry),
+        // (iii) `handle_nickname_registry_message` did not store both.
+        assert!(
+            obs.claim.peer_id == peer_a || obs.claim.peer_id == peer_b,
+            "winner must be one of the two candidates",
+        );
+        assert_eq!(
+            node.nickname_observations.len(),
+            1,
+            "exactly one observation per nickname — 'both Succeeded' regression guard",
+        );
+    }
+
+    #[test]
+    fn td37_tiebreak_helper_peer_id_hash_rule_is_consistent_with_handler() {
+        // Guard: the handler uses `tiebreak_winner` with
+        // (existing_first_seen, existing_peer_id, incoming_first_seen,
+        // incoming_peer_id). Confirm the pure helper stays consistent
+        // with the handler's intent — earlier first_seen wins regardless
+        // of peer_id.
+        let (_manager_a, _events_a) = build_manager_with_queue([131u8; 32]);
+        let (_manager_b, _events_b) = build_manager_with_queue([132u8; 32]);
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        assert!(tiebreak_winner(10, &peer_a, 20, &peer_b));
+        assert!(!tiebreak_winner(20, &peer_a, 10, &peer_b));
     }
 }

@@ -114,6 +114,16 @@ pub const CABI_NICK_INVALID_INPUT: c_int = 7;
 /// Nickname is already claimed by a different peer. Claim path only.
 pub const CABI_NICK_TAKEN: c_int = 8;
 
+/// TD-37 · Nickname-registry event kinds.
+///
+/// Surfaced via `cabi_node_dequeue_nickname_event`. Today the only event
+/// is [`CABI_NICKNAME_EVENT_OWNERSHIP_REVOKED`], produced by the
+/// gossipsub anti-entropy pass when a concurrent claim from a different
+/// peer wins the deterministic tiebreak against one of our own claims.
+/// More event kinds may be added here without breaking the dequeue ABI
+/// (new kind = new discriminant; callers already match on the kind).
+pub const CABI_NICKNAME_EVENT_OWNERSHIP_REVOKED: c_int = 0;
+
 /// Opaque handle that callers treat as an identifier for a running node.
 #[repr(C)]
 pub struct CabiNodeHandle {
@@ -129,6 +139,12 @@ struct ManagedNode {
     message_queue: messaging::MessageQueue,
     file_transfer_queue: messaging::FileTransferQueue,
     discovery_queue: peer::DiscoveryQueue,
+    /// TD-37: polling-compatible queue of nickname-ownership-revoked
+    /// events. Drained by `cabi_node_dequeue_nickname_event`. The manager
+    /// emits into this queue whenever a concurrent claim on the registry
+    /// gossipsub topic beats one of our own claims via the design §5
+    /// deterministic tiebreak.
+    nickname_event_queue: peer::NicknameEventQueue,
     discovery_sequence: AtomicU64,
     addr_state: Arc<RwLock<AddrState>>,
 }
@@ -141,6 +157,8 @@ impl ManagedNode {
         let file_transfer_queue =
             messaging::FileTransferQueue::new(messaging::DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
         let discovery_queue = peer::DiscoveryQueue::new(peer::DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let nickname_event_queue =
+            peer::NicknameEventQueue::new(peer::DEFAULT_NICKNAME_EVENT_QUEUE_CAPACITY);
         let addr_state = Arc::new(RwLock::new(AddrState::default()));
 
         let (manager, handle) = peer::PeerManager::new(
@@ -148,6 +166,7 @@ impl ManagedNode {
             message_queue.sender(),
             file_transfer_queue.sender(),
             discovery_queue.sender(),
+            Some(nickname_event_queue.sender()),
             addr_state.clone(),
             bootstrap_peers,
         )?;
@@ -167,6 +186,7 @@ impl ManagedNode {
             message_queue,
             file_transfer_queue,
             discovery_queue,
+            nickname_event_queue,
             discovery_sequence: AtomicU64::new(0),
             addr_state,
         })
@@ -197,6 +217,26 @@ impl ManagedNode {
         self.runtime
             .block_on(self.handle.publish(payload))
             .context("failed to publish message")
+    }
+
+    /// TD-37: broadcast a signed + PoW'd `NickClaim` on the dedicated
+    /// nickname-registry gossipsub topic. Called from `cabi_nickname_claim`
+    /// after the DHT `put_record` completes so the anti-entropy pass can
+    /// detect concurrent claims from peers we haven't yet received via
+    /// DHT replication.
+    fn publish_nickname_claim(&self, payload: Vec<u8>) -> Result<()> {
+        self.runtime
+            .block_on(self.handle.publish_nickname_claim(payload))
+            .context("failed to publish nickname claim on registry topic")
+    }
+
+    /// TD-37 Layer A: look up the manager's in-memory observation map for
+    /// `nickname`. Returns `Some((encoded_claim_bytes, first_seen_ts))`
+    /// when a registry-topic claim has been observed for this nickname.
+    fn lookup_nickname_observation(&self, nickname: String) -> Result<Option<(Vec<u8>, u64)>> {
+        self.runtime
+            .block_on(self.handle.lookup_nickname_observation(nickname))
+            .context("failed to query nickname observation map")
     }
 
     /// Initiates a Kademlia find_peer query and returns the request identifier.
@@ -246,9 +286,35 @@ impl ManagedNode {
     fn dht_get_record(&self, key: Vec<u8>) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
         self.runtime.block_on(self.handle.dht_get_record(key))
     }
+
+    /// TD-37: DHT `get_record` with a hard per-call timeout. Returns
+    /// `DhtQueryError::Timeout` if the underlying Kademlia query does not
+    /// resolve within the caller's deadline. Used by `cabi_nickname_claim`'s
+    /// Layer-A pre-check where we must NOT exceed ~3 s of spinner time
+    /// before the UX cuts over to the 8-15 s PoW grind.
+    fn dht_get_record_with_timeout(
+        &self,
+        key: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<Vec<u8>, peer::DhtQueryError> {
+        let fut = self.handle.dht_get_record(key);
+        match self
+            .runtime
+            .block_on(async move { tokio::time::timeout(timeout, fut).await })
+        {
+            Ok(inner) => inner,
+            Err(_) => Err(peer::DhtQueryError::Timeout),
+        }
+    }
     /// Attempts to dequeue the next discovery event without blocking.
     fn try_dequeue_discovery(&mut self) -> Option<peer::DiscoveryEvent> {
         self.discovery_queue.try_dequeue()
+    }
+
+    /// TD-37: attempts to dequeue the next nickname-registry event
+    /// without blocking.
+    fn try_dequeue_nickname_event(&mut self) -> Option<peer::NicknameEvent> {
+        self.nickname_event_queue.try_dequeue()
     }
 
     /// Attempts to pull a message from the internal queue without blocking.
@@ -1599,12 +1665,26 @@ fn dht_error_to_nick_code(err: peer::DhtQueryError) -> c_int {
 ///   malformed pointer inputs (reuses the existing FFI-level codes for
 ///   caller-bug signalling, per the `cabi_e2ee_*` precedent).
 ///
-/// **Note**: this function does NOT currently check for a pre-existing
-/// claim under the same key before publishing. Android layer is expected
-/// to call `cabi_nickname_resolve` first and surface `CABI_NICK_TAKEN`
-/// in the UI before ever hitting this path. A server-side first-writer-
-/// wins enforcement is the design §1.4 tiebreak rule; bookkeeping lands
-/// with the gossipsub-registry-topic follow-up.
+/// # Uniqueness enforcement (TD-37)
+///
+/// Before grinding PoW + publishing, this function performs a two-layer
+/// uniqueness pre-check:
+/// 1. **Bounded DHT `get_record` (≤3 s)** at the hashed key. If a valid
+///    claim is returned for this nickname and the holder's account public
+///    key differs from ours, return [`CABI_NICK_TAKEN`] immediately. Same
+///    account public key → treated as renewal, grind proceeds.
+/// 2. **In-memory observation map peek** (populated by the PeerManager's
+///    `NICKNAME_REGISTRY_TOPIC` subscription per TD-37 Layer B). If a
+///    concurrent claim arrived on gossipsub in the last few seconds and
+///    names the same nickname, it's evaluated the same way.
+///
+/// After a successful `put_record`, the signed+PoW'd bytes are broadcast
+/// on the registry topic so peers who were racing learn they lost; losers
+/// receive `CABI_NICKNAME_EVENT_OWNERSHIP_REVOKED` through
+/// `cabi_node_dequeue_nickname_event`.
+///
+/// The pre-check adds ≤3 s worst-case to the user-perceived spinner
+/// before the 8-15 s PoW grind. Design §1.4 step 2 + §5.
 pub extern "C" fn cabi_nickname_claim(
     handle: *mut CabiNodeHandle,
     profile_path: *const c_char,
@@ -1657,6 +1737,29 @@ pub extern "C" fn cabi_nickname_claim(
         }
     };
 
+    // TD-37 Layer A: detect a pre-existing claim holder before grinding
+    // PoW. We derive our own account public key (protobuf-encoded bytes)
+    // from the profile so we can recognize "it's us (renewal)" vs. "it's
+    // somebody else (TAKEN)". This must NOT leak the account seed.
+    let my_account_public_key_pb = match profile.account_public_key_protobuf() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(
+                target: "ffi",
+                %err,
+                "failed to derive account public key for Layer-A uniqueness check",
+            );
+            return CABI_STATUS_INTERNAL_ERROR;
+        }
+    };
+
+    let key = e2ee::nickname::claim_dht_key(&nickname);
+    if let Some(code) =
+        nickname_layer_a_pre_check(node, &nickname, key.clone(), &my_account_public_key_pb)
+    {
+        return code;
+    }
+
     let claim_ts = unix_seconds_now();
     let payload = match e2ee::nickname::build_claim(
         &profile,
@@ -1675,16 +1778,149 @@ pub extern "C" fn cabi_nickname_claim(
         }
     };
 
-    let key = e2ee::nickname::claim_dht_key(&nickname);
     let effective_ttl = if ttl_seconds == 0 {
         e2ee::nickname::DEFAULT_CLAIM_TTL_SECONDS
     } else {
         ttl_seconds
     };
 
-    match node.dht_put_record(key, payload, effective_ttl) {
-        Ok(_) => CABI_NICK_OK,
+    match node.dht_put_record(key, payload.clone(), effective_ttl) {
+        Ok(_) => {
+            // TD-37 Layer B: broadcast on the nickname-registry gossipsub
+            // topic so concurrent racers who were building their own
+            // claim learn we won (or lose to us). Failure to broadcast is
+            // NOT fatal — the DHT put already succeeded and peers will
+            // eventually converge via their own gossipsub subscription +
+            // periodic DHT fetches. Log + continue.
+            if let Err(err) = node.publish_nickname_claim(payload) {
+                tracing::warn!(
+                    target: "ffi",
+                    %err,
+                    "TD-37: DHT put succeeded but gossipsub anti-entropy broadcast failed",
+                );
+            }
+            CABI_NICK_OK
+        }
         Err(err) => dht_error_to_nick_code(err),
+    }
+}
+
+/// TD-37 Layer A pre-check. Returns `Some(code)` to short-circuit the
+/// claim flow (either `CABI_NICK_TAKEN` on a valid competing holder or a
+/// transport error code) or `None` to proceed to PoW + publish.
+///
+/// **Correctness discipline**: transient DHT errors (`NotFound`,
+/// `Timeout`) MUST NOT be treated as "take it is free" — they return
+/// `None` so the caller proceeds. This is safe because Layer B will
+/// surface `OwnershipRevoked` on a real subsequent collision, and the
+/// alternative (treating Timeout as TAKEN) would lock out every claim
+/// attempt under transient DHT load.
+fn nickname_layer_a_pre_check(
+    node: &ManagedNode,
+    nickname: &str,
+    key: Vec<u8>,
+    my_account_public_key_pb: &[u8],
+) -> Option<c_int> {
+    // 1) In-memory gossipsub observation (populated by Layer B). Quick,
+    //    no network round-trip.
+    match node.lookup_nickname_observation(nickname.to_string()) {
+        Ok(Some((encoded, _first_seen_ts))) => {
+            let observer_now = unix_seconds_now();
+            match e2ee::nickname::validate_claim(&encoded, observer_now) {
+                Ok(claim) => {
+                    if claim.account_public_key_protobuf == my_account_public_key_pb {
+                        // Our own prior claim — treat as renewal.
+                        tracing::debug!(
+                            target: "ffi",
+                            %nickname,
+                            "TD-37 Layer-A (gossip): prior observation is ours; proceeding as renewal",
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "ffi",
+                            %nickname,
+                            holder_peer = %claim.peer_id,
+                            "TD-37 Layer-A (gossip): nickname taken by a different peer; short-circuit",
+                        );
+                        return Some(CABI_NICK_TAKEN);
+                    }
+                }
+                Err(err) => {
+                    // Corrupt entry — ignore; Layer B would never have
+                    // stored this but belt-and-suspenders anyway.
+                    tracing::debug!(
+                        target: "ffi",
+                        ?err,
+                        "TD-37 Layer-A (gossip): dropped invalid cached observation",
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            // Nothing observed via gossip yet — fall through to DHT.
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "ffi",
+                %err,
+                "TD-37 Layer-A: nickname observation lookup failed; proceeding",
+            );
+        }
+    }
+
+    // 2) Bounded DHT `get_record`. Hard 3 s ceiling on the user-perceived
+    //    "Добавляем…" spinner before PoW grinding starts.
+    const LAYER_A_DHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    match node.dht_get_record_with_timeout(key, LAYER_A_DHT_TIMEOUT) {
+        Ok(payload) => {
+            let observer_now = unix_seconds_now();
+            match e2ee::nickname::validate_claim(&payload, observer_now) {
+                Ok(claim) => {
+                    if claim.account_public_key_protobuf == my_account_public_key_pb {
+                        tracing::debug!(
+                            target: "ffi",
+                            %nickname,
+                            "TD-37 Layer-A (DHT): prior claim is ours; proceeding as renewal",
+                        );
+                        None
+                    } else {
+                        tracing::info!(
+                            target: "ffi",
+                            %nickname,
+                            holder_peer = %claim.peer_id,
+                            "TD-37 Layer-A (DHT): nickname taken by a different peer; short-circuit",
+                        );
+                        Some(CABI_NICK_TAKEN)
+                    }
+                }
+                Err(err) => {
+                    // Invalid record at the key — corrupt replica, or a
+                    // vacate tombstone (schema-reject from the claim
+                    // validator). Either way, the name is effectively
+                    // free for us; proceed.
+                    tracing::debug!(
+                        target: "ffi",
+                        ?err,
+                        %nickname,
+                        "TD-37 Layer-A (DHT): record present but invalid as claim; proceeding",
+                    );
+                    None
+                }
+            }
+        }
+        Err(peer::DhtQueryError::NotFound) | Err(peer::DhtQueryError::Timeout) => {
+            // No existing holder observed within the tight deadline.
+            // Proceed — Layer B will catch any concurrent racer.
+            None
+        }
+        Err(peer::DhtQueryError::Internal(msg)) => {
+            tracing::warn!(
+                target: "ffi",
+                %msg,
+                "TD-37 Layer-A (DHT): transient internal error; proceeding",
+            );
+            None
+        }
     }
 }
 
@@ -3060,6 +3296,62 @@ pub extern "C" fn cabi_node_dequeue_discovery_event(
         address_buffer,
         address_buffer_len,
         address_written_len,
+    )
+}
+
+#[no_mangle]
+/// C-ABI. TD-37 · Attempts to dequeue the next nickname-registry event.
+///
+/// Polling contract identical to
+/// [`cabi_node_dequeue_discovery_event`] — returns
+/// [`CABI_STATUS_QUEUE_EMPTY`] when no event is pending, or writes the
+/// event kind + nickname and returns [`CABI_STATUS_SUCCESS`].
+///
+/// `event_kind` receives a `CABI_NICKNAME_EVENT_*` discriminant. On a
+/// successful dequeue the nickname UTF-8 bytes (NUL-terminated) are
+/// written to `nickname_buffer`. If the buffer is too small, sets
+/// `*nickname_written_len` to the required length and returns
+/// [`CABI_STATUS_BUFFER_TOO_SMALL`] without consuming the event's
+/// future contents — the nickname is still reported via
+/// `*nickname_written_len`, but the event has been removed from the
+/// queue. 256 bytes comfortably fits `MAX_NICKNAME_LEN` + NUL.
+pub extern "C" fn cabi_node_dequeue_nickname_event(
+    handle: *mut CabiNodeHandle,
+    event_kind: *mut c_int,
+    nickname_buffer: *mut c_char,
+    nickname_buffer_len: usize,
+    nickname_written_len: *mut usize,
+) -> c_int {
+    let node = match node_from_ptr(handle) {
+        Ok(node) => node,
+        Err(status) => return status,
+    };
+    if event_kind.is_null() || nickname_buffer.is_null() || nickname_written_len.is_null() {
+        return CABI_STATUS_NULL_POINTER;
+    }
+    if nickname_buffer_len == 0 {
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    unsafe {
+        *nickname_written_len = 0;
+    }
+    let event = match node.try_dequeue_nickname_event() {
+        Some(event) => event,
+        None => return CABI_STATUS_QUEUE_EMPTY,
+    };
+    let (kind, nickname) = match event {
+        peer::NicknameEvent::OwnershipRevoked { nickname } => {
+            (CABI_NICKNAME_EVENT_OWNERSHIP_REVOKED, nickname)
+        }
+    };
+    unsafe {
+        *event_kind = kind;
+    }
+    write_c_string(
+        nickname.as_str(),
+        nickname_buffer,
+        nickname_buffer_len,
+        nickname_written_len,
     )
 }
 

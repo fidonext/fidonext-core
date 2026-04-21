@@ -60,6 +60,11 @@ async fn spawn_node(
         message_queue.sender(),
         file_transfer_queue.sender(),
         discovery_queue.sender(),
+        // TD-37: the example mesh does not wire the nickname-ownership
+        // event queue — nickname uniqueness enforcement is exercised by
+        // the Android client and the dedicated unit tests, not this
+        // messaging-focused example.
+        None,
         addr_state,
         bootstrap_peers,
     )
