@@ -8,11 +8,14 @@ services:
     restart: unless-stopped
     environment:
       LISTEN_ADDR: /ip4/0.0.0.0/tcp/41000
-      USE_WS: "0"
+      FORCE_HOP: "true"
       # BOOTSTRAP_PEERS: "/ip4/x.x.x.x/tcp/41000/p2p/12D3...,/ip4/y.y.y.y/tcp/41000/p2p/12D3..."
       # USE_QUIC: "1"
-      # USE_WS: "1" # enables --use-ws in relay runtime
-      # LISTEN_ADDR: /ip4/0.0.0.0/tcp/41000/ws
+      # TD-01: SUBSCRIBE_TOPICS overrides the binary's default topic list.
+      # Leave unset in production — the default
+      # (`/fidonext/nickname-registry/v1`) is what cross-network peers need
+      # for nickname-uniqueness convergence.
+      # SUBSCRIBE_TOPICS: "/fidonext/nickname-registry/v1 /fidonext/custom/v1"
       # EXTRA_ARGS: "--bootstrap /ip4/..."
     ports:
       - "41000:41000/tcp"

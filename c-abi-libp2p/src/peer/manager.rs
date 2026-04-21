@@ -243,6 +243,19 @@ pub enum PeerCommand {
     /// must not be resurrected. Not exposed via the FFI surface;
     /// self-scheduled only.
     EarlyNicknameRebroadcast { nickname: String },
+    /// TD-01: subscribe to an arbitrary gossipsub topic by string name. Used
+    /// by the `fidonext-relay` binary to ensure relay nodes join the mesh
+    /// for application-level topics (e.g. `/fidonext/nickname-registry/v1`)
+    /// so cross-network peers can actually converge on them. Idempotent —
+    /// re-subscribing to an already-subscribed topic is a no-op on the
+    /// gossipsub side, but still logged. `response` is used purely as a
+    /// barrier; the oneshot returns `Ok(())` on successful subscription and
+    /// `Err(message)` if the gossipsub `subscribe` call fails (e.g. malformed
+    /// topic name).
+    SubscribeTopic {
+        topic: String,
+        response: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Shut the manager down gracefully.
     Shutdown,
 }
@@ -515,6 +528,26 @@ impl PeerManagerHandle {
             .send(PeerCommand::Shutdown)
             .await
             .map_err(|err| anyhow!("peer manager command channel closed: {err}"))
+    }
+
+    /// TD-01: subscribe to an arbitrary gossipsub topic by string name. Used
+    /// by the `fidonext-relay` binary so relay nodes join the mesh for
+    /// application-level topics (notably `/fidonext/nickname-registry/v1`)
+    /// and actually forward traffic between cross-network peers. Returns
+    /// `Err` if the underlying gossipsub `subscribe` fails; duplicate
+    /// subscriptions resolve to `Ok(())`.
+    pub async fn subscribe_topic(&self, topic: impl Into<String>) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.command_sender
+            .send(PeerCommand::SubscribeTopic {
+                topic: topic.into(),
+                response: tx,
+            })
+            .await
+            .map_err(|err| anyhow!("peer manager command channel closed: {err}"))?;
+        rx.await
+            .map_err(|err| anyhow!("subscribe_topic response channel closed: {err}"))?
+            .map_err(|err| anyhow!("gossipsub subscribe failed: {err}"))
     }
 
     // Requests starting an outbound file transfer to the target peer via the dedicated protocol.
@@ -1100,6 +1133,46 @@ impl PeerManager {
             }
             PeerCommand::EarlyNicknameRebroadcast { nickname } => {
                 self.handle_early_nickname_rebroadcast(nickname);
+                Ok(false)
+            }
+            PeerCommand::SubscribeTopic { topic, response } => {
+                // TD-01: explicit topic subscription for the relay binary and
+                // any other host that wants to ensure the gossipsub mesh
+                // includes a given topic before traffic starts flowing. The
+                // gossipsub behaviour rejects duplicate subscriptions with a
+                // `SubscriptionError::AlreadySubscribed`, which we treat as a
+                // success (the topic is already in the mesh, which is the
+                // state the caller asked for). Any other error is mapped to
+                // `Err(String)` for the oneshot.
+                let ident_topic = gossipsub::IdentTopic::new(&topic);
+                let result = match self.swarm.behaviour_mut().gossipsub.subscribe(&ident_topic) {
+                    Ok(true) => {
+                        tracing::info!(
+                            target: "peer",
+                            %topic,
+                            "subscribed to gossipsub topic",
+                        );
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            target: "peer",
+                            %topic,
+                            "already subscribed to gossipsub topic",
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "peer",
+                            %topic,
+                            %err,
+                            "failed to subscribe to gossipsub topic",
+                        );
+                        Err(err.to_string())
+                    }
+                };
+                let _ = response.send(result);
                 Ok(false)
             }
             PeerCommand::PutDhtRecord {
@@ -3882,6 +3955,23 @@ impl PeerManager {
         if self.relay_peer_id.as_ref() == Some(target) {
             return None;
         }
+        // TD-43: libp2p rejects multiaddrs that carry more than one
+        // `/p2p-circuit` component (the dial planner logs
+        // `Address contains multiple circuit relay protocols (p2p-circuit)
+        // which is not supported`). `relay_base_address` should, by
+        // construction in `update_relay_address`, never contain
+        // `p2p-circuit`, but if the upstream path ever regresses we must
+        // not compose a second circuit on top — skip the fallback instead
+        // of producing an invalid address.
+        if base.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            tracing::debug!(
+                target: "peer",
+                %base,
+                %target,
+                "relay base already contains p2p-circuit; refusing to stack a second circuit",
+            );
+            return None;
+        }
         let mut circuit = base.clone();
         circuit.push(Protocol::P2pCircuit);
         circuit.push(Protocol::P2p(target.clone()));
@@ -3912,6 +4002,26 @@ impl PeerManager {
                 target: "peer",
                 %target_peer_id,
                 "dial attempt already used a relay circuit; skipping fallback",
+            );
+            return;
+        }
+
+        // TD-43: guard against composing a second `/p2p-circuit` on top of a
+        // relay base that somehow already carries one. Stacking circuits is
+        // not supported by libp2p and shows up in logs as
+        // `Address contains multiple circuit relay protocols (p2p-circuit)
+        // which is not supported`. This is defensive — `update_relay_address`
+        // strips the circuit before caching the base — but aligns this path
+        // with `relay_circuit_addr_for`.
+        if relay_base_address
+            .iter()
+            .any(|p| matches!(p, Protocol::P2pCircuit))
+        {
+            tracing::debug!(
+                target: "peer",
+                %target_peer_id,
+                %relay_base_address,
+                "relay base already contains p2p-circuit; refusing to stack a second circuit",
             );
             return;
         }
@@ -4619,6 +4729,35 @@ mod relay_circuit_fallback_tests {
         manager.relay_peer_id = Some(relay_peer.clone());
 
         assert!(manager.relay_circuit_addr_for(&relay_peer).is_none());
+    }
+
+    #[test]
+    fn relay_circuit_addr_for_refuses_stacked_circuit() {
+        // TD-43: if `relay_base_address` ever ends up already containing a
+        // `/p2p-circuit` component, we must *not* build a
+        // `<base>/p2p-circuit/p2p/<target>` on top of it. libp2p rejects
+        // multiaddrs with more than one circuit component and logs
+        // `Address contains multiple circuit relay protocols`. Expect the
+        // helper to refuse rather than emit a malformed multiaddr. This
+        // should be unreachable in practice (update_relay_address strips
+        // the circuit before caching) but the guard must hold as a
+        // regression fence.
+        let mut manager = build_manager([220u8; 32], vec![]);
+        let stacked_base = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k/p2p-circuit",
+        )
+        .expect("stacked relay base");
+        let relay_peer =
+            PeerId::from_str("12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k").unwrap();
+        manager.relay_base_address = Some(stacked_base);
+        manager.relay_peer_id = Some(relay_peer);
+
+        let target =
+            PeerId::from_str("12D3KooWFUBpUgGywZPur3ayuX1XrTi1xX1WZT5ighvvRKuxfEX4").unwrap();
+        assert!(
+            manager.relay_circuit_addr_for(&target).is_none(),
+            "must refuse to stack p2p-circuit components",
+        );
     }
 
     #[test]

@@ -8,10 +8,17 @@ services:
       PROFILE_PATH: ${PROFILE_PATH:-/data/relay.profile.json}
       BOOTSTRAP_PEERS: ${BOOTSTRAP_PEERS:-}
       USE_QUIC: ${USE_QUIC:-0}
-      USE_WS: ${USE_WS:-0}
-      SEED_PHRASE: ${SEED_PHRASE:-}
-      SEED_HEX: ${SEED_HEX:-}
+      FORCE_HOP: ${FORCE_HOP:-true}
+      # TD-01: whitespace- or comma-separated gossipsub topic list. Leave
+      # empty to inherit the binary's default (`/fidonext/nickname-registry/v1`).
+      SUBSCRIBE_TOPICS: ${SUBSCRIBE_TOPICS:-}
+      RUST_LOG: ${RUST_LOG:-info,peer=info}
       EXTRA_ARGS: ${EXTRA_ARGS:-}
+      # TD-01 deprecations (no-ops in the native Rust relay):
+      #   USE_WS       — WebSocket transport is handled at the host (Caddy)
+      #                  layer, not in the relay binary.
+      #   SEED_PHRASE  — identity is now driven by PROFILE_PATH.
+      #   SEED_HEX     — identity is now driven by PROFILE_PATH.
     ports:
       - "${RELAY_PORT_TCP:-41000}:41000/tcp"
     volumes:

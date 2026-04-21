@@ -11,7 +11,7 @@ anyhow = "1"
 base64 = "0.22"
 libp2p = { version = "0.56", features = ["macros", "kad", "gossipsub", "noise", "yamux", "quic", "identify", "ping", "tcp", "tokio", "autonat", "relay", "rendezvous", "request-response", "cbor", "websocket", "dns"] }
 futures = "0.3.30"
-tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1.21.3"
@@ -32,6 +32,10 @@ tempfile = "3.25.0"
 # §"Crypto Review", item 3b). serde_cbor is not deterministic on maps; ciborium +
 # a hand-sorted integer-keyed map gives us reproducible signatures.
 ciborium = "0.2"
+# TD-01: `fidonext-relay` binary CLI. Derive + env features give us
+# `--listen-addr` / `LISTEN_ADDR`-style dual wiring so the Docker entrypoint
+# can keep pass-through env vars without hand-parsing.
+clap = { version = "4", features = ["derive", "env"] }
 
 # TD-29: on Android, the default `tracing-subscriber` fmt layer writes to
 # stdout/stderr, which never appears in `logcat`. `tracing-android` installs
@@ -47,4 +51,12 @@ cbindgen = "0.26"   # generate .h
 [[example]]
 name = "e2ee_local_mesh"
 path = "examples/rust/e2ee_local_mesh.rs"
+
+# TD-01: native Rust relay binary replacing the old
+# `examples/python/ping_standalone_nodes.py`-driven Docker image. Uses the
+# `cabi_rust_libp2p` rlib directly — no FFI. See `src/bin/fidonext_relay.rs`
+# and `deploy/relay/Dockerfile` for the runtime image wiring.
+[[bin]]
+name = "fidonext-relay"
+path = "src/bin/fidonext_relay.rs"
 
