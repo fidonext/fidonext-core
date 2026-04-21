@@ -50,6 +50,16 @@ const PROFILE_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `own_nickname_claims` on [`PeerManager`]) — no re-sign, no re-grind.
 /// Design §5 — anti-entropy on the nickname-registry gossipsub topic.
 const NICKNAME_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(30);
+/// TD-40.1: one-shot early re-broadcast delay scheduled at claim time. The
+/// steady-state 30 s anti-entropy tick is too slow to cover QA's
+/// 30-40 s observation window when a race-claim arrives near the beginning
+/// of the window — the loser's convergence landed right at the buzzer.
+/// Five seconds is short enough that a peer who missed the initial publish
+/// (sparse gossipsub mesh, transient NAT churn) gets a second chance well
+/// inside the window, but long enough that the mesh has a chance to form
+/// after the original claim's `publish` call returned. Does not replace
+/// [`NICKNAME_ANTI_ENTROPY_INTERVAL`] — both fire independently.
+const NICKNAME_ANTI_ENTROPY_FIRST_DELAY: Duration = Duration::from_secs(5);
 /// TD-40: hard TTL on a cached own-claim before anti-entropy evicts it.
 /// Matches `DEFAULT_CLAIM_TTL_SECONDS` from `e2ee::nickname::consts`;
 /// kept as a local constant so the manager does not need to import
@@ -206,6 +216,14 @@ pub enum PeerCommand {
         nickname: String,
         response: oneshot::Sender<()>,
     },
+    /// TD-40.1: one-shot early re-broadcast of a freshly claimed nickname.
+    /// Enqueued by a spawned task scheduled at [`NICKNAME_ANTI_ENTROPY_FIRST_DELAY`]
+    /// after a successful `handle_publish_nickname_claim`. If the cache
+    /// entry for `nickname` has been evicted in the interim (tiebreak loss,
+    /// explicit release, TTL expiry), the handler skips — a losing claim
+    /// must not be resurrected. Not exposed via the FFI surface;
+    /// self-scheduled only.
+    EarlyNicknameRebroadcast { nickname: String },
     /// Shut the manager down gracefully.
     Shutdown,
 }
@@ -580,6 +598,12 @@ struct PendingDirectRequest {
 pub struct PeerManager {
     swarm: Swarm<NetworkBehaviour>,
     command_receiver: mpsc::Receiver<PeerCommand>,
+    /// TD-40.1: clone of the command channel sender used by self-scheduled
+    /// tasks (currently only the one-shot early anti-entropy re-broadcast
+    /// triggered at claim time) to re-enter the event loop as a regular
+    /// `PeerCommand`. Keeping a clone here avoids polluting the external
+    /// `PeerManagerHandle` surface — this is strictly an internal back-channel.
+    command_sender: mpsc::Sender<PeerCommand>,
     local_peer_id: PeerId,
     keypair: identity::Keypair,
     inbound_sender: MessageQueueSender,
@@ -812,6 +836,7 @@ impl PeerManager {
         let mut manager = Self {
             swarm,
             command_receiver,
+            command_sender: command_sender.clone(),
             local_peer_id,
             keypair,
             inbound_sender,
@@ -1028,6 +1053,10 @@ impl PeerManager {
                     );
                 }
                 let _ = response.send(());
+                Ok(false)
+            }
+            PeerCommand::EarlyNicknameRebroadcast { nickname } => {
+                self.handle_early_nickname_rebroadcast(nickname);
                 Ok(false)
             }
             PeerCommand::PutDhtRecord {
@@ -1512,6 +1541,45 @@ impl PeerManager {
                     first_seen_ts_at_observer = observer_now,
                     "TD-37: recorded own nickname claim in observation map before broadcast",
                 );
+                // TD-40.1: schedule a one-shot early anti-entropy re-broadcast
+                // at T+5 s. The steady-state 30 s tick covers long-running
+                // convergence, but QA's 30-40 s observation window can close
+                // before it fires if the race-claim arrives near the start.
+                // The spawned task is fire-and-forget — if the entry has
+                // been evicted by then (tiebreak loss, explicit release, TTL),
+                // `EarlyNicknameRebroadcast` simply no-ops. If the manager has
+                // shut down, `send` returns `Err` and the task exits quietly.
+                //
+                // `Handle::try_current()` guards against the sync-test call
+                // sites (unit tests drive `handle_publish_nickname_claim`
+                // directly without a tokio runtime). In production the
+                // manager always runs inside `tokio::spawn`, so the Some
+                // branch is always taken at runtime.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let scheduler_sender = self.command_sender.clone();
+                    let scheduled_nickname = nickname.clone();
+                    handle.spawn(async move {
+                        tokio::time::sleep(NICKNAME_ANTI_ENTROPY_FIRST_DELAY).await;
+                        if let Err(err) = scheduler_sender
+                            .send(PeerCommand::EarlyNicknameRebroadcast {
+                                nickname: scheduled_nickname,
+                            })
+                            .await
+                        {
+                            tracing::trace!(
+                                target: "peer",
+                                ?err,
+                                "TD-40.1: manager shut down before T+5 s early rebroadcast fired",
+                            );
+                        }
+                    });
+                } else {
+                    tracing::trace!(
+                        target: "peer",
+                        %nickname,
+                        "TD-40.1: no tokio runtime (test path) — skipping T+5 s scheduler",
+                    );
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -1536,6 +1604,64 @@ impl PeerManager {
                 target: "peer",
                 %err,
                 "TD-37: failed to publish own nickname claim on registry topic",
+            ),
+        }
+    }
+
+    /// TD-40.1: one-shot early re-broadcast handler fired at
+    /// [`NICKNAME_ANTI_ENTROPY_FIRST_DELAY`] after `cabi_nickname_claim`
+    /// succeeds. Reuses the cached signed+PoW'd bytes (same invariant as the
+    /// steady-state 30 s tick) — no re-sign, no re-grind. Skips if the cache
+    /// entry was evicted between claim time and now (tiebreak loss, explicit
+    /// release, TTL expiry) to avoid resurrecting a losing claim. Does NOT
+    /// touch the cache itself on success; the steady-state tick continues
+    /// from its own schedule.
+    fn handle_early_nickname_rebroadcast(&mut self, nickname: String) {
+        let Some(entry) = self.own_nickname_claims.get(&nickname) else {
+            tracing::trace!(
+                target: "peer",
+                %nickname,
+                "TD-40.1: early anti-entropy rebroadcast skipped — entry evicted before T+5 s fired",
+            );
+            return;
+        };
+        // Defensive TTL check. The steady-state tick expires the entry on
+        // its own cadence; at T+5 s after claim this check is effectively
+        // always a pass, but guarding it keeps the semantics identical to
+        // `handle_nickname_anti_entropy_tick` if a contributor ever calls
+        // this handler from a non-claim-scheduled site.
+        let now = now_unix_seconds();
+        if now
+            > entry
+                .claim
+                .claim_ts
+                .saturating_add(NICKNAME_CLAIM_TTL_SECONDS)
+        {
+            tracing::debug!(
+                target: "peer",
+                %nickname,
+                "TD-40.1: early anti-entropy rebroadcast skipped — entry past TTL",
+            );
+            return;
+        }
+        let bytes = entry.encoded.clone();
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.nickname_registry_topic.clone(), bytes)
+        {
+            Ok(_) => tracing::debug!(
+                target: "peer",
+                %nickname,
+                "TD-40.1: early anti-entropy rebroadcast nickname={}",
+                nickname,
+            ),
+            Err(err) => tracing::warn!(
+                target: "peer",
+                %nickname,
+                %err,
+                "TD-40.1: early anti-entropy rebroadcast failed (gossipsub publish error); steady-state tick will retry",
             ),
         }
     }
@@ -4999,6 +5125,78 @@ mod nickname_registry_tests {
         assert!(
             manager.own_nickname_claims.contains_key("fresh_nick"),
             "fresh claim must survive TTL check and remain in cache",
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // TD-40.1 · early one-shot anti-entropy re-broadcast tests.
+    //
+    // The spawned T+5 s scheduler is driven indirectly via the
+    // `EarlyNicknameRebroadcast` command handler. These tests assert on
+    // the handler's observable contract: cache left unchanged on a fresh
+    // entry, and eviction-race handling (handler no-ops rather than
+    // resurrecting a losing claim).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn td40_early_first_rebroadcast() {
+        // Simulate claim success → fast-forward 5 s → trigger the early
+        // rebroadcast path. Cache entry must be unchanged, and the handler
+        // must read the exact bytes the publish path would have read
+        // (proven by the cache-entry equality AFTER the handler runs).
+        let (mut manager, _events) = build_manager_with_queue([143u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (encoded, _peer, _dir) = build_owned_claim("alice_td40_1", claim_ts);
+
+        manager.handle_publish_nickname_claim(encoded.clone());
+        let before = manager
+            .own_nickname_claims
+            .get("alice_td40_1")
+            .expect("cache populated on publish")
+            .encoded
+            .clone();
+        assert_eq!(
+            before, encoded,
+            "cached bytes must equal the published payload verbatim",
+        );
+
+        // Directly invoke the handler the T+5 s scheduler would have
+        // enqueued. Bypasses sleep so the test is deterministic.
+        manager.handle_early_nickname_rebroadcast("alice_td40_1".to_string());
+
+        // Cache must be unchanged — early rebroadcast must not mutate,
+        // resign, or re-grind PoW on the cached entry.
+        let after = manager
+            .own_nickname_claims
+            .get("alice_td40_1")
+            .expect("cache survives early rebroadcast")
+            .encoded
+            .clone();
+        assert_eq!(
+            after, encoded,
+            "early rebroadcast must not mutate cached bytes (byte-identity — no re-sign / no re-grind)",
+        );
+        assert_eq!(
+            before, after,
+            "cache must be byte-identical before and after early rebroadcast",
+        );
+
+        // Eviction-race: simulate the Layer B revoke happening between
+        // claim and the T+5 s handler firing. The handler must NOT
+        // resurrect a losing claim.
+        manager.own_nickname_claims.remove("alice_td40_1");
+        manager.handle_early_nickname_rebroadcast("alice_td40_1".to_string());
+        assert!(
+            !manager.own_nickname_claims.contains_key("alice_td40_1"),
+            "early rebroadcast must not resurrect a losing claim — cache stays empty",
+        );
+
+        // And the handler must also cleanly no-op for a nickname that was
+        // never cached in the first place (defensive path).
+        manager.handle_early_nickname_rebroadcast("never_existed".to_string());
+        assert!(
+            !manager.own_nickname_claims.contains_key("never_existed"),
+            "early rebroadcast for an unknown nickname is a no-op",
         );
     }
 }
