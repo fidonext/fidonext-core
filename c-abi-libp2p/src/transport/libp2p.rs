@@ -37,7 +37,18 @@ pub struct NetworkBehaviour {
     /// Gossipsub for simple message propagation
     pub gossipsub: gossipsub::Behaviour,
     /// Relay client for connecting through hop relays.
-    pub relay_client: relay::client::Behaviour,
+    ///
+    /// TD-47: gated behind `TransportConfig.enable_relay_client` and
+    /// wrapped in [`Toggle`] so VPN / MTU-anomaly callers can disable the
+    /// client-side `NetworkBehaviour` half to avoid the TD-46 multiaddr
+    /// SIGSEGV in `libp2p-relay`'s
+    /// `handle_established_outbound_connection`. The relay *transport*
+    /// stays in the stack unconditionally, so `/p2p-circuit` multiaddrs
+    /// can still be dialed as plain dials; only the behaviour half is
+    /// optional. Default is still `Some(..)` — the flag flips off only
+    /// when the Android caller detects amnezia-style VPN and calls
+    /// `cabi_transport_set_enable_relay_client(0)` before `cabi_node_new`.
+    pub relay_client: Toggle<relay::client::Behaviour>,
     /// Optional relay server (hop) behaviour for acting as a public relay.
     pub relay_server: Toggle<relay::Behaviour>,
     /// Optional Rendezvous client for asking for a catalog of peers
@@ -212,6 +223,21 @@ pub struct TransportConfig {
     pub hop_relay: bool,
     /// Controls whether rendezvous behaviours are enabled.
     pub enable_rendezvous: bool,
+    /// TD-47 / TD-51 (NIM-89, NIM-93): when `true` the composite
+    /// [`NetworkBehaviour`] composes a functional
+    /// `relay::client::Behaviour` wrapped in `Toggle<Some(..)>` AND the
+    /// relay *transport* half is composed into the swarm transport.
+    /// When `false`, NEITHER is built: `relay::client::new(..)` is not
+    /// called at all, no `relay::client::Behaviour` is constructed, and
+    /// no relay transport is composed — so the swarm's
+    /// `handle_established_outbound_connection` never even reaches the
+    /// relay-client code path. This fully removes the TD-46 multiaddr
+    /// SIGSEGV (the crashing code is not in the composite). Default is
+    /// `false` for v0.0.7, forced-off pending TD-52 (NIM-94) upstream
+    /// fix. Hosts that want relay-client back can call
+    /// `cabi_transport_set_enable_relay_client(1)` before `cabi_node_new`
+    /// — expect TD-46-class crash on arm64 until TD-52 lands.
+    pub enable_relay_client: bool,
     /// Optional seed for deriving an exact Ed25519 identity keypair.
     pub identity_seed: Option<[u8; 32]>,
 }
@@ -219,11 +245,12 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            use_quic: false,          // Turn on for quic
-            use_websocket: false,     // Turn on for ws transport (wss via reverse-proxy)
-            hop_relay: false,         // Turn on for node act as relay (at least try)
-            enable_rendezvous: false, // FEATURE NOT USED. Turn on for rendezvous client/server
-            identity_seed: None,      // Pass to use identity seed for generating keypair
+            use_quic: false,            // Turn on for quic
+            use_websocket: false,       // Turn on for ws transport (wss via reverse-proxy)
+            hop_relay: false,           // Turn on for node act as relay (at least try)
+            enable_rendezvous: false,   // FEATURE NOT USED. Turn on for rendezvous client/server
+            enable_relay_client: false, // TD-51 (NIM-93): v0.0.7 forced-off; TD-52 (NIM-94) upstream fix will re-enable.
+            identity_seed: None,        // Pass to use identity seed for generating keypair
         }
     }
 }
@@ -281,10 +308,20 @@ impl TransportConfig {
         Ok((keypair, swarm))
     }
 
-    /// Constructs the composite network behaviour using the supplied keypair
+    /// Constructs the composite network behaviour using the supplied keypair.
+    ///
+    /// TD-51 (NIM-93): `relay_client` is now an `Option<..>` produced by
+    /// [`Self::build_transport`] — it is `Some(..)` only when the caller
+    /// left `enable_relay_client = true` AND the transport half was
+    /// actually built. When `None`, the composite installs
+    /// `Toggle::from(None)` in the relay_client slot and no
+    /// `relay::client::Behaviour` is ever constructed. This fully
+    /// removes the TD-46 crash path: the crashing code
+    /// (`priv_client::handler::Handler::handle_established_outbound_connection`)
+    /// is not in the composite at all when relay-client is off.
     fn build_behaviour(
         keypair: &identity::Keypair,
-        relay_client: relay::client::Behaviour,
+        relay_client: Option<relay::client::Behaviour>,
         hop_relay: bool,
         enable_rendezvous: bool,
     ) -> NetworkBehaviour {
@@ -311,6 +348,30 @@ impl TransportConfig {
         // to an adaptive value; libp2p's default K=20 assumes a large public
         // DHT that we are not (yet) running.
         kad_config.set_replication_factor(NonZeroUsize::new(3).expect("3 != 0"));
+        // TD-53 R4.1 (security-crypto-engineer CHANGES_REQUESTED follow-up,
+        // 2026-04-22): globally disable Kademlia's periodic `PutRecordJob`
+        // Replicate cycle. Default (3600 s, `lib.rs:229` in libp2p-kad 0.48)
+        // would cause every locally-cached nickname claim
+        // (`nickname_registry_tests::td53_*`) to be re-announced from our
+        // peer_id every hour — which `publisher: None` alone does NOT
+        // suppress (only filters `is_publisher && !publish` in
+        // `jobs.rs:212-218`). Result would be a DHT-visible "interested in
+        // nickname X" signal from every observer, expanding relay-operator
+        // metadata surface beyond what gossipsub already leaks.
+        //
+        // Safe to disable globally because all DHT record publication in
+        // this crate goes through explicit application-layer paths:
+        //   * TD-18 periodic profile / nickname re-announce → manual
+        //     `dht_put_record` on the tick loop.
+        //   * TD-37 / TD-40 nickname claims → `cabi_nickname_claim` →
+        //     `dht_put_record` + gossipsub anti-entropy.
+        //   * Host-driven DHT puts → `cabi_node_dht_put_record`.
+        // None rely on Kademlia's built-in Replicate job.
+        //
+        // Regression-guarded by the
+        // `td53_cached_winner_does_not_emit_put_record_query` unit test in
+        // `peer::manager::nickname_registry_tests`.
+        kad_config.set_replication_interval(None);
         let store = MemoryStore::new(peer_id);
 
         let ping_config = ping::Config::new();
@@ -386,6 +447,14 @@ impl TransportConfig {
             request_response::Config::default().with_request_timeout(Duration::from_secs(8)),
         );
 
+        // TD-51 (NIM-93): `relay_client` was only built in
+        // `build_transport` when the caller left `enable_relay_client =
+        // true`. When it arrives as `None`, we install `Toggle::from(None)`
+        // and no `relay::client::Behaviour` is present in the composite
+        // — the TD-46 crash site cannot be reached because the crashing
+        // code is not in the swarm's handler tower.
+        let relay_client = Toggle::from(relay_client);
+
         NetworkBehaviour {
             kademlia,
             ping: ping::Behaviour::new(ping_config),
@@ -402,12 +471,25 @@ impl TransportConfig {
         }
     }
 
-    /// Builds the transport stack using TCP and optionally QUIC and Relay
+    /// Builds the transport stack using TCP and optionally QUIC, WebSocket
+    /// and Relay.
+    ///
+    /// TD-51 (NIM-93): when `self.enable_relay_client == false` the relay
+    /// transport half is NOT built — `relay::client::new(local_peer_id)`
+    /// is never called, no `relay::client::Behaviour` is constructed, and
+    /// the returned transport collapses to just TCP (+ QUIC / WebSocket
+    /// as configured). This is v0.0.7's TD-46 mitigation: the crashing
+    /// code (`priv_client::handler::Handler`) is simply not in the
+    /// composite. Returns `None` in the relay-client slot in that case;
+    /// [`Self::build_behaviour`] installs `Toggle::from(None)` to match.
     fn build_transport(
         &self,
         keypair: &identity::Keypair,
         local_peer_id: PeerId,
-    ) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
+    ) -> Result<(
+        Boxed<(PeerId, StreamMuxerBox)>,
+        Option<relay::client::Behaviour>,
+    )> {
         let noise_config = noise::Config::new(keypair)
             .map_err(|err| anyhow!("failed to create noise config: {err}"))?;
 
@@ -435,18 +517,25 @@ impl TransportConfig {
                 .boxed();
         }
 
-        let (relay_transport, relay_client) =
-            Self::build_relay_transport(noise_config.clone(), local_peer_id);
+        if self.enable_relay_client {
+            let (relay_transport, relay_client) =
+                Self::build_relay_transport(noise_config.clone(), local_peer_id);
 
-        Ok((
-            relay_transport
-                .or_transport(base_transport)
-                .map(|either, _| match either {
-                    Either::Left(output) | Either::Right(output) => output,
-                })
-                .boxed(),
-            relay_client,
-        ))
+            Ok((
+                relay_transport
+                    .or_transport(base_transport)
+                    .map(|either, _| match either {
+                        Either::Left(output) | Either::Right(output) => output,
+                    })
+                    .boxed(),
+                Some(relay_client),
+            ))
+        } else {
+            // TD-51 (NIM-93): relay-client disabled — do NOT call
+            // `relay::client::new(local_peer_id)`. The swarm transport
+            // is just the base transport; no `/p2p-circuit` dials.
+            Ok((base_transport, None))
+        }
     }
 
     /// Configures TCP with Noise authentication and Yamux multiplexing
@@ -494,5 +583,48 @@ impl TransportConfig {
             .boxed();
 
         (relay_transport, relay_client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportConfig;
+
+    /// TD-51 (NIM-93): v0.0.7 default flipped OFF. Every caller that
+    /// does not explicitly opt back in via
+    /// `cabi_transport_set_enable_relay_client(1)` gets a composite with
+    /// no `relay::client::Behaviour` and no relay transport half,
+    /// which is the v0.0.7 TD-46 mitigation.
+    #[test]
+    fn transport_config_default_disables_relay_client() {
+        assert!(!TransportConfig::default().enable_relay_client);
+    }
+
+    /// TD-47 / TD-51: default path — relay-client disabled. build()
+    /// must succeed and the composite `NetworkBehaviour` must type-check
+    /// with `Toggle::from(None)` in the relay_client slot; the relay
+    /// transport half is skipped entirely (`relay::client::new(..)` is
+    /// never called).
+    #[test]
+    fn transport_config_builds_with_relay_client_disabled() {
+        let cfg = TransportConfig {
+            enable_relay_client: false,
+            ..TransportConfig::default()
+        };
+        let (_keypair, _swarm) = cfg.build().expect("swarm builds with relay-client off");
+    }
+
+    /// TD-47: opt-in path locked in — callers that explicitly set
+    /// `enable_relay_client = true` still get a working composite with
+    /// the relay-client behaviour and transport composed. Under v0.0.7
+    /// these callers may hit the TD-46 crash on arm64; see NIM-88.
+    #[test]
+    fn transport_config_builds_with_relay_client_enabled() {
+        let cfg = TransportConfig {
+            enable_relay_client: true,
+            ..TransportConfig::default()
+        };
+        assert!(cfg.enable_relay_client);
+        let (_keypair, _swarm) = cfg.build().expect("swarm builds with relay-client on");
     }
 }

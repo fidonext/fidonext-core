@@ -54,7 +54,8 @@ impl PersistentMailboxStore {
             return Ok(MailboxStoreInsertOutcome::Duplicate);
         }
 
-        let serialized = serde_json::to_vec(envelope).context("failed to serialize mailbox envelope")?;
+        let serialized =
+            serde_json::to_vec(envelope).context("failed to serialize mailbox envelope")?;
         let (count, bytes) = self.recipient_usage(recipient_peer_id)?;
         if count >= limits.max_messages_per_recipient
             || bytes.saturating_add(serialized.len()) > limits.max_bytes_per_recipient
@@ -62,7 +63,11 @@ impl PersistentMailboxStore {
             return Ok(MailboxStoreInsertOutcome::QuotaExceeded);
         }
 
-        let msg_key = msg_key(recipient_peer_id, envelope.created_at_unix, &envelope.envelope_id);
+        let msg_key = msg_key(
+            recipient_peer_id,
+            envelope.created_at_unix,
+            &envelope.envelope_id,
+        );
         self.db.insert(&msg_key, serialized)?;
         self.db.insert(&idx_key, msg_key.as_bytes())?;
         Ok(MailboxStoreInsertOutcome::Stored)

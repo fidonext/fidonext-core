@@ -772,6 +772,22 @@ pub struct PeerManager {
     self_profile_record_key: Option<Vec<u8>>,
     self_profile_record_bytes: Option<Vec<u8>>,
     self_profile_record_ttl_seconds: u64,
+    /// TD-48 (NIM-90): mirrors `TransportConfig.enable_relay_client`.
+    /// When `false`, `build_behaviour` composed the relay-client half as
+    /// `Toggle::from(None)` and dropped the `relay::client::Behaviour`
+    /// value — which severs the private mpsc that binds the relay
+    /// Transport to the Behaviour. In that state, calling
+    /// `self.swarm.listen_on(.../p2p-circuit)` (or any other reservation
+    /// entry point into the relay-client code path) panics inside
+    /// `libp2p-relay`'s `priv_client` Transport on the next poll,
+    /// unwinding `run()` and killing the event loop silently
+    /// (JoinError::Panic is not captured by our
+    /// `if let Err(err) = manager.run().await` arm). Symptom: every
+    /// FFI command returns `peer manager command channel closed`
+    /// because the `Receiver<PeerCommand>` dies with the task. Honoured
+    /// by `maybe_auto_reserve_relay` and `PeerCommand::ReserveRelay`.
+    /// See `docs/td48-channel-closed-triage-2026-04-22.md`.
+    relay_client_enabled: bool,
 }
 
 /// TD-37: per-nickname observation. Records the CBOR bytes and the
@@ -947,6 +963,7 @@ impl PeerManager {
             self_profile_record_key: None,
             self_profile_record_bytes: None,
             self_profile_record_ttl_seconds: 0,
+            relay_client_enabled: config.enable_relay_client,
         };
 
         manager.add_bootstrap_peers(bootstrap_peers);
@@ -1033,6 +1050,18 @@ impl PeerManager {
                 Ok(false)
             }
             PeerCommand::ReserveRelay(address) => {
+                if !self.relay_client_enabled {
+                    // TD-48: symmetric guard with maybe_auto_reserve_relay.
+                    // Explicit callers (the relay bin, or any future host
+                    // that wires ReserveRelay) must not be able to crash
+                    // the event loop in relay-client-disabled mode.
+                    tracing::warn!(
+                        target: "peer",
+                        %address,
+                        "TD-48: ignoring explicit ReserveRelay (relay-client disabled via cabi_transport_set_enable_relay_client)",
+                    );
+                    return Ok(false);
+                }
                 self.start_relay_reservation(address, "explicit-command");
                 Ok(false)
             }
@@ -1622,85 +1651,8 @@ impl PeerManager {
         // branch. `observer_now` = wall-clock seconds, matches what peers
         // will stamp when they first see our claim.
         let observer_now = now_unix_seconds();
-        match validate_claim(payload.as_slice(), observer_now) {
-            Ok(claim) => {
-                let nickname = claim.nickname.clone();
-                // If we already have an older observation for this
-                // nickname under a different peer_id, the local node has
-                // already lost and will have received an
-                // `OwnershipRevoked` event. Publishing here anyway keeps
-                // the network-level retry simple — the remote tiebreak
-                // winner stays authoritative.
-                let entry = NicknameObservation {
-                    claim: claim.clone(),
-                    encoded: payload.clone(),
-                    first_seen_ts_at_observer: observer_now,
-                };
-                self.nickname_observations
-                    .entry(nickname.clone())
-                    .or_insert(entry);
-                // TD-40: also cache under `own_nickname_claims` so the
-                // periodic anti-entropy tick can re-broadcast the exact
-                // same bytes without re-signing / re-grinding PoW. Every
-                // successful publish refreshes the cache (e.g. after a
-                // revision bump the latest bytes are what gets re-broadcast).
-                // TD-42: stash the profile_path so a subsequent Layer-B
-                // tiebreak loss can build a signed vacate tombstone
-                // without re-asking the FFI host for the path.
-                self.own_nickname_claims.insert(
-                    nickname.clone(),
-                    OwnClaimCacheEntry {
-                        claim,
-                        encoded: payload.clone(),
-                        profile_path,
-                    },
-                );
-                tracing::debug!(
-                    target: "peer",
-                    %nickname,
-                    first_seen_ts_at_observer = observer_now,
-                    "TD-37: recorded own nickname claim in observation map before broadcast",
-                );
-                // TD-40.1: schedule a one-shot early anti-entropy re-broadcast
-                // at T+5 s. The steady-state 30 s tick covers long-running
-                // convergence, but QA's 30-40 s observation window can close
-                // before it fires if the race-claim arrives near the start.
-                // The spawned task is fire-and-forget — if the entry has
-                // been evicted by then (tiebreak loss, explicit release, TTL),
-                // `EarlyNicknameRebroadcast` simply no-ops. If the manager has
-                // shut down, `send` returns `Err` and the task exits quietly.
-                //
-                // `Handle::try_current()` guards against the sync-test call
-                // sites (unit tests drive `handle_publish_nickname_claim`
-                // directly without a tokio runtime). In production the
-                // manager always runs inside `tokio::spawn`, so the Some
-                // branch is always taken at runtime.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let scheduler_sender = self.command_sender.clone();
-                    let scheduled_nickname = nickname.clone();
-                    handle.spawn(async move {
-                        tokio::time::sleep(NICKNAME_ANTI_ENTROPY_FIRST_DELAY).await;
-                        if let Err(err) = scheduler_sender
-                            .send(PeerCommand::EarlyNicknameRebroadcast {
-                                nickname: scheduled_nickname,
-                            })
-                            .await
-                        {
-                            tracing::trace!(
-                                target: "peer",
-                                ?err,
-                                "TD-40.1: manager shut down before T+5 s early rebroadcast fired",
-                            );
-                        }
-                    });
-                } else {
-                    tracing::trace!(
-                        target: "peer",
-                        %nickname,
-                        "TD-40.1: no tokio runtime (test path) — skipping T+5 s scheduler",
-                    );
-                }
-            }
+        let claim = match validate_claim(payload.as_slice(), observer_now) {
+            Ok(claim) => claim,
             Err(err) => {
                 tracing::warn!(
                     target: "peer",
@@ -1709,7 +1661,281 @@ impl PeerManager {
                 );
                 return;
             }
+        };
+
+        let nickname = claim.nickname.clone();
+        let own_peer_id = claim.peer_id;
+
+        // TD-45: apply the design-§5 tiebreak against any pre-existing
+        // observation BEFORE we record our own claim. Prior to TD-45 this
+        // branch used `entry(...).or_insert(...)` which silently no-op'd
+        // when a competing peer's claim had raced into our observation
+        // map while we were still grinding PoW. Result: our own publish
+        // continued blindly, our `own_nickname_claims` cache kept
+        // re-broadcasting a losing claim, our local Kademlia store kept
+        // serving the losing record to `cabi_nickname_resolve`, and the
+        // host UX never got `OwnershipRevoked`. QA ship-gate3 (2026-04-22)
+        // hit this: device a06 saw kunzite's gossipsub claim ~0.8 s
+        // before its own PoW finished, published anyway, and then
+        // resolved `race_v07_gate3` to itself.
+        // See `fidonext_android/qa-artifacts/2026-04-22T2250Z-ship-gate3/`.
+        //
+        // Tiebreak predicate is a pure reuse of the handler-side one:
+        // `first_seen_ts_at_observer` primary (design §5 adversary-resistant
+        // key), `sha256(peer_id)` secondary. `observer_now` is the
+        // publish-time local clock for our newly built claim, mirroring
+        // how `handle_nickname_registry_message` stamps incoming claims.
+        // security-crypto-engineer verdict 2026-04-22 Q1: using
+        // `observer_now` here is correct; do NOT substitute
+        // `claim.claim_ts` or any other envelope field.
+        //
+        // On a tiebreak loss we REFUSE TO BROADCAST (the losing bytes
+        // contribute no information the honest network needs and we want
+        // to reduce gossipsub traffic on the loser side), scrub the
+        // losing bytes out of the anti-entropy cache, evict our local
+        // Kademlia replica, and emit `OwnershipRevoked` so the host
+        // flips its UX. Cleanup steps mirror the handler-side TD-44
+        // loss path at lines ~2005-2033:
+        //   1) `own_nickname_claims.remove(&nickname)` — idempotent
+        //      (security-crypto-engineer condition 2).
+        //   2) `kademlia.store_mut().remove(&RecordKey::new(&key))` —
+        //      unconditional store-level remove
+        //      (security-crypto-engineer conditions 1 + 2). The
+        //      `cabi_nickname_claim` FFI path runs `dht_put_record`
+        //      BEFORE calling into this handler (see lib.rs ~1805), so
+        //      the losing record is guaranteed in our local store even
+        //      in the loss branch. We use the store-level remove
+        //      rather than the behaviour-level `remove_record` because
+        //      `remove_record` is publisher-gated and test harnesses
+        //      inject records without a publisher field; identical
+        //      rationale to the TD-44 handler comment at lines
+        //      ~2013-2021.
+        //   3) `emit_nickname_ownership_revoked(nickname)` LAST
+        //      (security-crypto-engineer condition 3): the host treats
+        //      the event as a "cache-clean" signal; violating the
+        //      evict-then-emit ordering breaks `cabi_nickname_release`
+        //      idempotency.
+        //
+        // We deliberately do NOT publish a vacate tombstone here. TD-44
+        // reverted auto-tombstone emission because a tombstone at
+        // `revision + 1` beat the winner's claim at the same Kademlia
+        // key under revision-LWW, turning resolves into `SchemaReject`.
+        // security-crypto-engineer 2026-04-22 Q3: losing bytes that
+        // already escaped onto the wire are benign under §13.D; winner's
+        // TD-40 anti-entropy + periodic DHT re-announce converges
+        // remote replicas without our help. DO NOT RE-ADD a vacate
+        // broadcast here — you will reintroduce the TD-44 revision-LWW
+        // pathology. See the TD-44 branch in
+        // `handle_nickname_registry_message` + the ship-gate fail at
+        // `qa-artifacts/2026-04-21T2222Z-ship-v007/` for the failure mode.
+        if let Some(existing) = self.nickname_observations.get(&nickname).cloned() {
+            if existing.claim.peer_id != own_peer_id {
+                let existing_wins = tiebreak_winner(
+                    existing.first_seen_ts_at_observer,
+                    &existing.claim.peer_id,
+                    observer_now,
+                    &own_peer_id,
+                );
+                if existing_wins {
+                    tracing::warn!(
+                        target: "peer",
+                        %nickname,
+                        winner_peer = %existing.claim.peer_id,
+                        local_peer = %own_peer_id,
+                        existing_first_seen_ts = existing.first_seen_ts_at_observer,
+                        own_observer_now = observer_now,
+                        "TD-45: own publish lost tiebreak against pre-observed competing claim; suppressing broadcast and emitting OwnershipRevoked",
+                    );
+                    // (1) anti-entropy cache — idempotent remove.
+                    self.own_nickname_claims.remove(&nickname);
+                    // (2) local Kademlia record — unconditional store-level
+                    //     remove of OUR losing bytes, followed by (2b) an
+                    //     unconditional store-level PUT of the WINNER's bytes
+                    //     under the same hashed nickname key.
+                    //
+                    // TD-53: pre-TD-53 the loss branch only scrubbed our
+                    // losing record and left the local Kademlia store empty
+                    // at this key. `cabi_nickname_resolve` reads from
+                    // `kademlia.store_mut().get(...)` via the local-first
+                    // fast path in `handle_dht_get_record` and therefore
+                    // returned `NICK_NOT_FOUND=6` for the loser — see the
+                    // ship-gate9 fail at
+                    // `fidonext_android/qa-artifacts/2026-04-22T1950Z-ship-gate9/`,
+                    // device A resolving `race_g9_18c7` = status 6 at
+                    // T+5/+46/+296 s while the winning observation was
+                    // sitting in `nickname_observations` the whole time.
+                    // We now mirror the winner's signed claim bytes from
+                    // the observation map into the local Kademlia store so
+                    // the resolve-consistency invariant ("resolve answers
+                    // from the winning bytes the observation map holds")
+                    // becomes a store-level property.
+                    //
+                    // Field choices (security-crypto-engineer TD-53 review,
+                    // APPROVE-WITH-CONDITIONS R1/R2/R3):
+                    //
+                    // - `publisher: None` (R2). Important: `publisher: None`
+                    //   by itself does NOT suppress Kademlia's periodic
+                    //   `PutRecordJob` Replicate cycle — per
+                    //   libp2p-kad 0.48's `jobs.rs:212-218`, only records
+                    //   where `is_publisher && !publish` are filtered out,
+                    //   so `None` records WOULD be auto-republished every
+                    //   `record_replication_interval` (default 3600 s) if
+                    //   the job were enabled. The actual suppression lives
+                    //   in `transport/libp2p.rs` where TD-53 R4.1 calls
+                    //   `kad_config.set_replication_interval(None)` to
+                    //   disable the job globally. `publisher: None` here
+                    //   remains correct because we are not the originator
+                    //   and must not take over republish responsibility —
+                    //   see the security-crypto-engineer 2026-04-22 verdict
+                    //   for the metadata-leak rationale (Q2/Q3).
+                    //
+                    // - `expires: None` (R1). Claim freshness is bounded at
+                    //   the validator layer — `validate_claim` enforces
+                    //   `STALE_REPLAY_REJECT_SECONDS = 24 h` on read, and the
+                    //   encoded claim carries `valid_until` (default
+                    //   `DEFAULT_CLAIM_TTL_SECONDS = 30 d`). Duplicating the
+                    //   TTL at the Kademlia layer would cause drift and
+                    //   non-monotonic resolves. A subsequent observation of
+                    //   a fresher same-owner claim (revision bump) or a
+                    //   vacate tombstone overwrites this entry via
+                    //   `handle_nickname_registry_message`.
+                    //
+                    // - `value: existing.encoded.clone()` (R1). These are the
+                    //   winner's signed + PoW-valid + replay-gated bytes we
+                    //   already admitted to the observation map via
+                    //   `validate_claim`. No additional verification is
+                    //   required at the Kademlia boundary.
+                    //
+                    // Local-only invariant (R3): we use the store-level
+                    // `put`, not `kademlia.put_record(...)`. The former is
+                    // a local write; the latter would initiate a DHT
+                    // PUT_VALUE query and leak us as a replica source.
+                    let key = claim_dht_key(&nickname);
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .remove(&kad::RecordKey::new(&key));
+                    let winner_record = kad::Record {
+                        key: kad::RecordKey::new(&key),
+                        value: existing.encoded.clone(),
+                        publisher: None,
+                        expires: None,
+                    };
+                    if let Err(err) = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .put(winner_record)
+                    {
+                        tracing::warn!(
+                            target: "peer",
+                            %nickname,
+                            %err,
+                            "TD-53: failed to seed local Kademlia store with winner record after publish-time tiebreak loss; cabi_nickname_resolve may return NOT_FOUND until next inbound observation",
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "peer",
+                            %nickname,
+                            winner_peer = %existing.claim.peer_id,
+                            "TD-53: seeded local Kademlia store with winner claim bytes after publish-time tiebreak loss",
+                        );
+                    }
+                    // (3) host event, emitted last.
+                    self.emit_nickname_ownership_revoked(nickname);
+                    return;
+                }
+                tracing::debug!(
+                    target: "peer",
+                    %nickname,
+                    loser_peer = %existing.claim.peer_id,
+                    local_peer = %own_peer_id,
+                    "TD-45: own publish wins tiebreak over pre-observed competing claim; overwriting observation",
+                );
+            }
         }
+
+        // Win (or no competitor): insert unconditionally. The pre-check
+        // above has either (a) returned early on a loss, (b) logged a
+        // win that needs to displace the loser's observation, or
+        // (c) confirmed no competitor was present. All three surviving
+        // cases want our own bytes in the map.
+        let entry = NicknameObservation {
+            claim: claim.clone(),
+            encoded: payload.clone(),
+            first_seen_ts_at_observer: observer_now,
+        };
+        self.nickname_observations.insert(nickname.clone(), entry);
+        // TD-40: also cache under `own_nickname_claims` so the
+        // periodic anti-entropy tick can re-broadcast the exact
+        // same bytes without re-signing / re-grinding PoW. Every
+        // successful publish refreshes the cache (e.g. after a
+        // revision bump the latest bytes are what gets re-broadcast).
+        // TD-42: stash the profile_path so a subsequent Layer-B
+        // tiebreak loss can build a signed vacate tombstone
+        // without re-asking the FFI host for the path.
+        self.own_nickname_claims.insert(
+            nickname.clone(),
+            OwnClaimCacheEntry {
+                claim,
+                encoded: payload.clone(),
+                profile_path,
+            },
+        );
+        tracing::debug!(
+            target: "peer",
+            %nickname,
+            first_seen_ts_at_observer = observer_now,
+            "TD-37: recorded own nickname claim in observation map before broadcast",
+        );
+        // TD-40.1: schedule a one-shot early anti-entropy re-broadcast
+        // at T+5 s. The steady-state 30 s tick covers long-running
+        // convergence, but QA's 30-40 s observation window can close
+        // before it fires if the race-claim arrives near the start.
+        // The spawned task is fire-and-forget — if the entry has
+        // been evicted by then (explicit release, TTL), the
+        // `EarlyNicknameRebroadcast` handler simply no-ops. If the
+        // manager has shut down, `send` returns `Err` and the task
+        // exits quietly.
+        //
+        // `Handle::try_current()` guards against the sync-test call
+        // sites (unit tests drive `handle_publish_nickname_claim`
+        // directly without a tokio runtime). In production the
+        // manager always runs inside `tokio::spawn`, so the Some
+        // branch is always taken at runtime.
+        //
+        // TD-45 security-crypto-engineer condition 6: this scheduler
+        // now lives INSIDE the win branch only. A tiebreak loss returns
+        // above before we reach here, so we never schedule a T+5 s
+        // rebroadcast of a losing claim.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let scheduler_sender = self.command_sender.clone();
+            let scheduled_nickname = nickname.clone();
+            handle.spawn(async move {
+                tokio::time::sleep(NICKNAME_ANTI_ENTROPY_FIRST_DELAY).await;
+                if let Err(err) = scheduler_sender
+                    .send(PeerCommand::EarlyNicknameRebroadcast {
+                        nickname: scheduled_nickname,
+                    })
+                    .await
+                {
+                    tracing::trace!(
+                        target: "peer",
+                        ?err,
+                        "TD-40.1: manager shut down before T+5 s early rebroadcast fired",
+                    );
+                }
+            });
+        } else {
+            tracing::trace!(
+                target: "peer",
+                %nickname,
+                "TD-40.1: no tokio runtime (test path) — skipping T+5 s scheduler",
+            );
+        }
+
         match self
             .swarm
             .behaviour_mut()
@@ -1911,12 +2137,42 @@ impl PeerManager {
                 // claim/encoded bytes so a subsequent re-broadcast carries
                 // the newer revision.
                 if incoming.revision > existing.claim.revision {
+                    let refreshed_bytes = bytes.clone();
+                    let refreshed_nickname = nickname.clone();
                     let refreshed = NicknameObservation {
                         claim: incoming,
                         encoded: bytes,
                         first_seen_ts_at_observer: existing.first_seen_ts_at_observer,
                     };
                     self.nickname_observations.insert(nickname, refreshed);
+                    // TD-53: refresh the local Kademlia store so that a
+                    // `cabi_nickname_resolve` on the same hashed nickname
+                    // key returns the NEW (higher-revision) bytes rather
+                    // than whatever was previously cached. `publisher:
+                    // None` / `expires: None` — see TD-53 rationale in
+                    // `handle_publish_nickname_claim`. Overwriting is
+                    // explicit remove + put so the pair is symmetric
+                    // across all accept paths.
+                    let key = claim_dht_key(&refreshed_nickname);
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .remove(&kad::RecordKey::new(&key));
+                    let record = kad::Record {
+                        key: kad::RecordKey::new(&key),
+                        value: refreshed_bytes,
+                        publisher: None,
+                        expires: None,
+                    };
+                    if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                        tracing::warn!(
+                            target: "peer",
+                            nickname = %refreshed_nickname,
+                            %err,
+                            "TD-53: failed to refresh local Kademlia store with higher-revision claim; resolveNickname may return stale bytes until next observation",
+                        );
+                    }
                 }
                 return;
             }
@@ -1950,6 +2206,7 @@ impl PeerManager {
             // publish a vacate tombstone so the stale DHT record gets
             // cleared.
             let we_lost_our_own = existing.claim.peer_id == self.local_peer_id;
+            let winner_bytes_for_store = bytes.clone();
             self.nickname_observations.insert(
                 nickname.clone(),
                 NicknameObservation {
@@ -1958,6 +2215,45 @@ impl PeerManager {
                     first_seen_ts_at_observer: observer_now,
                 },
             );
+            // TD-53: unconditionally mirror the winner's bytes into the
+            // local Kademlia store so `cabi_nickname_resolve` returns a
+            // record for any peer that received the winning claim via
+            // gossipsub — including peers that lost a direct race
+            // (`we_lost_our_own == true`, the ship-gate9 failure mode)
+            // AND peers that witnessed a 3rd-party tiebreak without being
+            // a contestant themselves. `publisher: None` / `expires:
+            // None` — TD-53 rationale and security-crypto conditions
+            // R1/R2/R3 are documented at the TD-53 site in
+            // `handle_publish_nickname_claim`.
+            //
+            // No explicit `remove` is needed before the `put` — on
+            // `MemoryStore::BTreeMap::insert` the put atomically
+            // overwrites whatever was previously at the key, including
+            // (in the `we_lost_our_own` case) our own losing bytes. The
+            // TD-44 "scrub OUR local copy" intent is satisfied by the
+            // overwrite; keeping a separate `remove` here AND one down
+            // in the `we_lost_our_own` branch created the ordering
+            // hazard found by `td44_local_eviction_on_loss` after TD-53
+            // BLOCK 2 landed — the remove ran AFTER the put and evicted
+            // the winner, reproducing the ship-gate9 resolve-NOT-FOUND
+            // symptom. See TD-53 R4.2 commit for the full rationale.
+            {
+                let key = claim_dht_key(&nickname);
+                let record = kad::Record {
+                    key: kad::RecordKey::new(&key),
+                    value: winner_bytes_for_store,
+                    publisher: None,
+                    expires: None,
+                };
+                if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                    tracing::warn!(
+                        target: "peer",
+                        %nickname,
+                        %err,
+                        "TD-53: failed to seed local Kademlia store with winner record on inbound tiebreak win; resolveNickname may return stale bytes until next observation",
+                    );
+                }
+            }
             if we_lost_our_own {
                 tracing::warn!(
                     target: "peer",
@@ -2010,25 +2306,25 @@ impl PeerManager {
                         "TD-40: evicted losing own claim from anti-entropy cache",
                     );
                 }
-                // TD-44: scrub the losing record from our local Kademlia
-                // store so that a local `dht_get_record` on the hashed
-                // nickname key does not resurrect the stale claim. Use
-                // `store_mut().remove(&key)` (not `remove_record(&key)`):
-                // the behaviour-level helper is publisher-gated, and in
-                // test harnesses (no `put_record` ran) the record may
-                // have been injected via `store_mut().put(...)` without a
-                // publisher field. The unconditional store-level remove
-                // matches our intent: drop OUR local copy.
-                let key = claim_dht_key(&nickname);
-                self.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .remove(&kad::RecordKey::new(&key));
+                // TD-44 + TD-53 (2026-04-22): originally this branch called
+                // `store_mut().remove(&key)` to scrub OUR losing bytes from
+                // the local Kademlia store. That is no longer needed because
+                // the TD-53 mirror block above (line ~2247) already called
+                // `store_mut().put(winner_record)` at the same key, which on
+                // `MemoryStore::BTreeMap::insert` atomically overwrites OUR
+                // losing record with the WINNER's signed bytes. A subsequent
+                // `remove` here would evict the winner too, producing the
+                // ship-gate9 resolve-NOT-FOUND regression that TD-53 exists
+                // to fix. The TD-44 scrub INTENT ("drop OUR local copy") is
+                // satisfied by the overwrite. See
+                // `td44_local_eviction_on_loss` (updated in TD-53 BLOCK 3)
+                // + `td53_loser_resolve_returns_winner_after_tiebreak` for
+                // the locked-in invariant: store now holds the WINNER's
+                // bytes, not empty and not ours.
                 tracing::info!(
                     target: "peer",
                     %nickname,
-                    "TD-44: evicted local Kademlia record for losing nickname",
+                    "TD-44 / TD-53: losing nickname's local Kademlia record overwritten by winner bytes (no explicit remove)",
                 );
                 self.emit_nickname_ownership_revoked(nickname.clone());
                 // The `losing_entry` snapshot is intentionally unused —
@@ -2038,6 +2334,8 @@ impl PeerManager {
             }
         } else {
             // Fresh observation.
+            let fresh_bytes_for_store = bytes.clone();
+            let fresh_nickname = nickname.clone();
             self.nickname_observations.insert(
                 nickname,
                 NicknameObservation {
@@ -2046,6 +2344,33 @@ impl PeerManager {
                     first_seen_ts_at_observer: observer_now,
                 },
             );
+            // TD-53: mirror fresh winner bytes into the local Kademlia
+            // store so resolveNickname works for every peer that receives
+            // a claim via gossipsub — including late-arriving peers that
+            // have never participated in a tiebreak and peers receiving
+            // TD-40 anti-entropy replays. `publisher: None` / `expires:
+            // None` — security-crypto conditions R1/R2/R3, rationale at
+            // the TD-53 site in `handle_publish_nickname_claim`.
+            let key = claim_dht_key(&fresh_nickname);
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .remove(&kad::RecordKey::new(&key));
+            let record = kad::Record {
+                key: kad::RecordKey::new(&key),
+                value: fresh_bytes_for_store,
+                publisher: None,
+                expires: None,
+            };
+            if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                tracing::warn!(
+                    target: "peer",
+                    nickname = %fresh_nickname,
+                    %err,
+                    "TD-53: failed to seed local Kademlia store with fresh inbound claim; resolveNickname may return NOT_FOUND until next observation",
+                );
+            }
         }
     }
 
@@ -3959,6 +4284,25 @@ impl PeerManager {
     /// fully closes (see `ConnectionClosed`), so a subsequent reconnect
     /// re-tries the reservation cleanly.
     fn maybe_auto_reserve_relay(&mut self, peer_id: &PeerId) {
+        if !self.relay_client_enabled {
+            // TD-48: with the relay-client NetworkBehaviour composed as
+            // Toggle::from(None), issuing listen_on(.../p2p-circuit)
+            // crashes the loop inside libp2p-relay's priv_client
+            // Transport on its next poll (the Transport<->Behaviour
+            // mpsc was dropped in build_behaviour). Skip the auto-
+            // reservation entirely; the host opted into relay-less
+            // operation via cabi_transport_set_enable_relay_client(0).
+            // Do NOT mark the peer as attempted — if a future code
+            // path re-enables the flag (none exists today, but the
+            // setter is a static), a later reconnect should still get
+            // a fresh reservation.
+            tracing::debug!(
+                target: "peer",
+                %peer_id,
+                "TD-48: skipping relay auto-reservation (relay-client disabled)",
+            );
+            return;
+        }
         if self.relay_base_address.is_some() {
             return;
         }
@@ -4690,7 +5034,15 @@ mod relay_circuit_fallback_tests {
     use std::sync::{Arc, RwLock};
 
     fn build_manager(seed: [u8; 32], bootstrap: Vec<Multiaddr>) -> PeerManager {
-        let config = TransportConfig::new(false, false).with_identity_seed(seed);
+        // TD-51: tests cover the relay-client state machine, which only
+        // runs on the opt-in path; opt in explicitly so the default flip
+        // (NIM-93) doesn't short-circuit maybe_auto_reserve_relay via
+        // its TD-48 guard.
+        let config = TransportConfig {
+            enable_relay_client: true,
+            identity_seed: Some(seed),
+            ..Default::default()
+        };
         let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
         let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
         let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
@@ -4839,6 +5191,75 @@ mod relay_circuit_fallback_tests {
             manager.bootstrap_relay_addrs.get(&bootstrap_peer),
             Some(&bootstrap_addr),
             "bootstrap_relay_addrs must carry the full multiaddr (including /p2p)",
+        );
+    }
+
+    /// TD-48 (NIM-90): with `enable_relay_client=false`,
+    /// `maybe_auto_reserve_relay` MUST short-circuit without calling
+    /// `start_relay_reservation` — otherwise the first bootstrap-relay
+    /// `ConnectionEstablished` issues `swarm.listen_on(.../p2p-circuit)`
+    /// against a `Toggle<None>` relay-client and libp2p-relay's
+    /// priv_client panics, unwinding `run()` and killing the
+    /// `Receiver<PeerCommand>` with it. Observed on kunzite in
+    /// ship-gate6 (2026-04-22) as 57 × "peer manager command channel
+    /// closed" in ~17 minutes of logcat.
+    #[test]
+    fn maybe_auto_reserve_relay_skips_when_relay_client_disabled() {
+        let bootstrap_addr = Multiaddr::from_str(
+            "/ip4/217.65.5.134/tcp/41000/p2p/12D3KooWPmi5FwJGNRv4NKNe4jJvgepdPHfuAhFWBczbMmDkvD3k",
+        )
+        .unwrap();
+        let bootstrap_peer = extract_peer_id(&bootstrap_addr).unwrap();
+
+        // Cannot reuse the helper because `build_manager` now explicitly
+        // opts into `enable_relay_client = true` for the on-path tests
+        // (TD-51 / NIM-93 flipped the Default to `false`). This one
+        // test needs the off path specifically.
+        let config = TransportConfig {
+            enable_relay_client: false,
+            identity_seed: Some([0x48u8; 32]),
+            ..Default::default()
+        };
+        let message_queue = MessageQueue::new(DEFAULT_MESSAGE_QUEUE_CAPACITY);
+        let file_transfer_queue = FileTransferQueue::new(DEFAULT_FILE_TRANSFER_QUEUE_CAPACITY);
+        let discovery_queue = DiscoveryQueue::new(DEFAULT_DISCOVERY_QUEUE_CAPACITY);
+        let addr_state = Arc::new(RwLock::new(AddrState::default()));
+        let (mut manager, _handle) = PeerManager::new(
+            config,
+            message_queue.sender(),
+            file_transfer_queue.sender(),
+            discovery_queue.sender(),
+            None,
+            addr_state,
+            vec![bootstrap_addr.clone()],
+        )
+        .expect("peer manager");
+        std::mem::forget(message_queue);
+        std::mem::forget(file_transfer_queue);
+        std::mem::forget(discovery_queue);
+        std::mem::forget(_handle);
+
+        assert!(!manager.relay_client_enabled);
+        assert!(
+            manager.bootstrap_relay_addrs.contains_key(&bootstrap_peer),
+            "precondition: bootstrap_relay_addrs must be primed",
+        );
+
+        manager.maybe_auto_reserve_relay(&bootstrap_peer);
+
+        assert!(
+            !manager
+                .relay_reservation_attempted
+                .contains(&bootstrap_peer),
+            "TD-48: skip path must NOT mark the peer as attempted",
+        );
+        assert!(
+            manager.relay_base_address.is_none(),
+            "TD-48: skip path must NOT install a relay_base_address",
+        );
+        assert!(
+            manager.relay_peer_id.is_none(),
+            "TD-48: skip path must NOT stash a relay_peer_id",
         );
     }
 
@@ -5747,17 +6168,32 @@ mod nickname_registry_tests {
             NicknameEvent::OwnershipRevoked { nickname } => assert_eq!(nickname, "race_td44"),
         }
 
-        // (c) TD-44 new invariant: local Kademlia store no longer
-        //     contains OUR losing claim at the hashed nickname key.
-        assert!(
-            manager
-                .swarm
-                .behaviour_mut()
-                .kademlia
-                .store_mut()
-                .get(&kad_lib::RecordKey::new(&key))
-                .is_none(),
-            "TD-44 post-condition: local Kademlia record for losing nickname must be evicted",
+        // (c) TD-53 invariant (supersedes TD-44 "record must be
+        //     evicted"): the local Kademlia store no longer contains
+        //     OUR losing bytes at the hashed nickname key, but it now
+        //     MUST contain the WINNER's (remote) claim bytes so that
+        //     `cabi_nickname_resolve` on the loser side answers with
+        //     the winner — see `fidonext_android/qa-artifacts/2026-04-22T1950Z-ship-gate9/`
+        //     for the ship-gate9 NOT_FOUND regression that motivated
+        //     TD-53. The remote peer is known to us here because
+        //     `build_owned_claim("race_td44", ...)` returned its bytes
+        //     and its peer_id above.
+        let stored = manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad_lib::RecordKey::new(&key))
+            .expect("TD-53 post-condition: local Kademlia record must now hold winner bytes");
+        let stored_claim = crate::e2ee::nickname::validate_claim(&stored.value, now_unix_seconds())
+            .expect("TD-53 post-condition: stored winner bytes must re-validate as a claim");
+        assert_eq!(
+            stored_claim.peer_id, remote_peer,
+            "TD-53 post-condition: stored record must be the WINNER's claim, not OUR losing claim",
+        );
+        assert_ne!(
+            stored_claim.peer_id, local_peer,
+            "TD-53 post-condition: stored record must NOT be our losing claim",
         );
     }
 
@@ -5915,5 +6351,429 @@ mod nickname_registry_tests {
                 .is_none(),
             "TD-42 post-condition: winning node must NOT publish a vacate tombstone",
         );
+    }
+
+    // -------------------------------------------------------------------
+    // TD-45 · publish-time tiebreak (ship-gate3 race fix, 2026-04-22).
+    //
+    // The regression scenario from
+    // `fidonext_android/qa-artifacts/2026-04-22T2250Z-ship-gate3/`:
+    // a remote peer's claim arrives via gossipsub BEFORE our own PoW
+    // grind finishes. Under the old `or_insert` logic our observation
+    // map silently kept the remote entry, our publish flow then blindly
+    // cached + broadcast our losing bytes, and the DHT resolver on the
+    // losing side still read our local (stale) record. The three tests
+    // below lock down the fixed publish-time tiebreak path:
+    //
+    //   (a) loss via earlier first_seen  → event emitted, caches clean.
+    //   (b) no prior observation         → publish proceeds, no event.
+    //   (c) equal first_seen, sha256(peer_id) decides — security-crypto
+    //       condition 4 coverage for the `Ordering::Equal` branch of
+    //       `tiebreak_winner` in the publish direction.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn td45_publish_after_remote_claim_observed_emits_revoked() {
+        // Mirrors the ship-gate3 race: a remote claim lands on the
+        // registry topic (recorded in `nickname_observations`) BEFORE
+        // our own `handle_publish_nickname_claim` runs. Expected
+        // outcome under the TD-45 fix:
+        //   - OwnershipRevoked surfaces on the event queue.
+        //   - `own_nickname_claims` does NOT retain the losing entry
+        //     (anti-entropy will not rebroadcast it).
+        //   - `nickname_observations` still points at the remote winner.
+        let (mut manager, mut events) = build_manager_with_queue([145u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        // Remote claim arrives first via gossipsub. This stamps
+        // `first_seen_ts_at_observer = now()` with the remote as holder.
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("race_td45", claim_ts);
+        manager.handle_nickname_registry_message(remote_bytes);
+        let observed_first_seen = manager
+            .nickname_observations
+            .get("race_td45")
+            .expect("remote observation recorded")
+            .first_seen_ts_at_observer;
+
+        // Backdate the stored first_seen by 1 s so our own publish-time
+        // `observer_now` is strictly greater, guaranteeing the remote
+        // wins the primary-key comparison regardless of millisecond
+        // drift between the two `now_unix_seconds()` calls.
+        if let Some(obs) = manager.nickname_observations.get_mut("race_td45") {
+            obs.first_seen_ts_at_observer = observed_first_seen.saturating_sub(1);
+        } else {
+            panic!("observation entry vanished between get and get_mut");
+        }
+
+        // Our own publish runs. Distinct profile → distinct peer_id.
+        let (own_bytes, own_peer, _own_dir) = build_owned_claim("race_td45", claim_ts);
+        assert_ne!(
+            own_peer, remote_peer,
+            "test sanity: own and remote peers must differ",
+        );
+        manager.handle_publish_nickname_claim(own_bytes, None);
+
+        // (a) Event emitted exactly once.
+        match events.try_dequeue() {
+            Some(NicknameEvent::OwnershipRevoked { nickname }) => {
+                assert_eq!(nickname, "race_td45");
+            }
+            other => panic!("expected OwnershipRevoked(race_td45); got {other:?}"),
+        }
+        assert!(
+            events.try_dequeue().is_none(),
+            "only a single OwnershipRevoked event must surface per loss",
+        );
+
+        // (b) Anti-entropy cache scrubbed.
+        assert!(
+            !manager.own_nickname_claims.contains_key("race_td45"),
+            "TD-45: losing own claim must NOT remain in anti-entropy cache",
+        );
+
+        // (c) Observation still points at the winner.
+        let obs = manager
+            .nickname_observations
+            .get("race_td45")
+            .expect("observation preserved");
+        assert_eq!(
+            obs.claim.peer_id, remote_peer,
+            "TD-45: observation must still reflect the winning remote claim",
+        );
+    }
+
+    #[test]
+    fn td45_publish_before_remote_claim_no_event_no_revocation() {
+        // Baseline: our own claim publishes before any remote claim is
+        // observed. Must populate own cache + observation, must NOT
+        // emit OwnershipRevoked. Locks down the `existing = None`
+        // control path of the TD-45 pre-check.
+        let (mut manager, mut events) = build_manager_with_queue([146u8; 32]);
+        let claim_ts = now_unix_seconds();
+        let (own_bytes, own_peer, _own_dir) = build_owned_claim("solo_td45", claim_ts);
+
+        manager.handle_publish_nickname_claim(own_bytes.clone(), None);
+
+        let obs = manager
+            .nickname_observations
+            .get("solo_td45")
+            .expect("own claim recorded");
+        assert_eq!(
+            obs.claim.peer_id, own_peer,
+            "observation must reflect our own peer",
+        );
+        assert_eq!(
+            obs.encoded, own_bytes,
+            "observation must carry our own encoded bytes",
+        );
+        assert!(
+            manager.own_nickname_claims.contains_key("solo_td45"),
+            "TD-40 cache must be populated on a winning publish",
+        );
+        assert!(
+            events.try_dequeue().is_none(),
+            "no competitor observed → no OwnershipRevoked event must fire",
+        );
+    }
+
+    #[test]
+    fn td45_publish_after_remote_tie_peer_id_loses_tiebreak() {
+        // security-crypto-engineer condition 4: cover the
+        // `Ordering::Equal` branch of `tiebreak_winner` in the publish
+        // direction. We synthesise a remote observation whose
+        // `first_seen_ts_at_observer` exactly matches the
+        // `observer_now` our `handle_publish_nickname_claim` will
+        // stamp, then pick own-vs-remote peer IDs such that the
+        // sha256(peer_id) tiebreak falls AGAINST us. Expected outcome
+        // is identical to the earlier-first_seen loss: event emitted,
+        // own_nickname_claims scrubbed, observation still remote.
+        //
+        // To make the ts match exactly without racing wall-clock, we
+        // insert a synthetic observation entry AFTER capturing the
+        // pre-publish `now`, then immediately call the handler so its
+        // `observer_now` equals the synthetic value ±0 in the common
+        // case; we also backfill the handler's observer_now into the
+        // stored observation to make this robust against the rare
+        // sub-second rollover.
+        let (mut manager, mut events) = build_manager_with_queue([147u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        // Iterate claim pairs until we land an own_peer / remote_peer
+        // pair whose sha256 ordering makes own_peer LOSE the secondary
+        // key. The existing
+        // `td37_tiebreak_helper_peer_id_hash_rule_is_consistent_with_handler`
+        // test relies on the same kind of hash-ordering iteration.
+        let (own_bytes, own_peer, _own_dir, remote_peer, remote_observation) = {
+            let mut attempt = 0u32;
+            loop {
+                let (own_bytes, own_peer, own_dir) = build_owned_claim("tie_td45", claim_ts);
+                let (remote_bytes, remote_peer, remote_dir) =
+                    build_owned_claim("tie_td45", claim_ts);
+                if own_peer == remote_peer {
+                    attempt += 1;
+                    if attempt > 32 {
+                        panic!("could not generate two distinct peer IDs");
+                    }
+                    continue;
+                }
+                // We want `tiebreak_winner(existing_ts, remote, own_ts, own)`
+                // to return true (existing wins) when
+                // `existing_ts == own_ts`. That reduces to
+                // `sha256(remote) < sha256(own)`.
+                if tiebreak_winner(0, &remote_peer, 0, &own_peer) {
+                    let remote_obs = NicknameObservation {
+                        claim: validate_claim(&remote_bytes, claim_ts + 5)
+                            .expect("remote claim validates"),
+                        encoded: remote_bytes,
+                        first_seen_ts_at_observer: 0,
+                    };
+                    // Keep `remote_dir` alive for the duration of the
+                    // test so the backing tempdir is not dropped
+                    // mid-assertions.
+                    std::mem::forget(remote_dir);
+                    break (own_bytes, own_peer, own_dir, remote_peer, remote_obs);
+                }
+                attempt += 1;
+                if attempt > 64 {
+                    panic!(
+                        "could not find a peer pair where remote wins sha256 tiebreak in 64 tries"
+                    );
+                }
+            }
+        };
+        assert_ne!(own_peer, remote_peer);
+
+        // Install the synthetic remote observation with a placeholder
+        // first_seen that we will rewrite to match `observer_now`
+        // immediately before the handler runs.
+        let mut remote_observation = remote_observation;
+        let observer_now_before = now_unix_seconds();
+        remote_observation.first_seen_ts_at_observer = observer_now_before;
+        manager
+            .nickname_observations
+            .insert("tie_td45".to_string(), remote_observation);
+
+        // Call the handler. It will stamp its own `observer_now`; if
+        // the wall clock ticked between our read above and the
+        // handler's internal call the stored ts may be 1 second behind
+        // — but that only makes the existing entry STRICTLY earlier,
+        // which is still a loss and still exercises our fix (not the
+        // Equal branch, but a supertest). We patch the stored ts to
+        // match the handler's stamp on a best-effort basis by
+        // re-reading now() and rewriting the observation; a loop
+        // guards the rare rollover.
+        for _ in 0..5 {
+            let t = now_unix_seconds();
+            if let Some(obs) = manager.nickname_observations.get_mut("tie_td45") {
+                obs.first_seen_ts_at_observer = t;
+            }
+            if now_unix_seconds() == t {
+                break;
+            }
+        }
+
+        manager.handle_publish_nickname_claim(own_bytes, None);
+
+        // Regardless of whether we landed exactly on Equal or drifted
+        // to "existing strictly earlier", the fix must emit
+        // OwnershipRevoked and scrub the cache.
+        match events.try_dequeue() {
+            Some(NicknameEvent::OwnershipRevoked { nickname }) => {
+                assert_eq!(nickname, "tie_td45");
+            }
+            other => panic!("expected OwnershipRevoked(tie_td45); got {other:?}"),
+        }
+        assert!(events.try_dequeue().is_none());
+        assert!(
+            !manager.own_nickname_claims.contains_key("tie_td45"),
+            "TD-45: losing own claim must NOT remain in anti-entropy cache on Equal-branch loss",
+        );
+        let obs = manager
+            .nickname_observations
+            .get("tie_td45")
+            .expect("observation preserved");
+        assert_eq!(
+            obs.claim.peer_id, remote_peer,
+            "TD-45: observation must still reflect the winning remote claim",
+        );
+    }
+
+    #[test]
+    fn td53_loser_resolve_returns_winner_after_tiebreak() {
+        // TD-53 (NIM-95, ship-gate10 blocker): the publish-time tiebreak
+        // loss branch in `handle_publish_nickname_claim` must not only
+        // scrub our losing bytes from the local Kademlia store but ALSO
+        // mirror the winner's bytes from the observation map into the
+        // store, so that `cabi_nickname_resolve` on the loser returns the
+        // winner instead of NOT_FOUND. Ship-gate9
+        // (`fidonext_android/qa-artifacts/2026-04-22T1950Z-ship-gate9/`)
+        // caught the gap: TD-45 emitted OwnershipRevoked but the store
+        // was empty, so device A returned status=6 at T+5/+46/+296 s.
+        use crate::e2ee::nickname::claim_dht_key;
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        let (mut manager, _events) = build_manager_with_queue([153u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        // Remote winner's claim arrives first on the registry topic and
+        // becomes the observed entry.
+        let (remote_bytes, remote_peer, _remote_dir) = build_owned_claim("race_td53", claim_ts);
+        manager.handle_nickname_registry_message(remote_bytes.clone());
+        let observed_first_seen = manager
+            .nickname_observations
+            .get("race_td53")
+            .expect("remote observation recorded")
+            .first_seen_ts_at_observer;
+
+        // Backdate so the remote wins the primary-key comparison when
+        // our own publish stamps its `observer_now`.
+        if let Some(obs) = manager.nickname_observations.get_mut("race_td53") {
+            obs.first_seen_ts_at_observer = observed_first_seen.saturating_sub(1);
+        } else {
+            panic!("observation entry vanished between get and get_mut");
+        }
+
+        // Our own publish runs and loses the TD-45 tiebreak.
+        let (own_bytes, own_peer, _own_dir) = build_owned_claim("race_td53", claim_ts);
+        assert_ne!(own_peer, remote_peer);
+        manager.handle_publish_nickname_claim(own_bytes, None);
+
+        // TD-53 post-condition: local Kademlia store now holds the
+        // winner's bytes at the hashed nickname key. This is what
+        // `cabi_nickname_resolve`'s local-first path reads.
+        let key = claim_dht_key("race_td53");
+        let stored = manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad_lib::RecordKey::new(&key))
+            .expect("TD-53: local Kademlia store must contain the winner record after loss");
+        assert_eq!(
+            stored.value, remote_bytes,
+            "TD-53: stored bytes must be the winner's signed claim, byte-for-byte",
+        );
+        // Cross-check: observation map still points at the winner
+        // (TD-45 invariant preserved).
+        let obs = manager
+            .nickname_observations
+            .get("race_td53")
+            .expect("observation preserved");
+        assert_eq!(
+            obs.claim.peer_id, remote_peer,
+            "TD-53: observation map still reflects the winning remote claim",
+        );
+        // Cross-check: anti-entropy cache was scrubbed (TD-45 condition 1).
+        assert!(
+            !manager.own_nickname_claims.contains_key("race_td53"),
+            "TD-53: losing own claim must not remain in anti-entropy cache",
+        );
+    }
+
+    #[test]
+    fn td53_inbound_fresh_claim_populates_local_kademlia_store() {
+        // TD-53 fix (b): every accepted inbound claim on the registry
+        // topic must mirror into the local Kademlia store so any peer
+        // receiving the claim (not just direct race contestants) can
+        // answer `cabi_nickname_resolve` locally. Covers the fresh-
+        // observation branch of `handle_nickname_registry_message` and
+        // exercises the TD-40 anti-entropy replay path by proxy.
+        use crate::e2ee::nickname::claim_dht_key;
+        use libp2p::kad::{self as kad_lib, store::RecordStore};
+
+        let (mut manager, _events) = build_manager_with_queue([154u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        // Sanity: store is empty before the inbound message.
+        let key = claim_dht_key("alice_td53");
+        assert!(
+            manager
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&kad_lib::RecordKey::new(&key))
+                .is_none(),
+            "precondition: store is empty before any observation",
+        );
+
+        let (encoded, peer, _dir) = build_owned_claim("alice_td53", claim_ts);
+        manager.handle_nickname_registry_message(encoded.clone());
+
+        // Observation map recorded (TD-37 invariant).
+        let obs = manager
+            .nickname_observations
+            .get("alice_td53")
+            .expect("observation recorded");
+        assert_eq!(obs.claim.peer_id, peer);
+
+        // TD-53 post-condition: local Kademlia store contains the
+        // winner's bytes under the hashed nickname key, byte-for-byte
+        // identical to the observation's encoded form.
+        let stored = manager
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&kad_lib::RecordKey::new(&key))
+            .expect("TD-53: local Kademlia store must hold the fresh inbound claim");
+        assert_eq!(
+            stored.value, encoded,
+            "TD-53: stored bytes must match the inbound claim byte-for-byte",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn td53_cached_winner_does_not_emit_put_record_query() {
+        // TD-53 R4.3 regression test (security-crypto CHANGES_REQUESTED
+        // follow-up). The store-only mirror writes in
+        // `handle_publish_nickname_claim` and
+        // `handle_nickname_registry_message` must not trigger a DHT
+        // PUT_VALUE query. Two things guarantee that:
+        //   (1) we use `store_mut().put(...)` (local-only), not
+        //       `kademlia.put_record(...)`, and
+        //   (2) Kademlia's periodic Replicate job is globally disabled via
+        //       `kad_config.set_replication_interval(None)` in
+        //       `transport/libp2p.rs` (R4.1).
+        // If either (1) or (2) regresses — e.g. a future refactor switches
+        // the mirror to `kademlia.put_record(...)`, or a libp2p-kad bump
+        // flips the default interval back on — this test catches it by
+        // polling the swarm event stream for >1 s and asserting that no
+        // `kad::Event::OutboundQueryProgressed { PutRecord, .. }` is
+        // emitted.
+        use futures::FutureExt;
+        use libp2p::kad::{self as kad_lib, QueryResult};
+        use libp2p::swarm::SwarmEvent;
+        use tokio::time::{sleep, Duration};
+
+        let (mut manager, _events) = build_manager_with_queue([155u8; 32]);
+        let claim_ts = now_unix_seconds();
+
+        // Drive the store-only write path: an inbound fresh claim arrives,
+        // gets validated, and is mirrored into the local store.
+        let (encoded, _peer, _dir) = build_owned_claim("tick_td53", claim_ts);
+        manager.handle_nickname_registry_message(encoded);
+
+        // Poll the swarm for >1 s. Any `PutRecord` progress event would
+        // indicate a DHT query was started — that is the regression we are
+        // guarding against. We spin ~20 ticks at 60 ms each, draining
+        // whatever the swarm produces without blocking.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        while tokio::time::Instant::now() < deadline {
+            while let Some(Some(event)) = manager.swarm.next().now_or_never() {
+                if let SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                    kad_lib::Event::OutboundQueryProgressed {
+                        result: QueryResult::PutRecord(_),
+                        ..
+                    },
+                )) = event
+                {
+                    panic!(
+                        "TD-53 R4.3 regression: store-only mirror emitted a Kademlia PutRecord query; check that `set_replication_interval(None)` is still set in transport/libp2p.rs and that the mirror still uses `store_mut().put(...)` not `kademlia.put_record(...)`",
+                    );
+                }
+            }
+            sleep(Duration::from_millis(60)).await;
+        }
     }
 }

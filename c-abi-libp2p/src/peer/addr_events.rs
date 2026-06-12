@@ -8,45 +8,34 @@ pub struct AddrState {
     version: u64,
 }
 
-
 /// Events happening with addreses of the peer
 #[derive(Debug, Clone)]
 pub enum AddrEvent {
     /// New local listen addr added
     /// Source: `SwarmEvent::NewListenAddr`
     /// May be not publicly reachable
-    ListenerAdded {
-        address: Multiaddr,
-    },
+    ListenerAdded { address: Multiaddr },
 
     /// Local listen addr was removed
     /// Source: `SwarmEvent::ListenerClosed`
-    ListenerRemoved { 
-        address: Multiaddr,
-    },
+    ListenerRemoved { address: Multiaddr },
 
     /// External publicly reachable addr
     /// added and confirmed
     /// Source: `SwarmEvent::ExternalAddrConfirmed`
-    ExternalConfirmed {
-        address: Multiaddr,
-    },
+    ExternalConfirmed { address: Multiaddr },
 
     /// External publicly reachable addr expired
     /// Source: `SwarmEvent::ExternalAddrExpired`
-    ExternalExpired {
-        address: Multiaddr,
-    },
+    ExternalExpired { address: Multiaddr },
 
     /// Relay-based addr is added and ready to use
     /// Source: `PeerManager::update_relay_address` (derived from relay reservation)
-    RelayReachableReady {
-        address: Multiaddr,
-    },
+    RelayReachableReady { address: Multiaddr },
 
     /// Relay-reachable self address is no longer valid (reservation lost / expired)
     /// Source: `PeerManager::clear_relay_address` when current relay base is cleared
-    RelayReachableLost
+    RelayReachableLost,
 }
 
 impl AddrState {
@@ -54,19 +43,27 @@ impl AddrState {
         use AddrEvent::*;
         match ev {
             ListenerAdded { address } => {
-                if self.listen.insert(address.clone()) { self.version += 1; }
+                if self.listen.insert(address.clone()) {
+                    self.version += 1;
+                }
             }
 
             ListenerRemoved { address } => {
-                if self.listen.remove(address) { self.version += 1; }
+                if self.listen.remove(address) {
+                    self.version += 1;
+                }
             }
 
             ExternalConfirmed { address } => {
-                if self.external_confirmed.insert(address.clone()) { self.version += 1; }
+                if self.external_confirmed.insert(address.clone()) {
+                    self.version += 1;
+                }
             }
 
             ExternalExpired { address } => {
-                if self.external_confirmed.remove(address) { self.version += 1; }
+                if self.external_confirmed.remove(address) {
+                    self.version += 1;
+                }
             }
 
             RelayReachableReady { address } => {
@@ -85,7 +82,9 @@ impl AddrState {
     }
 
     // Public function to get cur version of snapshot for ABI
-    pub fn version(&self) -> u64 { self.version }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
 
     // Public function to give snapshot string of addreses for ABI
     pub fn snapshot_string(&self) -> String {
@@ -95,7 +94,11 @@ impl AddrState {
             out.push(a.to_string());
         }
 
-        let mut ext: Vec<String> = self.external_confirmed.iter().map(|a| a.to_string()).collect();
+        let mut ext: Vec<String> = self
+            .external_confirmed
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
         ext.sort();
         out.extend(ext);
 

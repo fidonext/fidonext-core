@@ -4,8 +4,8 @@
 //! surface to pass binary payloads between the host runtime and the Rust core.
 
 pub mod delivery;
-pub mod messaging;
 pub mod file_transfer;
+pub mod messaging;
 
 pub use delivery::*;
 pub use file_transfer::*;

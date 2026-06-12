@@ -420,6 +420,83 @@ impl Drop for ManagedNode {
     }
 }
 
+/// TD-47 / TD-51 (NIM-89, NIM-93): module-level flag read at
+/// node-construction time by [`cabi_node_new`] / [`cabi_node_new_v2`]
+/// to decide whether the composite [`transport::NetworkBehaviour`]
+/// composes a functional relay-client (`Toggle<Some(..)>` + relay
+/// transport half) or a disarmed one (`Toggle<None>` + no relay
+/// transport). Default `false` for v0.0.7 — forced-off pending TD-52
+/// (NIM-94) upstream fix; every caller that does not invoke
+/// [`cabi_transport_set_enable_relay_client`] gets the safe path.
+static ENABLE_RELAY_CLIENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// TD-47: latched to `true` on the first successful `ManagedNode::new`
+/// so that later setter calls can report `CABI_STATUS_INVALID_ARGUMENT`.
+/// The setter MUST be called before any node is constructed — once a
+/// swarm is running, flipping the flag has no effect, and silently
+/// accepting the write would lie to the caller.
+static RELAY_CLIENT_FLAG_LATCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// TD-47 / TD-51: internal read used by the `cabi_node_new*` entry
+/// points at node-construction time. Latches
+/// `RELAY_CLIENT_FLAG_LATCHED = true` as a side effect so a subsequent
+/// setter call is rejected. When the resolved value is `true` — i.e.
+/// the host explicitly opted relay-client back in under v0.0.7 — we
+/// emit a loud `warn!` so crash reports on arm64 can be correlated to
+/// the NIM-88 cluster (TD-46/48/50).
+fn consume_enable_relay_client_flag() -> bool {
+    RELAY_CLIENT_FLAG_LATCHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let enabled = ENABLE_RELAY_CLIENT.load(std::sync::atomic::Ordering::SeqCst);
+    if enabled {
+        tracing::warn!(
+            target: "ffi",
+            "relay-client opt-in under v0.0.7 — expect TD-46 class crash on arm64; see NIM-88 cluster"
+        );
+    }
+    enabled
+}
+
+#[no_mangle]
+/// C-ABI (TD-47 / TD-51 / NIM-89, NIM-93). Pre-init setter that
+/// toggles the relay-client `NetworkBehaviour` AND the relay transport
+/// half off (`enable = 0`) or on (`enable != 0`) for the next
+/// `cabi_node_new` / `cabi_node_new_v2` call.
+///
+/// v0.0.7 default is `false` — forced-off pending TD-52 (NIM-94)
+/// upstream fix for TD-46 (multiaddr SIGSEGV in `libp2p-relay`'s
+/// `handle_established_outbound_connection`). When disabled, neither
+/// the relay-client behaviour nor the relay transport half is
+/// composed: `relay::client::new(..)` is not called at all, so
+/// `priv_client::handler::Handler` is not present in the composite
+/// and the TD-46 crash site is literally unreachable. `/p2p-circuit`
+/// multiaddrs cannot be dialed in this mode — direct-only. Hosts that
+/// want relay-client back may call with `enable = 1`, but expect
+/// TD-46-class crashes on arm64; see NIM-88 cluster.
+///
+/// Contract:
+/// - MUST be called before `cabi_node_new` / `cabi_node_new_v2`. If any
+///   node has already been constructed in this process, the setter
+///   returns `CABI_STATUS_INVALID_ARGUMENT` and the flag is unchanged.
+/// - Default value is `false` (relay-client NOT composed) as of v0.0.7.
+/// - Value persists for the lifetime of the process; a second call
+///   before any node is constructed overwrites the first.
+///
+/// Returns `CABI_STATUS_SUCCESS` on success,
+/// `CABI_STATUS_INVALID_ARGUMENT` if called after node construction.
+pub extern "C" fn cabi_transport_set_enable_relay_client(enable: c_int) -> c_int {
+    if RELAY_CLIENT_FLAG_LATCHED.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            target: "ffi",
+            "cabi_transport_set_enable_relay_client called after a node was already constructed; ignoring"
+        );
+        return CABI_STATUS_INVALID_ARGUMENT;
+    }
+    ENABLE_RELAY_CLIENT.store(enable != 0, std::sync::atomic::Ordering::SeqCst);
+    CABI_STATUS_SUCCESS
+}
+
 #[no_mangle]
 /// C-ABI. Inits tracing for the library in order to give more proper info on networking
 pub extern "C" fn cabi_init_tracing() -> c_int {
@@ -2525,6 +2602,7 @@ pub extern "C" fn cabi_node_new(
     let config = transport::TransportConfig {
         use_quic,
         hop_relay: enable_relay_hop,
+        enable_relay_client: consume_enable_relay_client_flag(),
         identity_seed,
         ..Default::default()
     };
@@ -2584,6 +2662,7 @@ pub extern "C" fn cabi_node_new_v2(
         use_quic,
         use_websocket,
         hop_relay: enable_relay_hop,
+        enable_relay_client: consume_enable_relay_client_flag(),
         identity_seed,
         ..Default::default()
     };
@@ -3720,6 +3799,62 @@ fn avatar_error_to_status(err: peer::BlobFetchError) -> c_int {
             tracing::warn!(target: "ffi", %message, "avatar fetch failed");
             CABI_STATUS_INTERNAL_ERROR
         }
+    }
+}
+
+#[cfg(test)]
+mod td47_setter_tests {
+    //! TD-47 (NIM-89) unit tests for
+    //! [`cabi_transport_set_enable_relay_client`].
+    //!
+    //! These exercise only the setter itself (the static flag + latch
+    //! behaviour). Full integration — that the flag actually makes the
+    //! composite `NetworkBehaviour` install `Toggle<None>` — is covered
+    //! by the `transport_config_builds_with_relay_client_disabled` test
+    //! in `transport::libp2p`.
+    //!
+    //! NOTE: the setter's static flag is process-global, so these tests
+    //! are **not** safe to run in parallel with any test that
+    //! constructs a `ManagedNode`. Kept behind a dedicated module so a
+    //! future `cargo test --test` filter can serialize them if needed.
+
+    use super::{
+        cabi_transport_set_enable_relay_client, CABI_STATUS_INVALID_ARGUMENT, CABI_STATUS_SUCCESS,
+        ENABLE_RELAY_CLIENT, RELAY_CLIENT_FLAG_LATCHED,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Setter MUST succeed when the flag has not yet been consumed by
+    /// node construction.
+    #[test]
+    fn setter_succeeds_before_latch() {
+        // Reset state for this test — the lib-level test runner may
+        // have latched it from another test. Safe because the real
+        // Android caller only ever sees a freshly loaded .so.
+        RELAY_CLIENT_FLAG_LATCHED.store(false, Ordering::SeqCst);
+        assert_eq!(
+            cabi_transport_set_enable_relay_client(0),
+            CABI_STATUS_SUCCESS,
+        );
+        assert!(!ENABLE_RELAY_CLIENT.load(Ordering::SeqCst));
+        assert_eq!(
+            cabi_transport_set_enable_relay_client(1),
+            CABI_STATUS_SUCCESS,
+        );
+        assert!(ENABLE_RELAY_CLIENT.load(Ordering::SeqCst));
+    }
+
+    /// Setter MUST reject writes after the flag has been latched.
+    #[test]
+    fn setter_rejects_after_latch() {
+        RELAY_CLIENT_FLAG_LATCHED.store(true, Ordering::SeqCst);
+        ENABLE_RELAY_CLIENT.store(true, Ordering::SeqCst);
+        assert_eq!(
+            cabi_transport_set_enable_relay_client(0),
+            CABI_STATUS_INVALID_ARGUMENT,
+        );
+        // And the flag must be left unchanged.
+        assert!(ENABLE_RELAY_CLIENT.load(Ordering::SeqCst));
     }
 }
 
